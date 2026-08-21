@@ -40,6 +40,7 @@
 pub mod error;
 pub mod message;
 pub mod nxf;
+pub mod proto;
 pub mod syscall;
 pub mod types;
 

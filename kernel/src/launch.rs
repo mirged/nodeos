@@ -203,3 +203,46 @@ fn launch_one(name: &str, bytes: &[u8]) -> Result<Launched, LoadError> {
 pub fn grant(target: &Launched, handle: Handle) -> Result<crate::obj::HandleValue, ()> {
     target.process.install(handle).map_err(|_| ())
 }
+
+/// Wait for every launched process to terminate, then report.
+///
+/// Used by the `nodeos.autotest` boot mode so that a boot has an *exit status*
+/// rather than a log that something else has to interpret. A system whose
+/// correctness can only be established by grepping is a system whose
+/// correctness nobody checks.
+pub fn supervise(launched: &[Launched], timeout_ns: u64) -> bool {
+    use crate::task::ProcessState;
+
+    if launched.is_empty() {
+        return false;
+    }
+
+    let deadline = crate::time::now_ns() + timeout_ns;
+    loop {
+        let running = launched.iter().filter(|entry| entry.process.state() != ProcessState::Terminated).count();
+        if running == 0 {
+            break;
+        }
+        if crate::time::now_ns() > deadline {
+            for entry in launched {
+                if entry.process.state() != ProcessState::Terminated {
+                    crate::error!("{:?} (pid {}) did not exit within the deadline", entry.name, entry.process.pid());
+                }
+            }
+            return false;
+        }
+        sched::yield_now();
+    }
+
+    let mut ok = true;
+    for entry in launched {
+        let code = entry.process.exit_code();
+        if code == 0 {
+            crate::info!("{:?} (pid {}) exited cleanly", entry.name, entry.process.pid());
+        } else {
+            crate::error!("{:?} (pid {}) exited with code {}", entry.name, entry.process.pid(), code);
+            ok = false;
+        }
+    }
+    ok
+}

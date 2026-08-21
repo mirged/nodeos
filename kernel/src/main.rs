@@ -151,8 +151,19 @@ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
     // SAFETY: memory management and the scheduler are up, and `boot_info` has
     // been relocated to the direct physical map.
     let launched = unsafe { launch::launch_boot_modules(&boot_info) };
-    info!("{} boot module(s) launched; entering the idle loop", launched.len());
+    info!("{} boot module(s) launched", launched.len());
 
+    // `nodeos.autotest` turns a boot into a test run: wait for userspace to
+    // finish, then power the machine off with a status that says whether it
+    // worked. Without it the kernel simply idles, which is what a real system
+    // does.
+    if boot_info.cmdline().is_some_and(|line| line.contains("nodeos.autotest")) {
+        let ok = launch::supervise(&launched, 30 * time::NANOS_PER_SEC);
+        info!("autotest complete: {}", if ok { "PASS" } else { "FAIL" });
+        arch::x86_64::qemu::power_off(ok);
+    }
+
+    info!("entering the idle loop");
     sched::idle_loop()
 }
 

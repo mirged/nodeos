@@ -72,4 +72,4 @@ clippy:
 	cd kernel && cargo clippy $(CARGO_FLAGS)
 
 clean:
-	rm -rf $(BUILD) target
+	rm -rf $(BUILD) target tools/target
