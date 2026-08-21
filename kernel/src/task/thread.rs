@@ -76,6 +76,14 @@ pub enum ThreadEntry {
 
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 
+/// Address of the trap-frame slot reserved at the top of a kernel stack.
+///
+/// Kept 16-byte aligned so the frame is usable by SSE stores and so the switch
+/// frame planted below it lands on a predictable boundary.
+pub fn trap_frame_slot(stack_top: u64) -> u64 {
+    (stack_top - core::mem::size_of::<TrapFrame>() as u64) & !0xF
+}
+
 /// A schedulable execution context.
 pub struct Thread {
     header: ObjectHeader,
@@ -118,8 +126,17 @@ impl Thread {
         // Plant an initial switch frame so the first `switch_to` into this
         // thread returns straight into the trampoline. The trap frame area is
         // reserved above it for the user-mode entry path.
-        let frame_area = stack_top - core::mem::size_of::<TrapFrame>() as u64;
-        let switch_rsp = frame_area - core::mem::size_of::<SwitchFrame>() as u64;
+        //
+        // Alignment is stated rather than derived. `switch_to` pops six
+        // registers and returns, so the trampoline begins executing with
+        // `rsp == switch_rsp + 56`; the SysV ABI requires that to be congruent
+        // to 8 mod 16, which means `switch_rsp` must be 16-byte aligned. Get
+        // that wrong by eight bytes and the first `movaps` the compiler emits
+        // for a 16-byte stack temporary raises #GP -- a long way from the cause.
+        let frame_area = trap_frame_slot(stack_top);
+        let switch_rsp = (frame_area - core::mem::size_of::<SwitchFrame>() as u64) & !0xF;
+        debug_assert_eq!(switch_rsp % 16, 0, "thread switch frame is misaligned");
+        debug_assert_eq!((switch_rsp + 56) % 16, 8, "thread entry violates the SysV stack ABI");
         let switch_frame = SwitchFrame {
             r15: 0,
             r14: 0,
@@ -336,7 +353,7 @@ fn enter_user(thread: &Arc<Thread>, entry: u64, stack: u64, arg0: u64, arg1: u64
     use crate::arch::x86_64::segmentation::{USER_CS, USER_SS};
 
     let stack_top = thread.kernel_stack_top();
-    let frame_ptr = (stack_top - core::mem::size_of::<TrapFrame>() as u64) as *mut TrapFrame;
+    let frame_ptr = trap_frame_slot(stack_top) as *mut TrapFrame;
 
     let mut frame = TrapFrame::default();
     frame.rip = entry;

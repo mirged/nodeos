@@ -22,6 +22,7 @@ extern crate alloc;
 pub mod arch;
 pub mod boot;
 pub mod drivers;
+pub mod ipc;
 pub mod log;
 pub mod mm;
 pub mod obj;

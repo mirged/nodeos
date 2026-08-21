@@ -10,6 +10,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use crate::ipc::message::{Message, MessageFlags};
+use crate::ipc::{Channel, ChannelError};
 use crate::mm::space::MapFlags;
 use crate::mm::vmo::Vmo;
 use crate::obj::{CapClass, CapSet, Handle, HandleTable, KernelObject, Rights};
@@ -39,6 +41,8 @@ pub fn run() {
     handle_generations_prevent_reuse();
     namespaces_isolate();
     memory_objects_and_cow();
+    ipc_is_typed_and_capability_carrying();
+    ipc_request_reply_across_threads();
     scheduler_classes_are_ordered();
 
     let passed = PASSED.load(Ordering::Relaxed);
@@ -283,4 +287,144 @@ fn scheduler_classes_are_ordered() {
         check!(thread.state() == crate::task::ThreadState::Dead, "worker did not exit");
         check!(thread.runtime_ns() > 0 || thread.tid() > 0, "worker accumulated no runtime");
     }
+}
+
+/// Messages keep their type, and capabilities really are transferred.
+fn ipc_is_typed_and_capability_carrying() {
+    let (client, server) = Channel::create_pair();
+
+    // An empty endpoint is writable but not readable.
+    check!(
+        client.header().signals().get().contains(crate::obj::Signals::WRITABLE),
+        "a fresh channel is not writable"
+    );
+    check!(
+        !client.header().signals().get().contains(crate::obj::Signals::READABLE),
+        "a fresh channel claims to be readable"
+    );
+    check!(matches!(client.receive(), Err(ChannelError::Empty)), "an empty channel returned a message");
+
+    // Send a typed message carrying a capability.
+    let vmo = Vmo::new_anonymous(8192, false).expect("vmo");
+    let koid = vmo.header().koid();
+    let mut request = Message::empty(0x1001);
+    request.payload.extend_from_slice(b"open:/svc/fs");
+    request.handles.push(Handle::root(vmo, Rights::VMO_DEFAULT));
+    client.send(request).expect("send");
+
+    check!(
+        server.header().signals().get().contains(crate::obj::Signals::READABLE),
+        "sending did not make the peer readable"
+    );
+    check!(server.queued() == 1, "peer queue depth wrong");
+    check!(client.queued() == 0, "the message landed in the sender's own inbox");
+
+    let received = server.receive().expect("receive");
+    check!(received.kind == 0x1001, "message kind was not preserved");
+    check!(&received.payload[..] == b"open:/svc/fs", "payload was not preserved");
+    check!(received.handles.len() == 1, "capability was not transferred");
+    check!(
+        received.handles[0].object().header().koid() == koid,
+        "the transferred capability names a different object"
+    );
+    check!(
+        !server.header().signals().get().contains(crate::obj::Signals::READABLE),
+        "an emptied channel still claims to be readable"
+    );
+
+    // A capability without TRANSFER cannot be sent.
+    let pinned = Vmo::new_anonymous(4096, false).expect("vmo");
+    let mut bad = Message::empty(1);
+    bad.handles.push(Handle::root(pinned.clone(), Rights::READ));
+    check!(
+        matches!(
+            client.send(bad),
+            Err(ChannelError::Message(crate::ipc::message::MessageError::HandleNotTransferable))
+        ),
+        "a non-transferable capability was accepted"
+    );
+
+    // A revoked capability cannot be sent either.
+    let revocable = Handle::root(pinned, Rights::VMO_DEFAULT);
+    revocable.grant().revoke();
+    let mut stale = Message::empty(1);
+    stale.handles.push(revocable);
+    check!(
+        matches!(client.send(stale), Err(ChannelError::Message(crate::ipc::message::MessageError::HandleRevoked))),
+        "a revoked capability was accepted for transfer"
+    );
+
+    // Oversized payloads are refused rather than truncated.
+    let mut huge = Message::empty(1);
+    huge.payload.resize(crate::ipc::message::MAX_PAYLOAD + 1, 0);
+    check!(
+        matches!(client.send(huge), Err(ChannelError::Message(crate::ipc::message::MessageError::PayloadTooLarge))),
+        "an oversized payload was accepted"
+    );
+
+    // Closing one end signals the other. This is the whole supervision story:
+    // nobody has to *report* a crash, the handle table does it.
+    server.close();
+    check!(
+        client.header().signals().get().contains(crate::obj::Signals::PEER_CLOSED),
+        "closing an endpoint did not signal its peer"
+    );
+    check!(matches!(client.send(Message::empty(2)), Err(ChannelError::PeerClosed)), "send to a closed peer succeeded");
+}
+
+static REPLY_OK: AtomicU32 = AtomicU32::new(0);
+static SERVER_CHANNEL: crate::sync::Once<Arc<Channel>> = crate::sync::Once::new();
+
+fn echo_server(_arg: usize) {
+    let channel = SERVER_CHANNEL.get().clone();
+    for _ in 0..8 {
+        let Ok(request) = channel.receive_blocking() else { break };
+        let mut reply = Message::empty(request.kind | 0x8000);
+        reply.txid = request.txid;
+        reply.flags = MessageFlags::REPLY;
+        reply.payload = request.payload.iter().rev().copied().collect();
+        // Bounce the capability back, proving round-trip transfer works.
+        reply.handles = request.handles;
+        if channel.send(reply).is_err() {
+            break;
+        }
+    }
+}
+
+/// A full request/reply round trip between two threads, including a capability
+/// that travels out and back.
+fn ipc_request_reply_across_threads() {
+    let (client, server) = Channel::create_pair();
+    SERVER_CHANNEL.init(server);
+
+    let worker = sched::spawn_kernel_thread("echo", echo_server, 0, SchedParams::interactive(20)).expect("spawn");
+
+    for round in 0..8u32 {
+        let vmo = Vmo::new_anonymous(4096, false).expect("vmo");
+        let koid = vmo.header().koid();
+        let mut request = Message::empty(0x20);
+        request.payload.extend_from_slice(&[round as u8, 2, 3, 4]);
+        request.handles.push(Handle::root(vmo, Rights::VMO_DEFAULT));
+
+        let reply = client.call(request).expect("call");
+        check!(reply.kind == 0x8020, "reply kind wrong in round {round}");
+        check!(reply.flags.contains(MessageFlags::REPLY), "reply not marked as a reply");
+        check!(&reply.payload[..] == &[4u8, 3, 2, round as u8], "reply payload wrong in round {round}");
+        check!(reply.handles.len() == 1, "capability did not come back");
+        check!(
+            reply.handles[0].object().header().koid() == koid,
+            "a different capability came back"
+        );
+        REPLY_OK.fetch_add(1, Ordering::Relaxed);
+    }
+
+    check!(REPLY_OK.load(Ordering::Relaxed) == 8, "not every round completed");
+
+    // Let the server observe the closed peer and exit.
+    drop(client);
+    let deadline = crate::time::now_ns() + crate::time::NANOS_PER_SEC;
+    while worker.state() != crate::task::ThreadState::Dead && crate::time::now_ns() < deadline {
+        sched::yield_now();
+    }
+    check!(worker.state() == crate::task::ThreadState::Dead, "the echo server did not exit");
 }
