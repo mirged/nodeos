@@ -35,6 +35,7 @@ struct TagHeader {
 #[derive(Clone, Copy)]
 pub struct BootInfo {
     base: *const u8,
+    phys_base: u64,
     total_size: usize,
 }
 
@@ -59,13 +60,38 @@ impl BootInfo {
         if total_size < 8 {
             return None;
         }
-        Some(Self { base: ptr, total_size })
+        Some(Self { base: ptr, phys_base: ptr as u64, total_size })
     }
 
     /// Physical address range occupied by the information structure, so the
     /// frame allocator can reserve it.
     pub fn phys_range(&self) -> (u64, u64) {
-        (self.base as u64, self.base as u64 + self.total_size as u64)
+        (self.phys_base, self.phys_base + self.total_size as u64)
+    }
+
+    /// Re-point this view at `phys_base + offset`.
+    ///
+    /// The loader hands us a *physical* address, which is directly usable only
+    /// while the bootstrap identity map is live. Once the kernel installs its
+    /// own tables and drops that map, the same structure has to be reached
+    /// through the direct physical map instead.
+    ///
+    /// # Safety
+    /// `offset` must be the base of a mapping that covers the structure's
+    /// physical range.
+    pub unsafe fn relocated(&self, offset: u64) -> Self {
+        Self {
+            base: (self.phys_base + offset) as *const u8,
+            phys_base: self.phys_base,
+            total_size: self.total_size,
+        }
+    }
+
+    /// Physical address of a boot module's contents, translated through
+    /// whatever mapping this view is using.
+    pub fn module_ptr(&self, module: &Module<'_>) -> *const u8 {
+        let offset = self.base as u64 - self.phys_base;
+        (module.start + offset) as *const u8
     }
 
     fn tags(&self) -> TagIter<'_> {

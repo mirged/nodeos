@@ -17,10 +17,13 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::missing_safety_doc)] // we document safety in prose, not lints
 
+extern crate alloc;
+
 pub mod arch;
 pub mod boot;
 pub mod drivers;
 pub mod log;
+pub mod mm;
 pub mod panic;
 pub mod rt;
 pub mod sync;
@@ -86,8 +89,50 @@ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
         info!("module {:?}: {:#x}..{:#x} ({} KiB)", module.name, module.start, module.end, module.len() / 1024);
     }
 
-    info!("stage 0 complete: long mode, high half, console");
-    cpu::halt_forever()
+    // ---- Architectural bring-up -------------------------------------------
+    // SAFETY: first and only call, on the boot CPU, with interrupts disabled.
+    unsafe { arch::x86_64::init_boot_cpu() };
+    info!("descriptor tables, IDT and interrupt controller online");
+
+    // SAFETY: the IDT is loaded, every vector has a stub, and the timer has a
+    // handler. From here on the kernel may be interrupted -- but only at points
+    // where it has explicitly enabled interrupts (see the interrupt discipline
+    // in docs/ARCHITECTURE.md).
+    unsafe { cpu::interrupts_enable() };
+
+    // ---- Memory management -------------------------------------------------
+    // SAFETY: first call, interrupts disabled, nothing has allocated yet.
+    unsafe { mm::init(&boot_info) };
+    // The identity map is gone now, so the loader's structure has to be
+    // reached through the direct physical map instead.
+    // SAFETY: the direct map covers the whole of physical memory.
+    let boot_info = unsafe { boot_info.relocated(mm::layout::PHYSMAP_BASE) };
+    mm::selftest();
+
+    // Prove the timer is actually ticking before anything depends on it.
+    let before = arch::x86_64::interrupt::ticks();
+    for _ in 0..2_000_000u64 {
+        core::hint::spin_loop();
+    }
+    let after = arch::x86_64::interrupt::ticks();
+    info!("timer: {} ticks observed ({} Hz configured)", after - before, arch::x86_64::interrupt::TICK_HZ);
+    assert!(after > before, "scheduler tick is not advancing");
+
+    let _ = boot_info.cmdline();
+    info!("stage 2 complete: frame allocator, kernel page tables, heap");
+    idle()
+}
+
+/// The boot CPU's idle loop.
+///
+/// `sti; hlt` is architecturally atomic -- `sti` has a one-instruction
+/// interrupt shadow -- so an interrupt cannot slip in between the two and
+/// cause a lost wakeup.
+fn idle() -> ! {
+    loop {
+        // SAFETY: the idle loop is by definition an interruptible context.
+        unsafe { cpu::enable_interrupts_and_halt() };
+    }
 }
 
 fn banner() {
