@@ -18,6 +18,8 @@ pub mod heap;
 pub mod layout;
 pub mod paging;
 pub mod phys;
+pub mod space;
+pub mod vmo;
 
 use crate::arch::x86_64::cpu;
 use crate::arch::{LARGE_PAGE_SIZE, PAGE_SIZE};
@@ -107,6 +109,28 @@ unsafe fn build_kernel_tables(boot_info: &BootInfo) -> Mapper {
     let root = paging::alloc_page_table().expect("out of memory building the kernel PML4");
     // SAFETY: `root` is a freshly allocated, zeroed PML4 owned by the kernel.
     let mapper = unsafe { Mapper::new(root) };
+
+    // ---- Pre-populate the entire kernel half of the PML4 -----------------
+    // Address spaces share the kernel half by *copying* PML4 entries 256..512
+    // when they are created. If a kernel mapping later needs a PML4 slot that
+    // was empty at copy time -- a per-thread kernel stack, say -- it would
+    // appear only in the kernel's own tables, and a thread running in any other
+    // address space would fault on its own stack and then double-fault trying
+    // to report it.
+    //
+    // Allocating all 256 second-level tables up front (1 MiB, once) makes
+    // "the kernel half is shared" true by construction: every later kernel
+    // mapping edits a table that every address space already points at.
+    for index in 256..512 {
+        // SAFETY: `root` holds a live, zeroed PML4 that only we reference.
+        let table = unsafe { &mut *(phys::phys_to_virt(phys::pfn_to_phys(root)) as *mut paging::PageTable) };
+        if table.entries[index].is_present() {
+            continue;
+        }
+        let pdpt = paging::alloc_page_table().expect("out of memory pre-populating the kernel PML4");
+        table.entries[index] =
+            paging::Entry::new(phys::pfn_to_phys(pdpt), PageFlags::PRESENT.or(PageFlags::WRITABLE));
+    }
 
     // ---- Direct physical map --------------------------------------------
     // Cover every byte of RAM the firmware reported (including reserved
@@ -289,4 +313,43 @@ pub fn selftest() {
         heap::pages_in_use(),
         heap::live_bytes() / 1024
     );
+}
+
+/// Resolve a page fault against the faulting thread's address space.
+///
+/// Returns `true` when a mapping was installed and the instruction should be
+/// retried.
+fn page_fault(address: u64, error: paging_fault::PageFaultError, _frame: &mut crate::arch::x86_64::trap::TrapFrame) -> bool {
+    // A kernel-mode fault on a kernel stack guard page is a stack overflow, and
+    // deserves to be reported as one rather than as a mysterious unmapped
+    // access two frames deep in whatever recursed.
+    if let Some(thread) = crate::sched::current_thread() {
+        if thread.is_stack_guard(address) {
+            crate::error!(
+                "kernel stack overflow in thread {} ({}) at guard page {:#x}",
+                thread.tid(),
+                thread.name(),
+                address
+            );
+            return false;
+        }
+    }
+
+    if !layout::is_user(address) {
+        return false;
+    }
+
+    let Some(process) = crate::sched::current_process() else { return false };
+    process.space().handle_fault(address, error.write(), error.instruction_fetch())
+}
+
+use crate::arch::x86_64::exception as paging_fault;
+
+/// Install the demand-paging fault handler.
+///
+/// # Safety
+/// Call once, with interrupts disabled, after the scheduler exists.
+pub unsafe fn init_fault_handler() {
+    // SAFETY: single-threaded bring-up with interrupts disabled.
+    unsafe { paging_fault::set_page_fault_handler(page_fault) };
 }

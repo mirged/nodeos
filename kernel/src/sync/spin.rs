@@ -157,6 +157,15 @@ impl<T: ?Sized> IrqSpinLock<T> {
         }
     }
 
+    /// Get a mutable reference without locking, using unique ownership.
+    ///
+    /// Only reachable from `&mut self`, which the type system already proves is
+    /// exclusive -- used by `Drop` implementations, where locking would be
+    /// pointless.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.inner.get_mut()
+    }
+
     /// See [`SpinLock::force_unlock`].
     ///
     /// # Safety

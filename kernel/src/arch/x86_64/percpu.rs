@@ -81,6 +81,16 @@ impl PerCpu {
 const PERCPU_INIT: PerCpu = PerCpu::new();
 static PERCPU: [PerCpu; MAX_CPUS] = [PERCPU_INIT; MAX_CPUS];
 
+/// Number of CPUs that have run [`init`]. Everything that balances work across
+/// CPUs must consult this rather than [`MAX_CPUS`]: placing a runnable thread
+/// on a CPU that was never brought up is an invisible way to lose it forever.
+static ONLINE: AtomicU32 = AtomicU32::new(0);
+
+/// How many CPUs are online.
+pub fn online_cpus() -> usize {
+    ONLINE.load(Ordering::Acquire).max(1) as usize
+}
+
 /// Install `GS_BASE`/`KERNEL_GS_BASE` for the calling CPU.
 ///
 /// # Safety
@@ -90,6 +100,7 @@ pub unsafe fn init(cpu_id: u32, lapic_id: u32) {
     assert!((cpu_id as usize) < MAX_CPUS, "cpu id {cpu_id} exceeds MAX_CPUS");
     let block = &PERCPU[cpu_id as usize];
     block.cpu_id.store(cpu_id, Ordering::Relaxed);
+    ONLINE.fetch_max(cpu_id + 1, Ordering::AcqRel);
     block.lapic_id.store(lapic_id, Ordering::Relaxed);
     let addr = block as *const PerCpu as u64;
     // SAFETY: exclusive access during single-threaded CPU bring-up.

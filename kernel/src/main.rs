@@ -24,9 +24,14 @@ pub mod boot;
 pub mod drivers;
 pub mod log;
 pub mod mm;
+pub mod obj;
 pub mod panic;
 pub mod rt;
+pub mod sched;
+pub mod selftest;
 pub mod sync;
+pub mod task;
+pub mod time;
 
 use arch::x86_64::{boot as arch_boot, cpu};
 use boot::BootInfo;
@@ -89,6 +94,12 @@ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
         info!("module {:?}: {:#x}..{:#x} ({} KiB)", module.name, module.start, module.end, module.len() / 1024);
     }
 
+    // ---- Clock -------------------------------------------------------------
+    // Calibrated before the interrupt controller takes the PIT away, and before
+    // anything wants to measure anything.
+    // SAFETY: interrupts are disabled and the PIT is unowned.
+    unsafe { time::init() };
+
     // ---- Architectural bring-up -------------------------------------------
     // SAFETY: first and only call, on the boot CPU, with interrupts disabled.
     unsafe { arch::x86_64::init_boot_cpu() };
@@ -109,6 +120,13 @@ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
     let boot_info = unsafe { boot_info.relocated(mm::layout::PHYSMAP_BASE) };
     mm::selftest();
 
+    // ---- Tasking -----------------------------------------------------------
+    // SAFETY: the memory manager is up, so address spaces can be created.
+    unsafe { sched::init_boot_cpu() };
+    // SAFETY: the scheduler exists, so faults can be attributed to a thread.
+    unsafe { mm::init_fault_handler() };
+    info!("scheduler online: this context is now idle/0");
+
     // Prove the timer is actually ticking before anything depends on it.
     let before = arch::x86_64::interrupt::ticks();
     for _ in 0..2_000_000u64 {
@@ -119,21 +137,14 @@ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
     assert!(after > before, "scheduler tick is not advancing");
 
     let _ = boot_info.cmdline();
-    info!("stage 2 complete: frame allocator, kernel page tables, heap");
-    idle()
+
+    selftest::run();
+
+    info!("stage 4 complete: kernel objects, capabilities, threads, scheduler");
+    sched::idle_loop()
 }
 
-/// The boot CPU's idle loop.
-///
-/// `sti; hlt` is architecturally atomic -- `sti` has a one-instruction
-/// interrupt shadow -- so an interrupt cannot slip in between the two and
-/// cause a lost wakeup.
-fn idle() -> ! {
-    loop {
-        // SAFETY: the idle loop is by definition an interruptible context.
-        unsafe { cpu::enable_interrupts_and_halt() };
-    }
-}
+
 
 fn banner() {
     kprintln!();

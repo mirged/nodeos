@@ -287,8 +287,12 @@ _boot_entry64:
     xorq    %rbp, %rbp
     movq    %r12, %rdi                   /* kmain(magic, ...)            */
     movq    %r13, %rsi                   /* kmain(..., multiboot_info)   */
-    subq    $8, %rsp                     /* keep the SysV 16-byte alignment
-                                            invariant across the `call`   */
+
+    /* SysV requires RSP+8 to be 16-byte aligned *at the callee's first
+       instruction*, i.e. RSP must be 16-byte aligned immediately before the
+       `call`. __init_stack_top is page aligned, so it already is: adjusting it
+       here would break every `movaps` the compiler emits for a 16-byte stack
+       temporary.                                                          */
     movabsq $kmain, %rax
     callq   *%rax
 
