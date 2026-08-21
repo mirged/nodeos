@@ -1,0 +1,21 @@
+# The kernel is built for the *host* triple but with `#![no_std]`, a custom
+# linker script and a hand-written entry path. See docs/BUILD.md for why we do
+# not use a custom JSON target (that requires a nightly toolchain).
+[build]
+target-dir = "../target/kernel"
+rustflags = [
+  "-C", "relocation-model=static",
+  "-C", "code-model=kernel",
+  "-C", "no-redzone=yes",
+  "-C", "force-frame-pointers=yes",
+  "-C", "linker=ld.lld",
+  "-C", "linker-flavor=ld",
+  # Path is relative to the *workspace root*, which is cargo's cwd for rustc.
+  "-C", "link-arg=--script=kernel/link/kernel.ld",
+  "-C", "link-arg=-znostart-stop-gc",
+  "-C", "link-arg=-zmax-page-size=0x1000",
+  "-C", "link-arg=--no-dynamic-linker",
+  "-C", "link-arg=-static",
+  "-C", "link-arg=--build-id=none",
+  "-C", "link-arg=--gc-sections",
+]
