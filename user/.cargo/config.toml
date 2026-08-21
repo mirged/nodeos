@@ -1,0 +1,23 @@
+# Userspace programs are built exactly like the kernel -- for the host triple,
+# `#![no_std]`, with a custom linker script -- because a stable toolchain cannot
+# consume a custom target JSON. See docs/BUILD.md.
+#
+# The differences from the kernel's configuration are the linker script (ring-3
+# layout, based at the NodeOS program window) and the target directory.
+[build]
+target-dir = "../target/user"
+rustflags = [
+  "-C", "relocation-model=static",
+  "-C", "code-model=small",
+  "-C", "no-redzone=yes",
+  "-C", "force-frame-pointers=yes",
+  "-C", "linker=ld.lld",
+  "-C", "linker-flavor=ld",
+  # Relative to the *workspace root*, which is cargo's cwd for rustc.
+  "-C", "link-arg=--script=link/user.ld",
+  "-C", "link-arg=-zmax-page-size=0x1000",
+  "-C", "link-arg=--no-dynamic-linker",
+  "-C", "link-arg=-static",
+  "-C", "link-arg=--build-id=none",
+  "-C", "link-arg=--gc-sections",
+]

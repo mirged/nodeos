@@ -23,6 +23,8 @@ pub mod arch;
 pub mod boot;
 pub mod drivers;
 pub mod ipc;
+pub mod launch;
+pub mod loader;
 pub mod log;
 pub mod mm;
 pub mod obj;
@@ -30,6 +32,7 @@ pub mod panic;
 pub mod rt;
 pub mod sched;
 pub mod selftest;
+pub mod syscall;
 pub mod sync;
 pub mod task;
 pub mod time;
@@ -141,7 +144,15 @@ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
 
     selftest::run();
 
-    info!("stage 4 complete: kernel objects, capabilities, threads, scheduler");
+    // ---- Syscalls and userspace ---------------------------------------------
+    // SAFETY: interrupts are disabled and the GDT has the SYSCALL layout.
+    unsafe { syscall::init() };
+
+    // SAFETY: memory management and the scheduler are up, and `boot_info` has
+    // been relocated to the direct physical map.
+    let launched = unsafe { launch::launch_boot_modules(&boot_info) };
+    info!("{} boot module(s) launched; entering the idle loop", launched.len());
+
     sched::idle_loop()
 }
 

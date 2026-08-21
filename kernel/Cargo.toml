@@ -8,3 +8,6 @@ name = "nodeos-kernel"
 path = "src/main.rs"
 test = false
 bench = false
+
+[dependencies]
+nodeos-abi = { path = "../abi" }

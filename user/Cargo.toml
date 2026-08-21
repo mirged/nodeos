@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["libnode", "init"]
+
+[workspace.dependencies]
+nodeos-abi = { path = "../abi" }
+libnode = { path = "libnode" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+debug = true
+codegen-units = 1
+overflow-checks = true
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+debug = true

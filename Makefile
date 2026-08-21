@@ -21,7 +21,7 @@ QEMU_FLAGS := -machine q35 -cpu $(QEMU_CPU) -smp $(QEMU_SMP) -m $(QEMU_MEM) \
               -no-reboot -no-shutdown \
               -device isa-debug-exit,iobase=0xf4,iosize=0x04
 
-.PHONY: all kernel iso run run-graphic debug test clean fmt clippy
+.PHONY: all kernel tools user modules iso run run-graphic debug test clean fmt clippy
 
 all: iso
 
@@ -30,13 +30,30 @@ kernel:
 
 $(KERNEL): kernel
 
+tools:
+	cd tools && cargo build --release
+
+user:
+	cd user && cargo build $(CARGO_FLAGS)
+
+NXFPACK := tools/target/release/nxfpack
+USER_DIR := target/user/$(PROFILE)
+MODULE_DIR := $(BUILD)/modules
+
+# name : nxfpack flags
+modules: tools user
+	@mkdir -p $(MODULE_DIR)
+	$(NXFPACK) $(USER_DIR)/init -o $(MODULE_DIR)/init.nxf --name init --service --strict \
+		--cap PROCESS --cap CHANNEL --cap MEMORY --cap CLOCK --cap LOAD --cap DEBUG \
+		--stack 256K --heap 4M --max-memory 64M
+
 iso: $(ISO)
 
-$(ISO): kernel $(wildcard boot/grub.cfg)
+$(ISO): kernel modules grub/grub.cfg
 	@mkdir -p $(ISODIR)/boot/grub
 	cp $(KERNEL) $(ISODIR)/boot/nodeos-kernel
 	cp grub/grub.cfg $(ISODIR)/boot/grub/grub.cfg
-	@for m in $(MODULES); do cp $$m $(ISODIR)/boot/; done
+	cp $(MODULE_DIR)/*.nxf $(ISODIR)/boot/
 	grub-mkrescue -o $(ISO) $(ISODIR) -d /usr/lib/grub/i386-pc 2>/dev/null
 
 run: $(ISO)

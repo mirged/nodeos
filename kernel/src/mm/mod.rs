@@ -19,6 +19,7 @@ pub mod layout;
 pub mod paging;
 pub mod phys;
 pub mod space;
+pub mod uaccess;
 pub mod vmo;
 
 use crate::arch::x86_64::cpu;

@@ -1,0 +1,11 @@
+[package]
+name = "nxfpack"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "nxfpack"
+path = "src/main.rs"
+
+[dependencies]
+nodeos-abi = { path = "../../abi" }
