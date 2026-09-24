@@ -251,7 +251,11 @@ test-audio: $(ISO_DOOM) $(DISK)
 # Boot, drive the shell through a file's whole life -- create, write, read
 # back, delete -- and then check the result with mtools on the host, which is
 # the part that makes it a filesystem test rather than a self-consistency test.
-test-fs: $(ISO) $(DISK)
+# `test-fs` types at the shell through a display-less graphic boot, so it needs
+# the ISO that has a console and a shell in it -- declared here rather than left
+# to the script to complain about, which is what made a clean checkout fail with
+# "run 'make iso-graphic disk' first" from a `make` target.
+test-fs: $(ISO_GRAPHIC) $(ISO) $(DISK)
 	@scripts/run-fs-test.sh
 
 # The pointer is the one feature a headless boot cannot show, so this target
