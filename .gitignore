@@ -1,2 +1,5 @@
 /target
 /build
+/tools/target
+/doom_reference
+prebuilt/*.iso

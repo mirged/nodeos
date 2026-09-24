@@ -158,6 +158,23 @@ impl Channel {
 
     /// Send a request and block for the matching reply.
     pub fn call(&self, request: Message) -> Result<Message, Error> {
+        self.call_with(request, DEFAULT_RECEIVE_CAPACITY, DEFAULT_HANDLE_CAPACITY)
+    }
+
+    /// As [`Channel::call`], with an explicit reply buffer size.
+    ///
+    /// Worth reaching for whenever the reply is known to be small and the call
+    /// is made often. The runtime allocator never reclaims a block larger than
+    /// 2 KiB (see `alloc_impl`), so a caller that takes the 4 KiB default for
+    /// an *empty* acknowledgement leaks a page per call -- which is fine at
+    /// startup and fatal in a frame loop. `WM_COMMIT` is the case that found
+    /// this: Doom sends one per frame and ran its heap out in seconds.
+    pub fn call_with(
+        &self,
+        request: Message,
+        reply_capacity: usize,
+        reply_handle_capacity: usize,
+    ) -> Result<Message, Error> {
         let values: Vec<u32> = request.handles.iter().map(|h| h.raw().0).collect();
         let request_descriptor = MessageDescriptor {
             kind: request.kind,
@@ -169,15 +186,15 @@ impl Channel {
             handles: values.as_ptr() as u64,
         };
 
-        let mut reply_payload = alloc::vec![0u8; DEFAULT_RECEIVE_CAPACITY];
-        let mut reply_handles = alloc::vec![0u32; DEFAULT_HANDLE_CAPACITY];
+        let mut reply_payload = alloc::vec![0u8; reply_capacity];
+        let mut reply_handles = alloc::vec![0u32; reply_handle_capacity];
         let mut reply_descriptor = MessageDescriptor {
             kind: 0,
             flags: 0,
             txid: 0,
             payload: reply_payload.as_mut_ptr() as u64,
-            payload_len: DEFAULT_RECEIVE_CAPACITY as u32,
-            handle_count: DEFAULT_HANDLE_CAPACITY as u32,
+            payload_len: reply_capacity as u32,
+            handle_count: reply_handle_capacity as u32,
             handles: reply_handles.as_mut_ptr() as u64,
         };
 

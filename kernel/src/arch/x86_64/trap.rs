@@ -177,6 +177,14 @@ isr_common:
     and     eax, 3
     jz      1f
     swapgs
+    /* ...and park userspace's x87/SSE state, which the kernel is about to
+       overwrite. `gs:[16]` is this thread's kernel stack top, and the 512
+       bytes above it are its FXSAVE area -- see `task::thread::fpu_area`.
+       Without this a fault taken between a compiler-emitted `movups` load and
+       its matching store returns with the wrong `xmm0`, and the retried store
+       writes kernel leftovers into the program's memory.                   */
+    mov     rax, gs:[16]
+    fxsave64 [rax]
 1:
     cld                                 /* SysV requires DF clear           */
     mov     rdi, rsp                    /* &TrapFrame                       */
@@ -190,6 +198,11 @@ isr_common:
     mov     rax, [rsp + 0x90]
     and     eax, 3
     jz      2f
+    /* Restore the state saved on the way in, reading `gs:[16]` while GS is
+       still the kernel's. `rax` is scratch here: the `pop rax` below puts the
+       thread's own value back.                                             */
+    mov     rax, gs:[16]
+    fxrstor64 [rax]
     swapgs
 2:
     pop     r15

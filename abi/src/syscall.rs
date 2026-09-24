@@ -2,7 +2,7 @@
 
 /// The complete NodeOS syscall set.
 ///
-/// Twenty-four entry points. Compare against roughly 350 on Linux: the
+/// Thirty entry points. Compare against roughly 350 on Linux: the
 /// difference is not minimalism for its own sake, it is that every operation a
 /// Unix kernel performs on behalf of a *policy* -- naming files, resolving
 /// hostnames, deciding who may signal whom -- happens in a userspace service
@@ -18,6 +18,8 @@ pub enum Syscall {
     ProcessCreate = 1,
     /// Start a created process's first thread.
     ProcessStart = 2,
+    /// Load an NXF VMO into a created process.
+    ProcessLoad = 31,
     /// Terminate the calling process. Does not return.
     ProcessExit = 3,
     /// Create a thread in a process. Returns a thread handle.
@@ -70,11 +72,25 @@ pub enum Syscall {
     Clock = 23,
     /// Write a diagnostic string to the kernel log.
     DebugLog = 24,
+
+    // ---- Devices -----------------------------------------------------------
+    /// Obtain a memory object over a device's MMIO range.
+    DeviceGetVmo = 25,
+    /// Read queued bytes from a device (e.g. keyboard scancodes).
+    DeviceRead = 26,
+    /// Report a device's kind-specific properties (e.g. framebuffer geometry).
+    DeviceInfo = 27,
+    /// Read a device register through one of its port windows.
+    DevicePioRead = 28,
+    /// Write a device register through one of its port windows.
+    DevicePioWrite = 29,
+    /// Allocate a physically contiguous buffer a device can be pointed at.
+    DeviceDmaAlloc = 30,
 }
 
 impl Syscall {
     /// Highest implemented syscall number.
-    pub const MAX: u64 = Self::DebugLog as u64;
+    pub const MAX: u64 = Self::ProcessLoad as u64;
 
     /// Decode a raw syscall number.
     pub const fn from_u64(value: u64) -> Option<Self> {
@@ -86,6 +102,7 @@ impl Syscall {
         Some(match value {
             1 => Self::ProcessCreate,
             2 => Self::ProcessStart,
+            31 => Self::ProcessLoad,
             3 => Self::ProcessExit,
             4 => Self::ThreadCreate,
             5 => Self::ThreadExit,
@@ -107,7 +124,13 @@ impl Syscall {
             21 => Self::Wait,
             22 => Self::ObjectSignal,
             23 => Self::Clock,
-            _ => Self::DebugLog,
+            24 => Self::DebugLog,
+            25 => Self::DeviceGetVmo,
+            26 => Self::DeviceRead,
+            27 => Self::DeviceInfo,
+            28 => Self::DevicePioRead,
+            29 => Self::DevicePioWrite,
+            _ => Self::DeviceDmaAlloc,
         })
     }
 
@@ -117,6 +140,7 @@ impl Syscall {
             Self::Invalid => "invalid",
             Self::ProcessCreate => "process_create",
             Self::ProcessStart => "process_start",
+            Self::ProcessLoad => "process_load",
             Self::ProcessExit => "process_exit",
             Self::ThreadCreate => "thread_create",
             Self::ThreadExit => "thread_exit",
@@ -139,6 +163,12 @@ impl Syscall {
             Self::ObjectSignal => "object_signal",
             Self::Clock => "clock",
             Self::DebugLog => "debug_log",
+            Self::DeviceGetVmo => "device_get_vmo",
+            Self::DeviceRead => "device_read",
+            Self::DeviceInfo => "device_info",
+            Self::DevicePioRead => "device_pio_read",
+            Self::DevicePioWrite => "device_pio_write",
+            Self::DeviceDmaAlloc => "device_dma_alloc",
         }
     }
 }

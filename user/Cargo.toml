@@ -1,10 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["libnode", "init"]
+members = ["libnode", "libdraw", "init", "console", "compositor", "shell", "doom", "audio", "fs"]
 
 [workspace.dependencies]
 nodeos-abi = { path = "../abi" }
 libnode = { path = "libnode" }
+libdraw = { path = "libdraw" }
 
 [profile.release]
 panic = "abort"

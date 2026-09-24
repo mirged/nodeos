@@ -8,8 +8,12 @@
 //! `mem` feature, because a hosted program gets `memcpy` and friends from libc.
 //! There is no libc here, so the symbols LLVM emits calls to come from this
 //! module.
-
-use core::ffi::c_void;
+//!
+//! A program that links a C library of its own -- `doom` is the one that does
+//! -- must leave these names to this module rather than defining them again.
+//! There is no weak linkage on a stable toolchain, so two definitions are a
+//! link error, and these are the definitions every other program already
+//! shares.
 
 /// `memcpy(dest, src, n)`
 ///
@@ -123,14 +127,4 @@ pub unsafe extern "C" fn strlen(s: *const u8) -> usize {
         }
     }
     n
-}
-
-/// Placeholder for the C `free` some LLVM lowerings reference. Reaching it is a
-/// bug: nothing here allocates through a C allocator.
-///
-/// # Safety
-/// Never call this.
-#[no_mangle]
-pub unsafe extern "C" fn free(_ptr: *mut c_void) {
-    panic!("libnode called libc free()");
 }

@@ -13,7 +13,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use nodeos_abi::message::{MessageDescriptor, MAX_HANDLES, MAX_PAYLOAD};
-use nodeos_abi::types::{HandleInfo, MapFlags as AbiMapFlags, MapWindow, ThreadParams};
+use nodeos_abi::types::{HandleInfo, LoadedImageInfo, MapFlags as AbiMapFlags, MapWindow, ThreadParams};
 use nodeos_abi::{Error, Syscall};
 
 use crate::arch::x86_64::trap::TrapFrame;
@@ -23,7 +23,8 @@ use crate::mm::layout::Window;
 use crate::mm::space::{AddressSpace, MapFlags};
 use crate::mm::uaccess;
 use crate::mm::vmo::Vmo;
-use crate::obj::{CapClass, Handle, HandleValue, KernelObject, ObjectError, ObjectType, Rights, Signals};
+use crate::obj::{CapClass, Device, Handle, HandleValue, KernelObject, ObjectError, ObjectType, Rights, Signals};
+use crate::obj::device::DeviceError;
 use crate::sched::{self, SchedParams};
 use crate::task::thread::{Thread, ThreadEntry};
 use crate::task::Process;
@@ -122,6 +123,7 @@ fn dispatch(syscall: Syscall, args: &Args, frame: &mut TrapFrame) -> Result<i64,
 
         Syscall::ProcessCreate => sys_process_create(args),
         Syscall::ProcessStart => sys_process_start(args),
+        Syscall::ProcessLoad => sys_process_load(args),
         Syscall::ProcessExit => sys_process_exit(args),
         Syscall::ThreadCreate => sys_thread_create(args),
         Syscall::ThreadExit => sys_thread_exit(args),
@@ -151,6 +153,13 @@ fn dispatch(syscall: Syscall, args: &Args, frame: &mut TrapFrame) -> Result<i64,
         Syscall::ObjectSignal => sys_object_signal(args),
         Syscall::Clock => Ok(time::now_ns() as i64),
         Syscall::DebugLog => sys_debug_log(args, frame),
+
+        Syscall::DeviceGetVmo => sys_device_get_vmo(args),
+        Syscall::DeviceRead => sys_device_read(args),
+        Syscall::DeviceInfo => sys_device_info(args),
+        Syscall::DevicePioRead => sys_device_pio_read(args),
+        Syscall::DevicePioWrite => sys_device_pio_write(args),
+        Syscall::DeviceDmaAlloc => sys_device_dma_alloc(args),
     }
 }
 
@@ -228,6 +237,49 @@ fn sys_process_start(args: &Args) -> Result<i64, Error> {
     )
     .ok_or(Error::NoMemory)?;
     sched::enqueue(&thread);
+    Ok(0)
+}
+
+/// `process_load(process, image_vmo, image_len, result_ptr) -> status`
+///
+/// The caller supplies an NXF image in a readable VMO. The kernel validates
+/// and maps it with the existing loader, using the capabilities already
+/// granted to the child by `process_create`.
+fn sys_process_load(args: &Args) -> Result<i64, Error> {
+    let parent = current()?;
+    if !parent.granted().contains(CapClass::Load) {
+        return Err(Error::CapabilityDenied);
+    }
+    let process_handle = parent
+        .handles()
+        .get_checked(handle_of(args.a0), Rights::MANAGE_PROCESS)
+        .map_err(map_object_error)?;
+    let child = process_arc(process_handle.object())?;
+    if child.live_threads() > 0 {
+        return Err(Error::BadState);
+    }
+    let image_handle = parent
+        .handles()
+        .get_checked(handle_of(args.a1), Rights::READ)
+        .map_err(map_object_error)?;
+    let image = object_arc::<Vmo>(image_handle.object())?;
+    let size = args.a2 as usize;
+    if size == 0 || size > image.size() as usize || size > 64 * 1024 * 1024 {
+        return Err(Error::InvalidArgument);
+    }
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(size).map_err(|_| Error::NoMemory)?;
+    bytes.resize(size, 0);
+    image.read(0, &mut bytes).map_err(|_| Error::InvalidArgument)?;
+    let loaded = crate::loader::load(&child, &bytes, child.granted()).map_err(|error| match error {
+        crate::loader::LoadError::NoMemory => Error::NoMemory,
+        crate::loader::LoadError::CapabilityDenied(_) => Error::CapabilityDenied,
+        crate::loader::LoadError::Format(_)
+        | crate::loader::LoadError::Mapping
+        | crate::loader::LoadError::MissingDependency(_) => Error::InvalidArgument,
+    })?;
+    let info = LoadedImageInfo { entry: loaded.entry, stack: loaded.stack_top };
+    uaccess::write_struct(args.a3, &info)?;
     Ok(0)
 }
 
@@ -490,6 +542,179 @@ fn sys_memory_transfer(args: &Args) -> Result<i64, Error> {
 }
 
 // ---------------------------------------------------------------------------
+// Devices
+// ---------------------------------------------------------------------------
+
+fn map_device_error(error: DeviceError) -> Error {
+    match error {
+        DeviceError::WrongKind => Error::WrongType,
+        DeviceError::NoMemory => Error::NoMemory,
+        DeviceError::OutOfRange => Error::InvalidArgument,
+    }
+}
+
+/// `device_get_vmo(device) -> handle`
+///
+/// Turns a `Device` capability into a mappable memory object over its MMIO
+/// range. Only meaningful for MMIO-backed devices (today: the framebuffer);
+/// a device with no MMIO range fails with `WrongType`.
+fn sys_device_get_vmo(args: &Args) -> Result<i64, Error> {
+    let process = current()?;
+    let handle = process
+        .handles()
+        .get_checked(handle_of(args.a0), Rights::DEVICE_IO)
+        .map_err(map_object_error)?;
+    let device = object_arc::<Device>(handle.object())?;
+    let vmo = device.vmo().map_err(map_device_error)?;
+    let rights = vmo.default_rights();
+    let handle = process.install_object(vmo, rights).map_err(map_object_error)?;
+    Ok(handle.0 as i64)
+}
+
+/// `device_info(device, out_ptr) -> status`
+///
+/// Reports a device's kind-specific properties -- today, just the
+/// framebuffer's geometry, which a driver needs before it can address a
+/// single pixel and which nothing generic like `capability_query` should
+/// carry.
+fn sys_device_info(args: &Args) -> Result<i64, Error> {
+    use crate::obj::device::DeviceKind;
+    use nodeos_abi::types::{device_kind, DeviceInfo};
+
+    let process = current()?;
+    let handle = process
+        .handles()
+        .get_checked(handle_of(args.a0), Rights::GET_PROPERTY)
+        .map_err(map_object_error)?;
+    let device = object_arc::<Device>(handle.object())?;
+
+    let info = match device.kind() {
+        DeviceKind::FramebufferMmio { width, height, pitch, bpp, .. } => {
+            DeviceInfo { kind: device_kind::FRAMEBUFFER, width, height, pitch, bpp: bpp as u32, ..Default::default() }
+        }
+        DeviceKind::Ps2Keyboard => DeviceInfo { kind: device_kind::PS2_KEYBOARD, ..Default::default() },
+        DeviceKind::Pci { role, vendor, device, windows, irq } => {
+            let mut info = DeviceInfo {
+                kind: match role {
+                    crate::obj::device::PciRole::Ac97 => device_kind::AC97,
+                    crate::obj::device::PciRole::VirtioBlk => device_kind::VIRTIO_BLK,
+                },
+                vendor: vendor as u32,
+                device: device as u32,
+                irq: irq as u32,
+                ..Default::default()
+            };
+            for (index, window) in windows.iter().enumerate() {
+                info.port_base[index] = window.base as u32;
+                info.port_len[index] = window.len as u32;
+            }
+            info
+        }
+    };
+    uaccess::write_struct(args.a1, &info)?;
+    Ok(0)
+}
+
+/// `device_read(device, buf_ptr, buf_len) -> bytes`
+///
+/// Drains up to `buf_len` queued bytes (e.g. keyboard scancodes) into the
+/// caller's buffer, non-blocking: an empty device reads back `0`. Callers
+/// `wait` on the handle's `READABLE` signal first, the same idiom as a
+/// channel.
+fn sys_device_read(args: &Args) -> Result<i64, Error> {
+    let process = current()?;
+    let handle = process
+        .handles()
+        .get_checked(handle_of(args.a0), Rights::READ)
+        .map_err(map_object_error)?;
+    let device = object_arc::<Device>(handle.object())?;
+
+    let len = (args.a2 as usize).min(uaccess::MAX_COPY);
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|_| Error::NoMemory)?;
+    bytes.resize(len, 0);
+    let n = device.drain(&mut bytes);
+    uaccess::write_bytes(args.a1, &bytes[..n])?;
+    Ok(n as i64)
+}
+
+/// `device_pio_read(device, window, offset, width) -> value`
+///
+/// The narrow waist of userspace driver support: ring 3 cannot execute `in`,
+/// so it asks the kernel to, and the kernel's only question is whether the
+/// port is inside a window this device decodes. There is no port number in
+/// this interface at all -- the caller names an offset within a window it was
+/// granted, so a driver that gets the arithmetic wrong reads its own device's
+/// register or an error, never somebody else's hardware.
+fn sys_device_pio_read(args: &Args) -> Result<i64, Error> {
+    let process = current()?;
+    let handle = process
+        .handles()
+        .get_checked(handle_of(args.a0), Rights::DEVICE_IO)
+        .map_err(map_object_error)?;
+    let device = object_arc::<Device>(handle.object())?;
+    device
+        .pio_read(args.a1 as usize, args.a2 as u16, args.a3 as u8)
+        .map(|value| value as i64)
+        .map_err(map_device_error)
+}
+
+/// `device_pio_write(device, window, offset, width, value) -> status`
+///
+/// See [`sys_device_pio_read`].
+fn sys_device_pio_write(args: &Args) -> Result<i64, Error> {
+    let process = current()?;
+    let handle = process
+        .handles()
+        .get_checked(handle_of(args.a0), Rights::DEVICE_IO)
+        .map_err(map_object_error)?;
+    let device = object_arc::<Device>(handle.object())?;
+    device
+        .pio_write(args.a1 as usize, args.a2 as u16, args.a3 as u8, args.a4 as u32)
+        .map(|()| 0)
+        .map_err(map_device_error)
+}
+
+/// `device_dma_alloc(device, len, out_ptr) -> status`
+///
+/// Returns a memory object and the physical address a bus-mastering device
+/// must be pointed at. Gated on the device handle rather than on a memory
+/// right, because knowing a physical address is only useful to something that
+/// can make a device follow it, and that is what the device capability is.
+fn sys_device_dma_alloc(args: &Args) -> Result<i64, Error> {
+    use nodeos_abi::types::DmaInfo;
+
+    let process = current()?;
+    let handle = process
+        .handles()
+        .get_checked(handle_of(args.a0), Rights::DEVICE_IO)
+        .map_err(map_object_error)?;
+    let device = object_arc::<Device>(handle.object())?;
+
+    let vmo = device.dma_alloc(args.a1).map_err(map_device_error)?;
+    let info = DmaInfo {
+        handle: 0,
+        _reserved: 0,
+        phys: vmo.phys_base(),
+        len: vmo.size(),
+    };
+    let rights = vmo.default_rights();
+    let value = process
+        .handles()
+        .insert(Handle::root(vmo, rights))
+        .map_err(map_object_error)?;
+    let info = DmaInfo { handle: value.0, ..info };
+    // Written after the handle exists so a failed copy-out cannot leave the
+    // caller with a physical address and no object, which is the one ordering
+    // that would matter here.
+    if let Err(error) = uaccess::write_struct(args.a2, &info) {
+        let _ = process.handles().remove(value);
+        return Err(error);
+    }
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
 // Communication
 // ---------------------------------------------------------------------------
 
@@ -683,6 +908,7 @@ fn sys_capability_query(args: &Args) -> Result<i64, Error> {
         rights: handle.rights().0,
         signals: header.signals().get().0,
         grant_depth: handle.grant().depth(),
+        size: crate::obj::downcast::<Vmo>(handle.object()).map_or(0, |vmo| vmo.size()),
     };
     uaccess::write_struct(args.a1, &info)?;
     Ok(0)
@@ -763,13 +989,20 @@ fn sys_wait(args: &Args) -> Result<i64, Error> {
             .enumerate()
             .any(|(index, item)| objects[index].header().signals().get().0 & item.wanted != 0);
         if !raised {
-            if deadline == 0 {
-                sched::block_current();
-            } else {
-                // With a deadline and no timer objects yet, spin at scheduler
-                // granularity rather than risk sleeping past it.
-                sched::yield_now();
+            if deadline != 0 {
+                // Two things can end this wait -- a signal or the clock -- so
+                // the thread is registered with both and blocks once. Spinning
+                // here instead (which is what this did before there was a
+                // sleeper list) made a service polling on a few milliseconds
+                // starve every other process on the machine: it was runnable
+                // at every scheduling decision and nothing else ever got
+                // picked. See `time::wake_expired`.
+                time::sleep_until(&thread, deadline);
             }
+            sched::block_current();
+        }
+        if deadline != 0 {
+            time::cancel_sleep(&thread);
         }
         for object in &objects {
             object.header().signals().queue().unpark(&thread);

@@ -17,6 +17,7 @@
 use super::trap::TrapFrame;
 use super::{cpu, percpu};
 use crate::{error, kprintln};
+use crate::sched::current_process;
 
 /// Human-readable name for an architectural vector.
 pub fn vector_name(vector: u8) -> &'static str {
@@ -160,13 +161,13 @@ pub fn handle(frame: &mut TrapFrame) {
                 return;
             }
 
-            fatal(frame, Some((address, error)));
+            handle_exception(frame, Some((address, error)));
         }
 
         // #BP and #DB belong to whoever is debugging the faulting thread.
         1 | 3 if frame.from_user() => {
             if !report_to_user(frame) {
-                fatal(frame, None);
+                handle_exception(frame, None);
             }
         }
 
@@ -175,7 +176,7 @@ pub fn handle(frame: &mut TrapFrame) {
             if frame.from_user() && report_to_user(frame) {
                 return;
             }
-            fatal(frame, None);
+            handle_exception(frame, None);
         }
     }
 }
@@ -189,10 +190,32 @@ fn report_to_user(frame: &mut TrapFrame) -> bool {
     }
 }
 
-fn fatal(frame: &TrapFrame, page_fault: Option<(u64, PageFaultError)>) -> ! {
+fn handle_exception(frame: &mut TrapFrame, page_fault: Option<(u64, PageFaultError)>) {
     let vector = frame.vector as u8;
+
+    if frame.from_user() {
+        if let Some(proc) = current_process() {
+            kprintln!();
+            error!("fatal exception in user mode (PID {})", proc.pid());
+            kprintln!("  vector {vector} -- {}", vector_name(vector));
+            if let Some((address, err)) = page_fault {
+                kprintln!("  faulting address {address:#018x} ({err})");
+            }
+            kprintln!("{frame}");
+
+            // Execute the traitor!
+            proc.terminate(-11); 
+            crate::sched::schedule(); 
+
+            // Return cleanly -- the assembly exit stub / scheduler will 
+            // swap to the next runnable context!
+            return;
+        }
+    }
+
+    // If it was Ring 0 (kernel mode), or no process context existed:
     kprintln!();
-    error!("fatal exception in {} mode", if frame.from_user() { "user" } else { "kernel" });
+    error!("FATAL KERNEL PANIC: unhandled exception in kernel mode");
     kprintln!("  vector {vector} -- {}", vector_name(vector));
     if let Some((address, err)) = page_fault {
         kprintln!("  faulting address {address:#018x} ({err})");

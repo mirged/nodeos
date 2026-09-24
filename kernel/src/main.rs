@@ -94,6 +94,14 @@ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
     }
     info!("physical memory: {} MiB usable, top of RAM {:#x}", usable / (1024 * 1024), highest);
 
+    match boot_info.framebuffer() {
+        Some(fb) => info!(
+            "framebuffer: {}x{}x{} at {:#x} (pitch {})",
+            fb.width, fb.height, fb.bpp, fb.addr, fb.pitch
+        ),
+        None => warn!("no framebuffer reported by the loader; the console service will not start"),
+    }
+
     for module in boot_info.modules() {
         info!("module {:?}: {:#x}..{:#x} ({} KiB)", module.name, module.start, module.end, module.len() / 1024);
     }
@@ -148,9 +156,34 @@ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
     // SAFETY: interrupts are disabled and the GDT has the SYSCALL layout.
     unsafe { syscall::init() };
 
+    // ---- Devices -------------------------------------------------------------
+    // The framebuffer and keyboard are the only two devices this kernel knows
+    // about; both are claimed once here and handed to the console module by
+    // the launcher, never touched directly by the kernel again.
+    let framebuffer = boot_info
+        .framebuffer()
+        .map(|fb| obj::Device::framebuffer(fb.addr, fb.width, fb.height, fb.pitch, fb.bpp));
+    let keyboard = obj::Device::ps2_keyboard();
+    // SAFETY: the local APIC is up (`arch::x86_64::init_boot_cpu` ran above)
+    // and no keyboard interrupt can have occurred yet, since IRQ1 is still
+    // masked at the 8259 until this call unmasks it.
+    unsafe { arch::x86_64::interrupt::install_keyboard_handler(keyboard.clone()) };
+
+    // Everything else this kernel can claim is on the PCI bus, and it claims
+    // only what a driver in this tree knows how to drive. A function nobody
+    // asks for is left alone: unclaimed hardware is not a problem to be
+    // solved, and a capability nobody holds is authority nobody has.
+    // SAFETY: the boot CPU, single-threaded, before any userspace exists.
+    let functions = unsafe { arch::x86_64::pci::scan() };
+    info!("pci: {} function(s) on the bus", functions.len());
+    let audio = claim_pci(&functions, obj::device::PciRole::Ac97, "audio");
+    let storage = claim_pci(&functions, obj::device::PciRole::VirtioBlk, "storage");
+
+    let devices = launch::BootDevices { framebuffer, keyboard, audio, storage };
+
     // SAFETY: memory management and the scheduler are up, and `boot_info` has
     // been relocated to the direct physical map.
-    let launched = unsafe { launch::launch_boot_modules(&boot_info) };
+    let launched = unsafe { launch::launch_boot_modules(&boot_info, &devices) };
     info!("{} boot module(s) launched", launched.len());
 
     // `nodeos.autotest` turns a boot into a test run: wait for userspace to
@@ -169,14 +202,63 @@ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
 
 
 
+/// Claim the first PCI function a driver in this tree knows how to drive.
+///
+/// The match is on what the device *is*, not on where it sits: an AC'97 is an
+/// AC'97 whether QEMU put it at 00:04.0 or 00:1b.0, and a kernel that hard-codes
+/// bus addresses is a kernel that works on exactly one machine.
+fn claim_pci(
+    functions: &[arch::x86_64::pci::Function],
+    role: obj::device::PciRole,
+    what: &str,
+) -> Option<alloc::sync::Arc<obj::Device>> {
+    // Which BARs the driver is handed, in the order it expects them. AC'97
+    // decodes its mixer and its bus-master engine separately; virtio's legacy
+    // interface is one window.
+    let (matches, bars): (fn(&arch::x86_64::pci::Function) -> bool, &[usize]) = match role {
+        // Class 4 subclass 1 is "multimedia audio controller", which is what
+        // an AC'97 reports. Matching the class rather than Intel's device id
+        // costs nothing and covers the several vendors that shipped one.
+        obj::device::PciRole::Ac97 => (|f| f.class == 0x04 && f.subclass == 0x01, &[0, 1]),
+        // 0x1AF4:0x1001 is the legacy/transitional virtio block device. The
+        // modern-only id (0x1042) is deliberately not matched: it speaks
+        // through PCI capabilities and MMIO, and the driver here speaks the
+        // legacy port interface.
+        obj::device::PciRole::VirtioBlk => (|f| f.vendor == 0x1AF4 && f.device == 0x1001, &[0]),
+    };
+
+    let function = functions.iter().find(|f| matches(f) && f.io_port(bars[0]).is_some())?;
+    // SAFETY: `function` came from the scan above, nothing else holds a
+    // capability over it, and userspace does not exist yet.
+    let device = unsafe { obj::Device::pci(role, function, bars) };
+    info!(
+        "pci: claimed {} at {:02x}:{:02x}.{} ({:04x}:{:04x}) for {:?}",
+        what,
+        function.address.bus,
+        function.address.slot,
+        function.address.func,
+        function.vendor,
+        function.device,
+        role
+    );
+    Some(device)
+}
+
 fn banner() {
     kprintln!();
-    kprintln!("\x1b[1;36m  ##    ##                #########   ######\x1b[0m");
-    kprintln!("\x1b[1;36m  ###   ##  ####   ####   ##     ##  ##    ##\x1b[0m");
-    kprintln!("\x1b[1;36m  ## ## ## ##  ## ##  ##  ##     ##  ##\x1b[0m");
-    kprintln!("\x1b[1;36m  ##  #### ##  ## ##  ##  ##     ##   ######\x1b[0m");
-    kprintln!("\x1b[1;36m  ##   ###  ####   ####   #########  ######\x1b[0m");
+
+    kprintln!("\x1b[1;36m ****     **               **           *******    ********\x1b[0m");
+    kprintln!("\x1b[1;36m/**/**   /**              /**          **/////**  **////// \x1b[0m");
+    kprintln!("\x1b[1;36m/**//**  /**  ******      /**  *****  **     //**/**       \x1b[0m");
+    kprintln!("\x1b[1;36m/** //** /** **////**  ****** **///**/**      /**/*********\x1b[0m");
+    kprintln!("\x1b[1;36m/**  //**/**/**   /** **///**/*******/**      /**////////**\x1b[0m");
+    kprintln!("\x1b[1;36m/**   //****/**   /**/**  /**/**//// //**     **        /**\x1b[0m");
+    kprintln!("\x1b[1;36m/**    //***//****** //******//****** //*******   ******** \x1b[0m");
+    kprintln!("\x1b[1;36m//      ///  //////   //////  //////   ///////   ////////  \x1b[0m");
+
     kprintln!();
+
     kprintln!("  \x1b[1mNodeOS {VERSION}\x1b[0m -- capability-based research microkernel (x86-64)");
+
     kprintln!();
 }

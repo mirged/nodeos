@@ -10,9 +10,13 @@
 //! states); when CPUID says otherwise the timer-tick counter is used instead,
 //! at millisecond resolution.
 
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch::x86_64::{cpu, interrupt, percpu, pit};
+use crate::sync::IrqSpinLock;
+use crate::task::thread::Thread;
 
 /// Nanoseconds in a second.
 pub const NANOS_PER_SEC: u64 = 1_000_000_000;
@@ -106,5 +110,78 @@ pub fn spin_ns(ns: u64) {
     let deadline = now_ns() + ns;
     while now_ns() < deadline {
         cpu::pause();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sleeping until a deadline
+// ---------------------------------------------------------------------------
+
+/// One thread waiting for the clock to reach `deadline_ns`.
+///
+/// The reference is weak for the same reason a wait queue's is: a thread that
+/// is destroyed while sleeping must not be kept alive by the fact that it was.
+struct Sleeper {
+    deadline_ns: u64,
+    thread: Weak<Thread>,
+}
+
+/// Everyone waiting on the clock.
+///
+/// A vector scanned once per tick rather than a heap or a timer wheel. At a
+/// thousand ticks a second and a handful of sleepers -- which is what a NodeOS
+/// boot has, one per service that polls -- the scan is a few comparisons, and
+/// the alternative is a data structure whose correctness under an interrupt
+/// would need arguing.
+static SLEEPERS: IrqSpinLock<Vec<Sleeper>> = IrqSpinLock::new(Vec::new());
+
+/// Register `thread` to be woken once the clock passes `deadline_ns`.
+///
+/// The caller blocks itself afterwards, exactly as it would after parking on a
+/// wait queue -- and it may park on both, which is what a wait with a timeout
+/// is: two things that can end it, whichever comes first.
+pub fn sleep_until(thread: &Arc<Thread>, deadline_ns: u64) {
+    let mut sleepers = SLEEPERS.lock();
+    if let Some(existing) = sleepers.iter_mut().find(|s| s.thread.as_ptr() == Arc::as_ptr(thread)) {
+        existing.deadline_ns = deadline_ns;
+        return;
+    }
+    sleepers.push(Sleeper { deadline_ns, thread: Arc::downgrade(thread) });
+}
+
+/// Cancel `thread`'s registration, whether or not it has expired.
+pub fn cancel_sleep(thread: &Arc<Thread>) {
+    SLEEPERS.lock().retain(|s| s.thread.as_ptr() != Arc::as_ptr(thread));
+}
+
+/// Wake every thread whose deadline has passed. Called from the timer tick.
+///
+/// This is what makes a timed wait a *sleep*. Before it existed, a wait with a
+/// deadline spun at scheduler granularity -- yield, re-check, yield -- and a
+/// service polling a device on a five-millisecond period would take the whole
+/// machine with it: the spinning thread was runnable at every scheduling
+/// decision, so nothing else with work to do ever got picked. A sound card
+/// being fed on time is not a reason for the rest of userspace to stop.
+pub fn wake_expired() {
+    let now = now_ns();
+    let expired: Vec<Arc<Thread>> = {
+        let mut sleepers = SLEEPERS.lock();
+        let mut expired = Vec::new();
+        sleepers.retain(|sleeper| {
+            if sleeper.deadline_ns > now {
+                return true;
+            }
+            if let Some(thread) = sleeper.thread.upgrade() {
+                expired.push(thread);
+            }
+            false
+        });
+        expired
+    };
+    // Woken outside the lock: `wake` takes the run queue's, and holding both
+    // in one order here and the other order anywhere else is how a kernel
+    // deadlocks under interrupt.
+    for thread in expired {
+        crate::sched::wake(&thread);
     }
 }

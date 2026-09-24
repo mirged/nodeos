@@ -21,7 +21,7 @@ use crate::sync::IrqSpinLock;
 use super::layout::{self, Window};
 use super::paging::{self, Mapper, PageFlags};
 use super::phys;
-use super::vmo::Vmo;
+use super::vmo::{Vmo, VmoKind};
 
 /// How a region may be accessed.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -270,7 +270,14 @@ impl AddressSpace {
                 let Ok(Some(pfn)) = vmo.page(index, true) else {
                     return Err(SpaceError::OutOfMemory);
                 };
-                phys::incref(pfn);
+                // A physical VMO's frames are device MMIO, outside the buddy
+                // allocator's managed range entirely (see `Vmo::new_physical`
+                // and its `Drop` impl, which likewise never decrefs them) --
+                // refcounting them would panic, and there is no pool for them
+                // to be freed back into regardless.
+                if vmo.kind() != VmoKind::Physical {
+                    phys::incref(pfn);
+                }
                 // SAFETY: this address space is owned by this object; `base+i`
                 // was verified free above.
                 unsafe {
@@ -297,11 +304,14 @@ impl AddressSpace {
     fn tear_down_region(&self, region: &Region) {
         let mapper = self.mapper();
         let pages = (region.len / PAGE_SIZE as u64) as usize;
+        // See the matching comment in `map`: a physical VMO's frames are not
+        // in the refcounted pool, so unmapping one must not decref it either.
+        let tracked = region.vmo.kind() != VmoKind::Physical;
         for i in 0..pages {
             let virt = region.base + (i * PAGE_SIZE) as u64;
             // SAFETY: this space owns these mappings and is removing them.
             if let Some(entry) = unsafe { mapper.unmap(virt) } {
-                if entry.is_present() {
+                if tracked && entry.is_present() {
                     phys::decref(entry.pfn());
                 }
             }
@@ -395,14 +405,21 @@ impl AddressSpace {
 
         // Demand paging: commit the backing page and install it.
         let Ok(Some(pfn)) = region.vmo.page(index, true) else { return false };
-        phys::incref(pfn);
+        // See the matching comment in `map`: a physical VMO's frames are not
+        // in the refcounted pool at all.
+        let tracked = region.vmo.kind() != VmoKind::Physical;
+        if tracked {
+            phys::incref(pfn);
+        }
         let page_flags = region.flags.to_page_flags(!self.is_kernel);
         // SAFETY: this address space is owned by this object, and the region
         // covering `page_addr` authorises exactly these permissions.
         match unsafe { mapper.map(page_addr, phys::pfn_to_phys(pfn), page_flags, true) } {
             Ok(()) => true,
             Err(_) => {
-                phys::decref(pfn);
+                if tracked {
+                    phys::decref(pfn);
+                }
                 false
             }
         }

@@ -8,6 +8,7 @@
 //! and nothing for a "superuser" bit to override.
 
 pub mod capclass;
+pub mod device;
 pub mod grant;
 pub mod handle;
 pub mod rights;
@@ -20,6 +21,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::IrqSpinLock;
 
 pub use capclass::{CapClass, CapSet};
+pub use device::Device;
 pub use grant::Grant;
 pub use handle::{Handle, HandleTable, HandleValue};
 pub use rights::Rights;

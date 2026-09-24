@@ -9,6 +9,7 @@ pub mod boot;
 pub mod cpu;
 pub mod exception;
 pub mod interrupt;
+pub mod pci;
 pub mod percpu;
 pub mod pic;
 pub mod pit;

@@ -158,6 +158,11 @@ pub fn enqueue(thread: &Arc<Thread>) {
 }
 
 /// Make a blocked thread runnable. Returns `true` if it was actually woken.
+///
+/// A thread that is *not* blocked yet is the interesting case: it is somewhere
+/// between re-checking its condition and [`block_current`], and dropping the
+/// wakeup here would leave it asleep on a condition that is already true. The
+/// wakeup is recorded on the thread instead, and `block_current` consumes it.
 pub fn wake(thread: &Arc<Thread>) -> bool {
     match thread.state() {
         ThreadState::Blocked => {
@@ -168,7 +173,11 @@ pub fn wake(thread: &Arc<Thread>) -> bool {
                 false
             }
         }
-        _ => false,
+        ThreadState::Dead => false,
+        _ => {
+            thread.set_wake_pending();
+            false
+        }
     }
 }
 
@@ -176,8 +185,15 @@ pub fn wake(thread: &Arc<Thread>) -> bool {
 ///
 /// The caller must already have parked the thread on whatever wait queue will
 /// wake it, *before* calling this, or the wakeup can be lost.
+///
+/// Returns without blocking if a wakeup arrived while the caller was still
+/// deciding to block -- see [`Thread::set_wake_pending`]. Callers are loops
+/// that re-check their condition, so an early return costs one extra pass.
 pub fn block_current() {
     let Some(thread) = current_thread() else { return };
+    if thread.take_wake_pending() {
+        return;
+    }
     thread.set_state(ThreadState::Blocked);
     schedule();
 }
@@ -221,6 +237,10 @@ fn tick(_frame: &mut TrapFrame) {
     if !is_enabled() {
         return;
     }
+    // Sleepers first: a thread whose deadline has just passed should be on the
+    // run queue before this tick decides whether to preempt, or it waits an
+    // extra millisecond for no reason.
+    time::wake_expired();
     let cpu = this_cpu();
     let sched = scheduler(cpu);
 

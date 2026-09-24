@@ -86,6 +86,16 @@ pub unsafe fn syscall4(number: Syscall, a0: u64, a1: u64, a2: u64, a3: u64) -> i
     unsafe { syscall6(number, a0, a1, a2, a3, 0, 0) }
 }
 
+/// Issue a syscall with five arguments.
+///
+/// # Safety
+/// See [`syscall6`].
+#[inline(always)]
+pub unsafe fn syscall5(number: Syscall, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
+    // SAFETY: forwarded contract.
+    unsafe { syscall6(number, a0, a1, a2, a3, a4, 0) }
+}
+
 /// Convert a raw return value into a [`Status`].
 #[inline]
 pub fn status(raw: i64) -> Status {

@@ -195,6 +195,31 @@ unsafe fn start_timer(tick_hz: u32) {
     }
 }
 
+/// Delivery mode bits (10:8) for ExtINT: "deliver as if the 8259 asserted
+/// this pin directly", which is how a legacy PIC's IRQs reach the CPU on a
+/// machine with no I/O APIC in use.
+const LVT_DELIVERY_EXTINT: u32 = 0b111 << 8;
+
+/// Let the legacy 8259 PIC's interrupts reach the CPU through the local
+/// APIC's LINT0 pin.
+///
+/// `init` masks LINT0 unconditionally, on the assumption that local
+/// interrupt pins are "firmware's business". That is true for LINT1 (NMI) but
+/// not for LINT0 on a machine with no I/O APIC driver: LINT0 is the only path
+/// a PIC-sourced IRQ (here, PS/2 IRQ1) has to the CPU at all. Call this only
+/// once a handler is installed for the vector the PIC will assert and the
+/// corresponding PIC line is about to be unmasked.
+///
+/// # Safety
+/// The APIC must already be enabled ([`init`] must have run).
+pub unsafe fn enable_legacy_irq_passthrough() {
+    if !is_enabled() {
+        return;
+    }
+    // SAFETY: the APIC window is mapped once `is_enabled()` is true.
+    unsafe { write(REG_LVT_LINT0, LVT_DELIVERY_EXTINT) };
+}
+
 /// Acknowledge the interrupt currently in service.
 ///
 /// # Safety

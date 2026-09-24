@@ -142,6 +142,17 @@ impl Channel {
             drop(inbox);
 
             peer.header.signals().update(Signals::READABLE, Signals::NONE);
+            // `update` only wakes on a *transition*, and a message queued
+            // behind another one does not change the signal word: the peer was
+            // already readable. That is enough for a receiver waiting for
+            // "anything", and not enough for one in `call`, which is waiting
+            // for a particular transaction id and has to re-run its search
+            // every time the queue grows. Waking here unconditionally is the
+            // difference between a display client that blocks for one frame
+            // and one that blocks forever, because a compositor event
+            // arriving before the reply left the reply with no wakeup of its
+            // own to ride in on.
+            peer.header.signals().queue().wake_all();
             if full {
                 // The peer's inbox is full, so *we* are no longer writable.
                 self.header.signals().update(Signals::NONE, Signals::WRITABLE);
@@ -213,12 +224,28 @@ impl Channel {
 
     /// Take the first queued message whose `txid` matches, leaving others in
     /// place. Used to correlate a reply with its request.
+    ///
+    /// Mirrors [`Channel::receive`]'s signal bookkeeping: `READABLE` must drop
+    /// when this empties the inbox, not just when a plain `receive` does, or a
+    /// second `call` on the same channel can never be woken. A reply removed
+    /// from the middle of the queue leaves other queued traffic's readability
+    /// untouched.
     pub fn receive_reply(&self, txid: u64) -> Result<Message, ChannelError> {
         let mut inbox = self.inbox.lock();
         if let Some(position) = inbox.queue.iter().position(|m| m.txid == txid && m.flags.contains(MessageFlags::REPLY))
         {
             let message = inbox.queue.remove(position).expect("position from iter");
             inbox.bytes -= message.cost();
+            let empty = inbox.queue.is_empty();
+            drop(inbox);
+            if empty {
+                self.header.signals().update(Signals::NONE, Signals::READABLE);
+            }
+            // Room freed here makes the *peer* writable again, as in `receive`.
+            if let Some(peer) = self.peer() {
+                peer.header.signals().update(Signals::WRITABLE, Signals::NONE);
+            }
+            self.space_available.wake_all();
             return Ok(message);
         }
         drop(inbox);

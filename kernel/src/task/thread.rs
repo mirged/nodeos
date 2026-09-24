@@ -10,7 +10,7 @@
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 use crate::arch::x86_64::trap::TrapFrame;
 use crate::arch::x86_64::{percpu, segmentation};
@@ -76,7 +76,63 @@ pub enum ThreadEntry {
 
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 
+/// Bytes an `FXSAVE` image occupies, reserved at the very top of every kernel
+/// stack for the owning thread's user-mode x87/SSE state.
+///
+/// # Why the kernel has to save this at all
+///
+/// The obvious reading is that only a program doing floating-point arithmetic
+/// has SSE state worth preserving, and this kernel deliberately runs no such
+/// program. That reading is wrong, and it is wrong in a way that produces
+/// silent data corruption rather than a fault.
+///
+/// The compiler emits SSE for ordinary data movement -- a 16-byte struct copy
+/// becomes `movups xmm0, [src]` / `movups [dst], xmm0`. If the *store* faults
+/// (a first touch of a demand-paged page, say), the kernel runs, clobbers
+/// `xmm0` with whatever its own compiled code puts there, and returns to retry
+/// the instruction. The retry then writes the kernel's leftovers instead of
+/// the program's data. Nothing faults, nothing is logged, and a struct arrives
+/// at the far end of an IPC message with the right length and the wrong
+/// contents.
+///
+/// So the state is saved on every entry from ring 3 and restored on every
+/// return to it. Kernel-mode entries are exempt because the kernel runs with
+/// interrupts disabled (see `docs/ARCHITECTURE.md`), so no kernel SSE
+/// operation can be interrupted part-way.
+pub const FPU_AREA_SIZE: u64 = 512;
+
+/// Base of the FPU save area at the top of a kernel stack -- which is also the
+/// highest address the stack itself may use, since the area sits above it.
+///
+/// The entry stubs find this address as `gs:[16]`, the same slot they already
+/// read to get a kernel stack, so preserving the state costs no new per-CPU
+/// bookkeeping.
+pub fn fpu_area(raw_stack_top: u64) -> u64 {
+    (raw_stack_top - FPU_AREA_SIZE) & !0xF
+}
+
+/// Write a valid, empty `FXSAVE` image, so that a restore is well defined even
+/// if one somehow happens before the first save.
+///
+/// # Safety
+/// `area` must point at [`FPU_AREA_SIZE`] writable, 16-byte-aligned bytes.
+unsafe fn init_fpu_area(area: u64) {
+    // SAFETY: the caller guarantees the range.
+    unsafe { core::ptr::write_bytes(area as *mut u8, 0, FPU_AREA_SIZE as usize) };
+    // An all-zero image is not a safe one: it means FCW = 0 (every x87
+    // exception unmasked) and MXCSR = 0 (every SIMD exception unmasked), so
+    // the first ordinary calculation would trap. These are the reset values.
+    // SAFETY: as above; both offsets are within the image.
+    unsafe {
+        core::ptr::write((area) as *mut u16, 0x037F); // FCW
+        core::ptr::write((area + 24) as *mut u32, 0x1F80); // MXCSR
+    }
+}
+
 /// Address of the trap-frame slot reserved at the top of a kernel stack.
+///
+/// `stack_top` is the *usable* top -- [`fpu_area`] applied to the raw top --
+/// so the trap frame never overlaps the FPU save area above it.
 ///
 /// Kept 16-byte aligned so the frame is usable by SSE stores and so the switch
 /// frame planted below it lands on a predictable boundary.
@@ -111,6 +167,17 @@ pub struct Thread {
     pub(crate) timeslice_ns: AtomicU64,
     /// Trap frame of the thread while it is stopped in an exception.
     pub(crate) fault_frame: IrqSpinLock<Option<TrapFrame>>,
+    /// A wakeup that arrived while this thread was still running.
+    ///
+    /// Every blocking path in the kernel has the same shape: park on a wait
+    /// queue, re-check the condition, then [`crate::sched::block_current`].
+    /// A preemption between the re-check and the block leaves a window where
+    /// [`crate::sched::wake`] sees a *runnable* thread and has nothing to do,
+    /// and the wakeup is lost -- the thread blocks a moment later on a
+    /// condition that has already been satisfied and never hears about it
+    /// again. `wake` records the wakeup here instead of dropping it, and
+    /// `block_current` consumes it and declines to block.
+    wake_pending: AtomicBool,
 }
 
 // SAFETY: `saved_rsp` is only touched by the scheduler, with interrupts
@@ -121,7 +188,15 @@ impl Thread {
     /// Create a thread that will run `entry` inside `process`.
     pub fn new(process: &Arc<Process>, name: &str, entry: ThreadEntry, params: SchedParams) -> Option<Arc<Self>> {
         let stack = KernelStack::new()?;
-        let stack_top = stack.top();
+        // The usable top, with the FPU save area carved off above it. Every
+        // other user of this stack -- the trap frame slot, `TSS.RSP0`, the
+        // syscall stub's `gs:[16]` -- works from this address, so the save
+        // area is out of reach of anything the stack itself does.
+        let stack_top = fpu_area(stack.top());
+        // SAFETY: the area is inside the stack just allocated above, nothing
+        // else references it yet, and `fpu_area` returns a 16-byte-aligned
+        // address.
+        unsafe { init_fpu_area(stack_top) };
 
         // Plant an initial switch frame so the first `switch_to` into this
         // thread returns straight into the trampoline. The trap frame area is
@@ -166,6 +241,7 @@ impl Thread {
             vruntime: AtomicU64::new(0),
             timeslice_ns: AtomicU64::new(0),
             fault_frame: IrqSpinLock::new(None),
+            wake_pending: AtomicBool::new(false),
         });
         thread.header.set_name(name);
         process.add_thread(&thread);
@@ -193,6 +269,7 @@ impl Thread {
             vruntime: AtomicU64::new(0),
             timeslice_ns: AtomicU64::new(0),
             fault_frame: IrqSpinLock::new(None),
+            wake_pending: AtomicBool::new(false),
         });
         thread.header.set_name(name);
         process.add_thread(&thread);
@@ -226,6 +303,18 @@ impl Thread {
             .is_ok()
     }
 
+    /// Record a wakeup that found this thread still runnable.
+    ///
+    /// See [`Thread::wake_pending`] for why one has to be remembered at all.
+    pub fn set_wake_pending(&self) {
+        self.wake_pending.store(true, Ordering::Release);
+    }
+
+    /// Consume a pending wakeup, reporting whether there was one.
+    pub fn take_wake_pending(&self) -> bool {
+        self.wake_pending.swap(false, Ordering::AcqRel)
+    }
+
     /// Scheduling parameters.
     pub fn params(&self) -> SchedParams {
         *self.params.lock()
@@ -254,9 +343,14 @@ impl Thread {
 
     /// Top of the kernel stack, which is what `TSS.RSP0` must hold while this
     /// thread runs.
+    /// The highest address this thread's kernel stack may use.
+    ///
+    /// Not the raw top of the allocation: [`FPU_AREA_SIZE`] bytes above this
+    /// hold the thread's user-mode x87/SSE state, which the entry stubs reach
+    /// through exactly this address.
     pub fn kernel_stack_top(&self) -> u64 {
         match &self.stack {
-            Some(stack) => stack.top(),
+            Some(stack) => fpu_area(stack.top()),
             None => segmentation::kernel_stack(0),
         }
     }

@@ -35,6 +35,13 @@ syscall_entry:
     mov     gs:[8], rsp             /* park the user stack pointer         */
     mov     rsp, gs:[16]            /* adopt this thread's kernel stack    */
 
+    /* Park userspace's x87/SSE state before any kernel code can clobber it.
+       `rsp` is now the stack top, and this thread's 512-byte FXSAVE area is
+       the region starting there -- the stack grows *down* from this address,
+       so the save area and the frame built below never overlap. See
+       `task::thread::fpu_area`.                                            */
+    fxsave64 [rsp]
+
     /* Build a TrapFrame identical in shape to the interrupt path's.        */
     push    0x23                    /* ss  = USER_SS                        */
     push    qword ptr gs:[8]        /* rsp = the user stack pointer         */
@@ -68,6 +75,12 @@ syscall_entry:
     /* The dispatcher returns the frame to resume on, which may belong to a
        different thread if it went through the scheduler.                   */
     mov     rsp, rax
+
+    /* Give userspace its x87/SSE state back. `rax` is scratch: it holds the
+       resumed frame, which `rsp` now points at, and the `pop rax` below
+       replaces it with the syscall's return value.                         */
+    mov     rax, gs:[16]
+    fxrstor64 [rax]
 
     pop     r15
     pop     r14

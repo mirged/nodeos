@@ -33,6 +33,28 @@ pub unsafe fn outb(port: u16, value: u8) {
     unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags)) };
 }
 
+/// Read one 16-bit word from an I/O port.
+///
+/// # Safety
+/// See [`inb`].
+#[inline]
+pub unsafe fn inw(port: u16) -> u16 {
+    let value: u16;
+    // SAFETY: see `inb`.
+    unsafe { asm!("in ax, dx", out("ax") value, in("dx") port, options(nomem, nostack, preserves_flags)) };
+    value
+}
+
+/// Write one 16-bit word to an I/O port.
+///
+/// # Safety
+/// See [`outb`].
+#[inline]
+pub unsafe fn outw(port: u16, value: u16) {
+    // SAFETY: see `outb`.
+    unsafe { asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags)) };
+}
+
 /// Read one 32-bit word from an I/O port.
 ///
 /// # Safety

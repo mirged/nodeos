@@ -69,6 +69,19 @@ global_asm!(
     .short  0
     .long   8
 
+    /* Tag 5: framebuffer request. Asks the loader for a linear graphics
+       mode; GRUB substitutes the closest mode it can set (via VBE on
+       BIOS, or via GOP if GRUB itself was booted through UEFI) and
+       reports the actual geometry in the matching Multiboot2 info tag
+       (parsed by `crate::boot::multiboot2::BootInfo::framebuffer`).      */
+    .balign 8
+    .short  5
+    .short  0
+    .long   20
+    .long   1024                                     /* width            */
+    .long   768                                      /* height           */
+    .long   32                                       /* depth (bpp)      */
+
     /* Tag 0: end of tags. */
     .balign 8
     .short  0

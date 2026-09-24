@@ -1,0 +1,15 @@
+[package]
+name = "doom"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[[bin]]
+name = "doom"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+libnode = { workspace = true }
+nodeos-abi = { workspace = true }

@@ -19,16 +19,34 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use nodeos_abi::message::{BootstrapMessage, KIND_BOOTSTRAP};
-use nodeos_abi::HandleValue;
+use nodeos_abi::{proto, HandleValue};
 
 use crate::boot::BootInfo;
 use crate::ipc::message::Message;
 use crate::ipc::Channel;
 use crate::loader::{self, LoadError};
-use crate::obj::{CapClass, CapSet, Handle, Rights};
+use crate::obj::{CapClass, CapSet, Device, Handle, Rights};
 use crate::sched;
 use crate::task::thread::{Thread, ThreadEntry};
 use crate::task::Process;
+
+/// Devices the boot launcher may grant to specific modules by name.
+///
+/// A launcher in userspace would resolve these from a manifest; the boot set
+/// is small and fixed enough that a struct built once in `kmain` says the same
+/// thing more plainly.
+pub struct BootDevices {
+    /// The boot framebuffer, if the loader reported one. Granted to
+    /// `"compositor"` at index 0 of its bootstrap message's capabilities.
+    pub framebuffer: Option<Arc<Device>>,
+    /// The PS/2 keyboard. Granted to `"compositor"` at index 1.
+    pub keyboard: Arc<Device>,
+    /// The AC'97 audio controller, if the machine has one. Granted to
+    /// `"audio"`, which is the only process that ever touches it.
+    pub audio: Option<Arc<Device>>,
+    /// The virtio block device, if one was attached. Granted to `"fs"`.
+    pub storage: Option<Arc<Device>>,
+}
 
 /// The boot policy: which capability classes each named module may hold.
 ///
@@ -42,13 +60,54 @@ fn policy(name: &str) -> CapSet {
         // load further images. It gets no device or filesystem authority: it
         // hands those to the services that need them, having never held them.
         "init" => base.with(CapClass::Process).with(CapClass::Load).with(CapClass::Clock).with(CapClass::Debug),
-        // The log service needs nothing but its channel.
+        // The compositor is the only thing in the system that holds the
+        // screen and the keyboard. Everything that wants to draw or to be
+        // typed at is one of its clients, and holds a channel instead.
+        "compositor" => base.with(CapClass::Display).with(CapClass::Input),
+        // The console service used to hold those two devices, and with them
+        // the whole screen. It is now a compositor client with a window, so
+        // the floor is all it needs -- which is why it and `doom` can be on
+        // screen at the same time.
         "console" => base,
+        // The filesystem service may create and serve files. It also holds
+        // the disk, because the only thing in this system that speaks blocks
+        // is the thing that speaks files: a separate block-driver process
+        // would be one more address space and one more protocol for exactly
+        // one client. `docs/FILESYSTEM.md` argues that trade honestly.
+        "fs" => base
+            .with(CapClass::FileRead)
+            .with(CapClass::FileWrite)
+            .with(CapClass::FileCreate)
+            .with(CapClass::Device),
+        // The audio service holds the sound card and nothing else -- no
+        // filesystem, no display, no way to learn what it is mixing. It is
+        // handed samples over a channel and it puts them on a ring.
+        "audio" => base.with(CapClass::Audio).with(CapClass::Device).with(CapClass::Clock),
         // The filesystem service may create and serve files; it may not touch
         // devices or the network.
         "ramfs" => base.with(CapClass::FileRead).with(CapClass::FileWrite).with(CapClass::FileCreate),
         // The device manager is the only thing that may claim hardware.
         "devmgr" => base.with(CapClass::Device),
+        // The shell is a console client like any other; it holds no device
+        // capability of its own, only the channels the launcher hands it --
+        // one to the console, one to the filesystem.
+        "shell" => base
+            .with(CapClass::Process)
+            .with(CapClass::Load)
+            .with(CapClass::Debug)
+            .with(CapClass::Clock)
+            .with(CapClass::FileRead)
+            .with(CapClass::FileWrite)
+            .with(CapClass::FileCreate),
+        // Doom is a compositor client too. It does not go through `console`
+        // -- it repaints its whole window 35 times a second and wants raw
+        // make/break scancodes, neither of which the console protocol offers
+        // -- but the window system serves both without either holding a
+        // device. Doom needs the clock for its frame timing, and `Audio` for
+        // the channel to the mixer -- which is still not a device: the sound
+        // card belongs to `audio`, exactly as the screen belongs to the
+        // compositor.
+        "doom" => base.with(CapClass::Clock).with(CapClass::Audio),
         // Anything else gets the floor: memory and channels.
         _ => base,
     }
@@ -64,15 +123,98 @@ pub struct Launched {
     pub name: alloc::string::String,
 }
 
+/// A boot module that is data rather than an executable: no NXF magic, so
+/// nothing to launch. It is turned into a memory object and handed to the
+/// program that declared a use for it.
+///
+/// Doom's IWAD is the only one today. Loading it this way rather than baking
+/// it into the image means the 14 MiB is mapped from where the boot loader
+/// already put it -- the process reads the WAD out of a read-only mapping and
+/// no copy of it is ever made.
+struct DataModule {
+    name: alloc::string::String,
+    vmo: Arc<crate::mm::vmo::Vmo>,
+}
+
+/// Turn a boot module's physical range into a read-only memory object.
+///
+/// # Safety
+/// `start` must be the physical base of a module the frame allocator reserved,
+/// and `len` its length.
+unsafe fn data_module_vmo(name: &str, start: u64, len: u64) -> Option<Arc<crate::mm::vmo::Vmo>> {
+    // A physical VMO can only begin on a page boundary. Multiboot2 loaders
+    // page-align modules, so this is a check rather than a code path with an
+    // alternative -- if it ever fails, refusing beats handing out a mapping
+    // that is silently offset from the data.
+    if start % crate::arch::PAGE_SIZE as u64 != 0 {
+        crate::error!("data module {name:?} is not page-aligned at {start:#x}; ignoring it");
+        return None;
+    }
+    // SAFETY: the frame allocator reserved the module's range at boot, so no
+    // other object claims it, and the launcher is the boot-time root of
+    // authority over what the loader placed in memory.
+    match unsafe { crate::mm::vmo::Vmo::new_physical(start, len) } {
+        Ok(vmo) => Some(vmo),
+        Err(error) => {
+            crate::error!("data module {name:?} could not be mapped: {error:?}");
+            None
+        }
+    }
+}
+
+/// Launch order for the boot set: lower runs first.
+///
+/// Only services other modules are wired to need a rank. Everything else is
+/// equal and keeps the loader's order.
+fn launch_rank(name: &str) -> u32 {
+    match name {
+        "compositor" => 0,
+        // Both are services with clients below them, and neither is a client
+        // of anything, so they can come up in parallel with the console.
+        "audio" | "fs" => 1,
+        "console" => 2,
+        _ => 3,
+    }
+}
+
+/// Introduce `client` to an already-launched `service`, returning the client's
+/// end of the new channel.
+///
+/// This is the only way a NodeOS program ever reaches a service it was not
+/// born holding: somebody who already had the authority to talk to it makes
+/// the introduction. Here that somebody is the boot launcher, because the
+/// alternative at boot is a name server that nothing has a handle to yet.
+fn connect_to(launched: &[Launched], service: &str, client: &str) -> Option<Handle> {
+    let Some(entry) = launched.iter().find(|entry| entry.name == service) else {
+        crate::warn!("{client:?} launched with no {service:?} module to connect to");
+        return None;
+    };
+
+    let (client_end, server_end) = Channel::create_pair();
+    let mut connect = Message::empty(proto::CONNECT);
+    connect.handles.push(Handle::root(server_end, Channel::default_rights()));
+    if entry.control.send(connect).is_err() {
+        crate::error!("failed to introduce {client:?} to {service:?}");
+        return None;
+    }
+    Some(Handle::root(client_end, Channel::default_rights()))
+}
+
 /// Load and start every boot module, returning what was launched.
 ///
 /// # Safety
 /// Must run after the memory manager and the scheduler are up, with
 /// `boot_info` relocated to the direct physical map.
-pub unsafe fn launch_boot_modules(boot_info: &BootInfo) -> Vec<Launched> {
-    let mut launched = Vec::new();
+pub unsafe fn launch_boot_modules(boot_info: &BootInfo, devices: &BootDevices) -> Vec<Launched> {
+    let mut launched: Vec<Launched> = Vec::new();
+    let mut data: Vec<DataModule> = Vec::new();
+    let mut images: Vec<(&str, &[u8])> = Vec::new();
     let mut found = 0usize;
 
+    // First pass: separate executables from data. Data has to be in hand
+    // before anything is started, because a program's bootstrap message is
+    // built once and cannot be added to afterwards -- and the boot loader
+    // gives no guarantee about the order modules appear in.
     for module in boot_info.modules() {
         found += 1;
         let pointer = boot_info.module_ptr(&module);
@@ -80,7 +222,105 @@ pub unsafe fn launch_boot_modules(boot_info: &BootInfo) -> Vec<Launched> {
         // and the direct map covers it, so the bytes are stable and readable.
         let bytes = unsafe { core::slice::from_raw_parts(pointer, module.len()) };
 
-        match launch_one(module.name, bytes) {
+        if bytes.len() >= nodeos_abi::nxf::MAGIC.len() && bytes[..4] == nodeos_abi::nxf::MAGIC {
+            images.push((module.name, bytes));
+        } else {
+            crate::info!("module {:?} is data ({} KiB)", module.name, module.len() / 1024);
+            // SAFETY: `module.start` is the physical base the loader reported
+            // for a range the frame allocator reserved.
+            if let Some(vmo) = unsafe { data_module_vmo(module.name, module.start, module.len() as u64) } {
+                data.push(DataModule { name: alloc::string::String::from(module.name), vmo });
+            }
+        }
+    }
+
+    // The launcher introduces clients to services as it goes, so a service has
+    // to be running before anything that needs a channel to it starts. The
+    // loader gives no ordering guarantee -- GRUB lists modules in whatever
+    // order its configuration file did -- so state the order here rather than
+    // depend on somebody else's file getting it right. A stable sort leaves
+    // everything of equal rank in the order the loader supplied.
+    images.sort_by_key(|(name, _)| launch_rank(name));
+
+    for (name, bytes) in images {
+        // Extra capabilities this module's bootstrap message should carry,
+        // decided here rather than inside `launch_one`, because most of them
+        // depend on another module already being launched -- which only the
+        // caller can know.
+        let extra_handles = match name {
+            // The compositor is the one holder of the screen and the keyboard.
+            // Every other program that draws gets a channel to it instead,
+            // below.
+            "compositor" => match &devices.framebuffer {
+                Some(framebuffer) => alloc::vec![
+                    Handle::root(framebuffer.clone(), framebuffer.default_rights()),
+                    Handle::root(devices.keyboard.clone(), devices.keyboard.default_rights()),
+                ],
+                None => {
+                    crate::warn!("compositor launched with no framebuffer to drive");
+                    Vec::new()
+                }
+            },
+            "console" => connect_to(&launched, "compositor", name).into_iter().collect(),
+            // The audio service is handed the sound card the same way the
+            // compositor is handed the screen: one device capability, held by
+            // one process, for the lifetime of the boot.
+            "audio" => devices
+                .audio
+                .as_ref()
+                .map(|device| alloc::vec![Handle::root(device.clone(), device.default_rights())])
+                .unwrap_or_else(|| {
+                    crate::warn!("audio launched with no sound card to drive");
+                    Vec::new()
+                }),
+            "fs" => devices
+                .storage
+                .as_ref()
+                .map(|device| alloc::vec![Handle::root(device.clone(), device.default_rights())])
+                .unwrap_or_else(|| {
+                    crate::warn!("fs launched with no disk to serve");
+                    Vec::new()
+                }),
+            // The shell reads its capabilities positionally: the console
+            // first, the filesystem second. A boot with no `fs` module gives
+            // it one handle and the shell's file commands report that they
+            // have nowhere to look, which is better than a shell that will not
+            // start.
+            "shell" => {
+                let mut handles: Vec<Handle> = connect_to(&launched, "console", name).into_iter().collect();
+                if !handles.is_empty() {
+                    handles.extend(connect_to(&launched, "fs", name));
+                }
+                handles
+            }
+            // Doom's whole authority is two handles: a window, and the IWAD as
+            // a read-only memory object. It cannot create a process, touch a
+            // filesystem, or reach any device -- including the screen it is
+            // drawing on, which it now reaches only through the compositor.
+            //
+            // The connection has to come first or not at all: `doom` reads its
+            // capabilities positionally, and handing it a WAD where it expects
+            // a channel would be worse than handing it nothing.
+            "doom" => match connect_to(&launched, "compositor", name) {
+                Some(connection) => {
+                    let mut handles = alloc::vec![connection];
+                    match data.iter().find(|entry| entry.name.ends_with("wad")) {
+                        Some(wad) => handles.push(Handle::root(wad.vmo.clone(), Rights::READ_ONLY)),
+                        None => crate::warn!("doom launched with no IWAD module to read"),
+                    }
+                    // Sound is optional and comes last for that reason: a boot
+                    // with no `audio` module leaves Doom holding two handles
+                    // and playing silently, rather than failing to start over
+                    // a sound card.
+                    handles.extend(connect_to(&launched, "audio", name));
+                    handles
+                }
+                None => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+
+        match launch_one(name, bytes, extra_handles) {
             Ok(entry) => {
                 crate::info!(
                     "launched {:?} as pid {} with capabilities {:?}",
@@ -91,18 +331,17 @@ pub unsafe fn launch_boot_modules(boot_info: &BootInfo) -> Vec<Launched> {
                 launched.push(entry);
             }
             Err(error) => {
-                crate::error!("failed to launch module {:?}: {:?}", module.name, error);
+                crate::error!("failed to launch module {:?}: {:?}", name, error);
             }
         }
     }
-
     if found == 0 {
         crate::warn!("no boot modules were supplied; userspace will not start");
     }
     launched
 }
 
-fn launch_one(name: &str, bytes: &[u8]) -> Result<Launched, LoadError> {
+fn launch_one(name: &str, bytes: &[u8], extra_handles: Vec<Handle>) -> Result<Launched, LoadError> {
     // Inspect before committing anything, so a module that asks for more than
     // the policy allows is refused before it costs a page of memory.
     let requirements = loader::inspect(bytes)?;
@@ -161,7 +400,7 @@ fn launch_one(name: &str, bytes: &[u8]) -> Result<Launched, LoadError> {
         .install_object(thread.clone(), Rights::THREAD_DEFAULT)
         .map_err(|_| LoadError::NoMemory)?;
 
-    let info = BootstrapMessage {
+    let info = nodeos_abi::proto::Encoded::new(BootstrapMessage {
         version: 1,
         granted_caps: granted.0,
         process: HandleValue(process_handle.0),
@@ -172,18 +411,12 @@ fn launch_one(name: &str, bytes: &[u8]) -> Result<Launched, LoadError> {
         heap_size: requirements.resources.heap_reserve,
         extra_count: 0,
         _reserved: 0,
-    };
+    });
 
     let mut message = Message::empty(KIND_BOOTSTRAP);
-    // SAFETY: `BootstrapMessage` is `repr(C)` plain-old-data, so its bytes are
-    // a valid wire representation.
-    let raw = unsafe {
-        core::slice::from_raw_parts(
-            &info as *const BootstrapMessage as *const u8,
-            core::mem::size_of::<BootstrapMessage>(),
-        )
-    };
-    message.payload.extend_from_slice(raw);
+    message.payload.extend_from_slice(info.bytes());
+    message.handles.extend(extra_handles);
+
     if parent_end.send(message).is_err() {
         crate::error!("failed to deliver the bootstrap message to {module_name:?}");
     }

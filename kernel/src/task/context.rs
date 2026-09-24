@@ -76,6 +76,13 @@ enter_user_mode:
     /* rdi = &TrapFrame prepared on this thread's kernel stack. Adopt it as the
        stack and take the ordinary interrupt-return path out to ring 3.     */
     mov     rsp, rdi
+    /* Load the empty x87/SSE image `Thread::new` wrote, so a program's first
+       instruction sees architectural reset values rather than whatever the
+       kernel last left in the registers. Every later return to ring 3 goes
+       through the trap or syscall stub, which restores what that thread had.
+       `rax` is scratch; the `pop rax` below sets the real value.           */
+    mov     rax, gs:[16]
+    fxrstor64 [rax]
     swapgs
     pop     r15
     pop     r14

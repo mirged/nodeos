@@ -32,6 +32,7 @@ extern crate alloc;
 
 pub mod alloc_impl;
 pub mod channel;
+pub mod device;
 pub mod env;
 pub mod io;
 pub mod mem;
@@ -41,6 +42,7 @@ pub mod start;
 pub mod sync;
 pub mod sys;
 pub mod thread;
+pub mod wait;
 
 pub use channel::{Channel, Message};
 pub use env::Env;
@@ -91,6 +93,18 @@ impl Handle {
     pub fn revoke(&self) -> Result<(), Error> {
         // SAFETY: takes a handle value only.
         sys::ok(unsafe { sys::syscall1(nodeos_abi::Syscall::CapabilityRevoke, self.0 .0 as u64) })
+    }
+
+    /// Block until any of `wanted`'s signals is asserted on this object, or
+    /// `deadline_ns` passes (`0` means wait forever). Returns the signals
+    /// actually observed.
+    pub fn wait(&self, wanted: nodeos_abi::Signals, deadline_ns: u64) -> Result<nodeos_abi::Signals, Error> {
+        let mut item = nodeos_abi::WaitItem { handle: self.0, wanted: wanted.0, observed: 0, _reserved: 0 };
+        // SAFETY: `&mut item` is a single, correctly sized, writable `WaitItem`.
+        let raw = unsafe {
+            sys::syscall3(nodeos_abi::Syscall::Wait, &mut item as *mut _ as u64, 1, deadline_ns)
+        };
+        sys::status(raw).map(|_| nodeos_abi::Signals(item.observed))
     }
 
     /// Ask the kernel what this handle is.

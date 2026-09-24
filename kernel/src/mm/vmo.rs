@@ -62,6 +62,10 @@ pub struct Vmo {
     header: ObjectHeader,
     kind: VmoKind,
     resizable: bool,
+    /// Buddy order of the block this object owns, for a DMA object built by
+    /// [`Vmo::new_dma`]. `None` for every other object, including the MMIO
+    /// ranges that share [`VmoKind::Physical`] and own nothing.
+    owned_order: Option<usize>,
     inner: IrqSpinLock<VmoInner>,
 }
 
@@ -80,6 +84,7 @@ impl Vmo {
             header: ObjectHeader::new(ObjectType::Vmo, Signals::NONE),
             kind: VmoKind::Anonymous,
             resizable,
+            owned_order: None,
             inner: IrqSpinLock::new(VmoInner { size, pages: slots, phys_base: 0 }),
         }))
     }
@@ -103,7 +108,61 @@ impl Vmo {
             header: ObjectHeader::new(ObjectType::Vmo, Signals::NONE),
             kind: VmoKind::Physical,
             resizable: false,
+            owned_order: None,
             inner: IrqSpinLock::new(VmoInner { size, pages: slots, phys_base }),
+        }))
+    }
+
+    /// Allocate a physically *contiguous*, zero-filled range for device DMA.
+    ///
+    /// A bus-mastering device is given physical addresses and follows them
+    /// literally: it has no page tables, so a buffer it walks off the end of
+    /// one page into must be contiguous in physical memory too. Ordinary
+    /// anonymous objects are committed page by page from wherever the buddy
+    /// allocator has a frame, which is exactly what a descriptor ring cannot
+    /// use.
+    ///
+    /// The result is a [`VmoKind::Physical`] object, so mapping it neither
+    /// increfs nor decrefs its frames -- the block is owned by this object and
+    /// returned to the allocator whole when the last handle to it closes. That
+    /// matters more than it sounds: a device is still reading these addresses
+    /// until its driver stops the engine, and a frame that could be freed by
+    /// unmapping would be handed to somebody else while DMA was still landing
+    /// in it.
+    pub fn new_dma(size: u64) -> Result<Arc<Self>, VmoError> {
+        let size = align_up(size).max(PAGE_SIZE as u64);
+        let pages = (size / PAGE_SIZE as u64) as usize;
+        // The buddy allocator deals in power-of-two blocks, so round up and
+        // hand back the whole block: a driver that asked for six pages gets
+        // eight, and the eighth is not silently somebody else's.
+        let order = pages.next_power_of_two().trailing_zeros() as usize;
+        if order >= phys::MAX_ORDER {
+            return Err(VmoError::OutOfMemory);
+        }
+        let block = pages.next_power_of_two();
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(block).map_err(|_| VmoError::OutOfMemory)?;
+
+        let base = phys::alloc_order(order).ok_or(VmoError::OutOfMemory)?;
+        for i in 0..block {
+            slots.push(Some(base + i as Pfn));
+        }
+        let phys_base = phys::pfn_to_phys(base);
+        // A device ring is read before the driver has written all of it -- the
+        // AC'97 engine starts at descriptor zero the moment it is enabled --
+        // so leaving stale memory in it is not a hygiene question.
+        // SAFETY: the block was just allocated, is not aliased, and lies in
+        // the direct map, so it is valid for `block * PAGE_SIZE` writes.
+        unsafe {
+            core::ptr::write_bytes(phys::phys_to_virt(phys_base) as *mut u8, 0, block * PAGE_SIZE);
+        }
+
+        Ok(Arc::new(Self {
+            header: ObjectHeader::new(ObjectType::Vmo, Signals::NONE),
+            kind: VmoKind::Physical,
+            resizable: false,
+            owned_order: Some(order),
+            inner: IrqSpinLock::new(VmoInner { size: (block * PAGE_SIZE) as u64, pages: slots, phys_base }),
         }))
     }
 
@@ -267,6 +326,15 @@ impl Drop for Vmo {
     fn drop(&mut self) {
         // Physical VMOs do not own their frames; anonymous and paged ones do.
         if self.kind == VmoKind::Physical {
+            if let Some(order) = self.owned_order {
+                let base = phys::phys_to_pfn(self.inner.get_mut().phys_base);
+                // SAFETY: `new_dma` allocated exactly this block at this order,
+                // the last handle has just gone, and a mapping of a physical
+                // VMO holds no reference of its own -- so nothing can still be
+                // pointing at these frames but a device whose driver died with
+                // them, which is the case `Drop` cannot help with either way.
+                unsafe { phys::free_order(base, order) };
+            }
             return;
         }
         let inner = self.inner.get_mut();

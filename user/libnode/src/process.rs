@@ -1,5 +1,6 @@
 //! Creating and starting processes.
 
+use nodeos_abi::types::LoadedImageInfo;
 use nodeos_abi::{Error, HandleValue, Syscall};
 
 use crate::{sys, Handle};
@@ -26,6 +27,23 @@ impl Process {
     /// The process capability.
     pub fn handle(&self) -> &Handle {
         &self.handle
+    }
+
+    /// Load an NXF image from a VMO into this not-yet-started process.
+    pub fn load(&self, image: &crate::mem::Vmo, image_len: u64) -> Result<LoadedImageInfo, Error> {
+        let mut info = LoadedImageInfo::default();
+        // SAFETY: the handles and output pointer are valid for this call.
+        let raw = unsafe {
+            sys::syscall4(
+                Syscall::ProcessLoad,
+                self.handle.raw().0 as u64,
+                image.handle().raw().0 as u64,
+                image_len,
+                &mut info as *mut _ as u64,
+            )
+        };
+        sys::ok(raw)?;
+        Ok(info)
     }
 
     /// Start the process's first thread, moving `bootstrap` into it.

@@ -160,6 +160,17 @@ pub struct ThreadParams {
     pub affinity: u64,
 }
 
+/// Result written by `process_load`: the entry point and initial stack for the
+/// loaded image, both in the child process's address space.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LoadedImageInfo {
+    /// Absolute entry address.
+    pub entry: u64,
+    /// Initial stack pointer.
+    pub stack: u64,
+}
+
 impl Default for ThreadParams {
     fn default() -> Self {
         Self { class: SchedClass::Normal as u32, priority: 16, period_ns: 0, budget_ns: 0, affinity: 0 }
@@ -267,4 +278,75 @@ pub struct HandleInfo {
     pub signals: u32,
     /// Depth of the grant chain behind this handle.
     pub grant_depth: u32,
+    /// Size in bytes, for objects that have one (a memory object); `0`
+    /// otherwise. Without this a process handed a memory object it did not
+    /// create -- the usual case, since capabilities arrive by message -- has
+    /// no way to learn how much of it to map.
+    pub size: u64,
+}
+
+/// Device kinds reported by `device_info`.
+pub mod device_kind {
+    /// A framebuffer MMIO device.
+    pub const FRAMEBUFFER: u32 = 1;
+    /// The PS/2 keyboard.
+    pub const PS2_KEYBOARD: u32 = 2;
+    /// An Intel AC'97 audio controller, as two port windows: the mixer
+    /// (window 0) and the bus-master engine (window 1).
+    pub const AC97: u32 = 3;
+    /// A virtio block device on its legacy port-I/O interface (window 0).
+    pub const VIRTIO_BLK: u32 = 4;
+}
+
+/// Information returned by `device_info`. Fields not meaningful for a given
+/// [`device_kind`] are zero.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeviceInfo {
+    /// See [`device_kind`].
+    pub kind: u32,
+    /// Framebuffer width, in pixels.
+    pub width: u32,
+    /// Framebuffer height, in pixels.
+    pub height: u32,
+    /// Framebuffer bytes per scanline.
+    pub pitch: u32,
+    /// Framebuffer bits per pixel.
+    pub bpp: u32,
+    /// PCI vendor identifier, for a PCI-backed device.
+    pub vendor: u32,
+    /// PCI device identifier, for a PCI-backed device.
+    pub device: u32,
+    /// Base port of each window the device decodes; `0` where there is none.
+    ///
+    /// A driver never uses these to issue a port instruction -- it cannot, it
+    /// is in ring 3 -- but knowing the window is non-empty is how it tells a
+    /// device it can drive from one it cannot.
+    pub port_base: [u32; 2],
+    /// Length in ports of each window; `0` where there is none.
+    pub port_len: [u32; 2],
+    /// Interrupt line the firmware routed the device to, or `0`.
+    pub irq: u32,
+    /// Padding.
+    pub _reserved: u32,
+}
+
+/// Result of `device_dma_alloc`: a memory object plus the physical address the
+/// device must be pointed at.
+///
+/// The physical address is the entire reason this syscall exists. It is
+/// meaningless to a process -- it cannot be dereferenced, and the object still
+/// has to be mapped to be touched -- and it is exactly what goes into a
+/// descriptor ring, because the device has no page tables to consult.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DmaInfo {
+    /// Handle to the memory object.
+    pub handle: u32,
+    /// Padding.
+    pub _reserved: u32,
+    /// Physical base address of the buffer.
+    pub phys: u64,
+    /// Length in bytes, rounded up to the allocator's block size.
+    pub len: u64,
 }
