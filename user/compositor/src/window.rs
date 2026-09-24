@@ -22,6 +22,13 @@ pub const MAX_WINDOWS: usize = 2;
 pub const BORDER: u32 = 1;
 /// Height of a window's title bar, in pixels.
 pub const TITLE_H: u32 = GLYPH_SIZE as u32 + 4;
+/// The same number under the name the pointer uses.
+///
+/// One name for the compositor and one for the pointer, deliberately: a press
+/// either grabbed a title bar or landed in the window's content, and both
+/// answers have to come from the one number, so the pointer reads this alias
+/// rather than keeping a copy of the sum.
+pub const TITLE_BAR_H: u32 = TITLE_H;
 
 /// The empty screen behind every window.
 pub const DESKTOP: Rgb = 0x0018_1E26;
@@ -47,6 +54,13 @@ pub struct Rect {
     pub h: u32,
 }
 
+impl Rect {
+    /// Whether a screen point lies inside this rectangle.
+    pub const fn contains(&self, x: u32, y: u32) -> bool {
+        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
+    }
+}
+
 /// The screen geometry, split into [`MAX_WINDOWS`] columns.
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
@@ -63,7 +77,14 @@ impl Layout {
     /// The whole frame of column `slot`, title bar and borders included.
     pub const fn frame(&self, slot: usize) -> Rect {
         let column = self.width / MAX_WINDOWS as u32;
-        Rect { x: column * slot as u32, y: 0, w: column, h: self.height }
+        let x = column * slot as u32;
+        // The last column takes the remainder when the screen is not an exact
+        // multiple of the column count, which is the same rule `slot_at`
+        // applies to a pointer: a strip of screen that no column owns is a
+        // strip no repaint ever paints, and it shows as the previous frame's
+        // pixels down the right-hand edge.
+        let w = if slot + 1 == MAX_WINDOWS { self.width - x } else { column };
+        Rect { x, y: 0, w, h: self.height }
     }
 
     /// The drawable area of column `slot`: the frame minus the title bar and
@@ -86,6 +107,25 @@ impl Layout {
             y: TITLE_H,
             w: self.width - 2 * BORDER,
             h: self.height - TITLE_H - BORDER,
+        }
+    }
+
+    /// Which column a screen x-coordinate falls in.
+    ///
+    /// A division with a clamp rather than an equality against each column's
+    /// left edge, because the last column absorbs the remainder when the
+    /// screen is not an exact multiple of the column count -- and a pointer
+    /// that fell through the gap on the right would grab nothing.
+    pub const fn slot_at(&self, x: u32) -> usize {
+        let column = self.width / MAX_WINDOWS as u32;
+        if column == 0 {
+            return 0;
+        }
+        let slot = (x / column) as usize;
+        if slot >= MAX_WINDOWS {
+            MAX_WINDOWS - 1
+        } else {
+            slot
         }
     }
 

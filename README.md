@@ -42,8 +42,8 @@ and the whole thing runs in QEMU today.
 | Userspace runtime (`libnode`) and `init` running in ring 3 | working |
 | Per-process resource namespaces (kernel object + launcher policy) | partial |
 | User x87/SSE state preserved across every entry from ring 3 | working |
-| `Device` capability: boot framebuffer + PS/2 keyboard | working |
-| `compositor`: the only holder of the screen and keyboard (`docs/COMPOSITOR.md`) | working |
+| `Device` capability: boot framebuffer + PS/2 keyboard + PS/2 mouse | working |
+| `compositor`: the only holder of the screen, keyboard and mouse (`docs/COMPOSITOR.md`) | working |
 | `console` (text/graphics service) and `shell`, as compositor clients | working |
 | Doom, in a window beside the shell (`docs/DOOM.md`) | working |
 | Userspace services (ramfs, devmgr) | in progress |
@@ -57,9 +57,10 @@ sudo apt-get install -y qemu-system-x86 grub-pc-bin grub-common xorriso mtools
 make            # build the kernel, userspace, tools, and a bootable ISO
 make run        # boot it in QEMU with the console on stdout
 make test       # boot and assert that every self-test passed
+make test-mouse # boot with a display, drive the mouse, check the pixels
 ```
 
-You should see the kernel bring itself up, run 112 self-tests, launch `init`
+You should see the kernel bring itself up, run 121 self-tests, launch `init`
 from an NXF module, and `init` report back from ring 3.
 
 ## The window system
@@ -68,12 +69,18 @@ from an NXF module, and `init` report back from ring 3.
 make run-graphic                            # compositor + console + shell
 ```
 
-`compositor` holds the framebuffer and the PS/2 keyboard, and it is the only
-process in the system that does. Everything else -- the console, Doom -- gets a
-memory object the size of its own window and a channel, which is the whole of
-its display authority. Cycle the keyboard focus with the Meta ("Windows") key,
-or Scroll Lock where the VM eats Meta. See
-[`docs/COMPOSITOR.md`](docs/COMPOSITOR.md).
+`compositor` holds the framebuffer, the PS/2 keyboard and the mouse, and it is
+the only process in the system that does. Everything else -- the console, Doom
+-- gets a memory object the size of its own window and a channel, which is the
+whole of its display authority.
+
+With a pointer, the window system behaves like one: click a window to focus it,
+click the empty desktop to give the focus up, drag a title bar to move a window
+between columns, and double-click one to maximize it. The keyboard still does
+everything it did -- Meta ("Windows") or Scroll Lock cycles the focus, Meta+Tab
+too, Meta+Enter toggles maximize -- which is what makes a machine with no mouse
+a usable one. See [`docs/COMPOSITOR.md`](docs/COMPOSITOR.md) for the input path, and for why
+checking any of it needs a framebuffer rather than a serial log.
 
 ## Doom
 

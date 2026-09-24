@@ -202,6 +202,12 @@ fn handle_event(
             }
         }
         wm_event::FOCUS_IN | wm_event::FOCUS_OUT | wm_event::KEY => {}
+        // The pointer is delivered, and the console has nothing to do with it:
+        // there is no scrollback to drag and no selection to make, and a text
+        // service that moved its own caret to wherever a click landed would
+        // fight the line editor the shell is typing into. A client that wants
+        // the pointer reads the same events on the same channel.
+        wm_event::POINTER_MOTION | wm_event::POINTER_BUTTON => {}
         wm_event::CLOSE => libnode::exit(0),
         other => println!("console: unknown compositor event kind {other}"),
     }

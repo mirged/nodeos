@@ -263,34 +263,32 @@ impl<'a> Iterator for TagIter<'a> {
     type Item = (u32, *const u8, usize);
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            // SAFETY: `cursor` stays within `[base, end)` by construction, and
-            // we check that a whole header fits before reading one.
-            if (self.end as usize).checked_sub(self.cursor as usize)? < mem::size_of::<TagHeader>() {
-                return None;
-            }
-            // SAFETY: bounds checked immediately above; the loader guarantees
-            // 8-byte alignment of every tag.
-            let header = unsafe { (self.cursor as *const TagHeader).read() };
-            if header.kind == tag_type::END {
-                return None;
-            }
-            let size = header.size as usize;
-            if size < mem::size_of::<TagHeader>() {
-                return None; // malformed: would not make progress
-            }
-            // SAFETY: the tag body follows the header and is `size - 8` bytes.
-            let body = unsafe { self.cursor.add(mem::size_of::<TagHeader>()) };
-            let body_len = size - mem::size_of::<TagHeader>();
-            if (self.end as usize) - (body as usize) < body_len {
-                return None;
-            }
-            // Tags are padded up to an 8-byte boundary.
-            let advance = (size + 7) & !7;
-            // SAFETY: `advance >= size`, and we verified the tag fits.
-            self.cursor = unsafe { self.cursor.add(advance) };
-            return Some((header.kind, body, body_len));
+        // SAFETY: `cursor` stays within `[base, end)` by construction, and
+        // we check that a whole header fits before reading one.
+        if (self.end as usize).checked_sub(self.cursor as usize)? < mem::size_of::<TagHeader>() {
+            return None;
         }
+        // SAFETY: bounds checked immediately above; the loader guarantees
+        // 8-byte alignment of every tag.
+        let header = unsafe { (self.cursor as *const TagHeader).read() };
+        if header.kind == tag_type::END {
+            return None;
+        }
+        let size = header.size as usize;
+        if size < mem::size_of::<TagHeader>() {
+            return None; // malformed: would not make progress
+        }
+        // SAFETY: the tag body follows the header and is `size - 8` bytes.
+        let body = unsafe { self.cursor.add(mem::size_of::<TagHeader>()) };
+        let body_len = size - mem::size_of::<TagHeader>();
+        if (self.end as usize) - (body as usize) < body_len {
+            return None;
+        }
+        // Tags are padded up to an 8-byte boundary.
+        let advance = (size + 7) & !7;
+        // SAFETY: `advance >= size`, and we verified the tag fits.
+        self.cursor = unsafe { self.cursor.add(advance) };
+        return Some((header.kind, body, body_len));
     }
 }
 

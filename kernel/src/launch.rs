@@ -41,6 +41,14 @@ pub struct BootDevices {
     pub framebuffer: Option<Arc<Device>>,
     /// The PS/2 keyboard. Granted to `"compositor"` at index 1.
     pub keyboard: Arc<Device>,
+    /// The PS/2 controller's auxiliary port -- the mouse, if the machine has
+    /// one. Granted to `"compositor"` at index 2.
+    ///
+    /// The object exists whether or not a mouse answered the bring-up probe,
+    /// and the capability says which: the display server is the one process
+    /// that has to decide where a pointer is, so it is the one process that
+    /// has to be able to find out there isn't one.
+    pub pointer: Arc<Device>,
     /// The AC'97 audio controller, if the machine has one. Granted to
     /// `"audio"`, which is the only process that ever touches it.
     pub audio: Option<Arc<Device>>,
@@ -255,6 +263,7 @@ pub unsafe fn launch_boot_modules(boot_info: &BootInfo, devices: &BootDevices) -
                 Some(framebuffer) => alloc::vec![
                     Handle::root(framebuffer.clone(), framebuffer.default_rights()),
                     Handle::root(devices.keyboard.clone(), devices.keyboard.default_rights()),
+                    Handle::root(devices.pointer.clone(), devices.pointer.default_rights()),
                 ],
                 None => {
                     crate::warn!("compositor launched with no framebuffer to drive");

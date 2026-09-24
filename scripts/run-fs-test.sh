@@ -55,14 +55,42 @@ type_line() {
     monitor "sendkey ret"
 }
 
+# A line in the serial log, waited for. Everything this test asks the guest to
+# do happens asynchronously -- it types at a machine running at its own speed --
+# so a check that sleeps for a fixed time and looks once is a race that passes
+# on a fast host and fails on a slow one. It also fails *misleadingly*: the
+# message says the guest did the wrong thing when the truth is that it had not
+# got there yet.
+# The log carries colour escapes, and they sit *inside* the module tags:
+# `ESC[35m[/bin/init.nxf]ESC[0m init: ...`. A pattern that includes a tag -- the
+# only way to tell the shell's own output apart from a child it launched -- has
+# to be matched against the log with the escapes taken out, or it silently never
+# matches and the test blames the guest.
+plain_log() {
+    sed -e 's/\x1b\[[0-9;]*m//g' "${LOG}"
+}
+
+wait_for_log() {
+    local pattern="$1" seconds="${2:-15}" waited=0
+    while (( waited < seconds * 4 )); do
+        plain_log | grep -q "${pattern}" && return 0
+        sleep 0.25
+        waited=$(( waited + 1 ))
+    done
+    return 1
+}
+
 echo "run-fs-test: booting ${ISO}"
 sleep "${BOOTWAIT}"
 
-grep -q "fs: FAT16 mounted\|fs: FAT32 mounted" "${LOG}" || {
+if ! wait_for_log "fs: FAT16 mounted\|fs: FAT32 mounted"; then
     echo "run-fs-test: FAIL -- the filesystem service did not mount the disk" >&2
+    if [[ ! -s "${LOG}" ]]; then
+        echo "run-fs-test: the serial log is empty; QEMU produced nothing at all" >&2
+    fi
     tail -20 "${LOG}" >&2
     exit 1
-}
+fi
 
 type_line "fstest"
 sleep 6
@@ -76,23 +104,34 @@ sleep 3
 type_line "run /bin/init.nxf"
 sleep 3
 
-if grep -q "fstest: PASS" "${LOG}"; then
+# Either answer, waited for: the shell runs its own filesystem tests and reports
+# the verdict in the log. Waiting for the verdict rather than for the shell to
+# have had time to reach one is the difference between a test that measures the
+# filesystem and one that measures the host's load average.
+if wait_for_log "fstest: PASS" 25 || wait_for_log "fstest: FAIL" 1; then
+    if plain_log | grep -q "fstest: FAIL"; then
+        echo "run-fs-test: FAIL -- the shell's self-test reported failures" >&2
+        plain_log | grep "fstest:" >&2
+        exit 1
+    fi
     echo "run-fs-test: the shell's self-test passed"
-elif grep -q "fstest: FAIL" "${LOG}"; then
-    echo "run-fs-test: FAIL -- the shell's self-test reported failures" >&2
-    grep "fstest:" "${LOG}" >&2
-    exit 1
 else
     echo "run-fs-test: FAIL -- the self-test never reported" >&2
-    grep -i "fstest\|fs:" "${LOG}" | tail -20 >&2
+    plain_log | grep -i "fstest\|fs:" | tail -20 >&2
     exit 1
 fi
 
-if grep -q "process started" "${LOG}" && grep -q "init: userspace is alive" "${LOG}"; then
+# What a `run` leaves behind is not the shell saying "process started" -- the
+# shell writes that to the console, which draws it on a screen this test does
+# not have. The serial log carries what clients *log*, so the evidence is the
+# child's own output under the path it was launched from, and the kernel
+# reporting that the process it created exited cleanly.
+if wait_for_log "\[/bin/init.nxf\] init: userspace is alive" 20 &&
+    wait_for_log "process [0-9]* (/bin/init.nxf) terminated with code 0" 20; then
     echo "run-fs-test: shell launched /bin/init.nxf as a child process"
 else
     echo "run-fs-test: FAIL -- run did not start /bin/init.nxf" >&2
-    grep -E "run:|process started|init: userspace" "${LOG}" >&2 || true
+    plain_log | grep -E "init.nxf|process started" | tail -10 >&2
     exit 1
 fi
 

@@ -157,17 +157,26 @@ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
     unsafe { syscall::init() };
 
     // ---- Devices -------------------------------------------------------------
-    // The framebuffer and keyboard are the only two devices this kernel knows
-    // about; both are claimed once here and handed to the console module by
-    // the launcher, never touched directly by the kernel again.
+    // The framebuffer and the two halves of the PS/2 controller are the only
+    // devices this kernel knows about; all three are claimed once here and
+    // handed to whichever module needs them by the launcher, never touched
+    // directly by the kernel again.
     let framebuffer = boot_info
         .framebuffer()
         .map(|fb| obj::Device::framebuffer(fb.addr, fb.width, fb.height, fb.pitch, fb.bpp));
     let keyboard = obj::Device::ps2_keyboard();
+    // The controller is programmed before either of its devices can produce a
+    // byte, and the probe is what says whether there is a mouse on the other
+    // end of it -- so it runs before the `Device` that describes the mouse
+    // exists at all.
+    // SAFETY: single-threaded bring-up on the boot CPU, with both PS/2 lines
+    // still masked at the 8259, so nothing else is touching ports 0x60/0x64.
+    let mouse_present = unsafe { arch::x86_64::ps2::init() };
+    let pointer = obj::Device::ps2_mouse(mouse_present);
     // SAFETY: the local APIC is up (`arch::x86_64::init_boot_cpu` ran above)
-    // and no keyboard interrupt can have occurred yet, since IRQ1 is still
-    // masked at the 8259 until this call unmasks it.
-    unsafe { arch::x86_64::interrupt::install_keyboard_handler(keyboard.clone()) };
+    // and no PS/2 interrupt can have occurred yet, since IRQ1 and IRQ12 are
+    // both still masked at the 8259 until this call unmasks them.
+    unsafe { arch::x86_64::interrupt::install_input_handlers(keyboard.clone(), pointer.clone()) };
 
     // Everything else this kernel can claim is on the PCI bus, and it claims
     // only what a driver in this tree knows how to drive. A function nobody
@@ -179,7 +188,7 @@ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
     let audio = claim_pci(&functions, obj::device::PciRole::Ac97, "audio");
     let storage = claim_pci(&functions, obj::device::PciRole::VirtioBlk, "storage");
 
-    let devices = launch::BootDevices { framebuffer, keyboard, audio, storage };
+    let devices = launch::BootDevices { framebuffer, keyboard, pointer, audio, storage };
 
     // SAFETY: memory management and the scheduler are up, and `boot_info` has
     // been relocated to the direct physical map.

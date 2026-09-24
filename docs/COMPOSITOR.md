@@ -15,14 +15,15 @@ agreed to share, but because neither can reach the other's pixels.
      |  module2 /boot/compositor.nxf  console.nxf  shell.nxf  doom.nxf
      v
   kernel/src/launch.rs
-     |  Display + Input  ->  compositor      (framebuffer, keyboard)
+     |  Display + Input  ->  compositor      (framebuffer, keyboard, mouse)
      |  Memory + Channel ->  console         (a channel to the compositor)
      |  + Clock          ->  doom            (a channel, and the IWAD)
      v
   compositor (ring 3)
      +-- window.rs     columns, frames, title bars
      +-- keyboard.rs   PS/2 set 1 -> events, decoded once for everyone
-     +-- main.rs       the protocol, and who the next keystroke is for
+     +-- pointer.rs    PS/2 mouse packets -> motion, and the arrow on screen
+     +-- main.rs       the protocol, and who the next keystroke or click is for
 ```
 
 ## What a client is given
@@ -97,20 +98,140 @@ The compositor shortcuts are:
 
 Meta is aliased to Scroll Lock for virtual machines that eat the Windows key.
 The compositor swallows these shortcuts; all other keys go to the focused
-client. A maximized surface keeps its full-screen-width buffer, while tiled
-mode clips that buffer to the window's column, so the shell can use the whole
-screen without changing the surface protocol.
+client.
+
+## The pointer
+
+The mouse is the one input device whose protocol is not merely transport. A PS/2
+mouse sends three bytes per movement: two signed deltas, and a byte of flags
+carrying their sign bits, the button states and two overflow bits. Nothing in
+those bytes says where the pointer *is*. They are a velocity, the position is the
+sum of everything that came before, and so the compositor owns it and a client
+only ever hears the difference.
+
+The decoding lives in `user/compositor/src/pointer.rs` rather than in the kernel,
+for the same reason scancodes do: the kernel moves bytes from the controller to
+the process that owns the device, and what the bytes *mean* is a question for
+whoever is drawing the result.
+
+| Field | For |
+| --- | --- |
+| `x`, `y` | where the event happened, in the window's own coordinates |
+| `buttons` | the whole button state after the event, so a client needs no history |
+| `button`, `pressed` | which button changed, and which way |
+
+`x` and `y` are signed and are deliberately *not* clamped to the window. A client
+that took a button press keeps receiving motion after the pointer has left it --
+which is what lets a drag be followed out of its own edge -- and its coordinates
+go negative on the way out rather than piling up at the border.
+
+Two parts of the decoder are policy rather than parsing, and both were found by
+its own test vectors rather than by reasoning:
+
+* **A byte lost inside a packet is undetectable from the bytes.** Deltas carry no
+  framing, so the rest of a packet is indistinguishable from the start of the
+  next one and the stream is read one byte out of step from then on. The only
+  signal is time: a PS/2 mouse in the mode this driver leaves it in sends a packet
+  every ten milliseconds, so a hundred milliseconds of quiet means a byte went
+  missing -- the kernel's input queue drops its oldest byte when it fills, since
+  an interrupt handler may never block -- and the decoder is reset on that gap.
+* **An overflowed axis is dropped, not clamped.** The device sets a flag when its
+  counter ran out, and the value in the packet is then not the movement that
+  happened; a clamped value would tell the compositor the pointer went somewhere
+  it never went. The other axis and the buttons are unaffected and still
+  delivered: "the button went down while the mouse was flung across the desk" is
+  worth reporting.
+
+The decoder is checked against a dozen hand-written packet streams before it is
+trusted with a real one, and the compositor refuses to serve a display if any of
+them fails. Hand-written, not generated: what is being checked is a hand-written
+reading of somebody else's specification, and a generator would encode the same
+misreading twice. Three of those vectors failed the first time they ran, and two
+of the failures were real bugs in the decoder.
+
+### The arrow
+
+There is no cursor layer, no hardware sprite and no transparency, so the arrow is
+drawn into the framebuffer like any other pixel and the pixels it covers are
+saved first. Every function in the compositor that writes the framebuffer takes
+the arrow off before it and paints it after: a blit that landed under the cursor
+would otherwise be undone by the cursor's own saved pixels on the next move, and
+the screen would grow a copy of the arrow wherever the pointer had been.
+
+That failure is not hypothetical. `paint` now removes the old arrow before
+drawing the new one, and what found it was the test that counts the arrows on the
+screen rather than looking for *an* arrow: with a trail, a test that looked for
+one would report the oldest copy as the current position and pass.
+
+### Focus, drags and clicks
+
+| Gesture | What happens |
+| --- | --- |
+| Click a window | It takes the keyboard focus |
+| Click the desktop | The focus goes to nobody, and no title bar is highlighted |
+| Drag a title bar | The window follows the pointer, into whichever column the pointer is in |
+| Double click a title bar | Maximize, or put back |
+
+A press gives the window under it the *implicit grab*: motion and the matching
+release keep going to that window after the pointer has left it. That is a
+compositor decision rather than a protocol one -- a client is never told the
+pointer left, only where it went -- and it is what makes dragging a window past
+its own edge work at all.
+
+Dragging a window into a column another window holds hands that column over
+instead of stacking the two: a fixed set of columns has no third place for a
+window to go, and the exchange is what makes the gesture reversible.
 
 ## The layout is tiled by default
 
-The screen is divided into `MAX_WINDOWS` columns once, at startup. Windows are
-tiled into those columns by default. Each surface is allocated at the full
-content width, which lets the compositor show the focused window maximized;
-the surface is clipped to its column while tiled.
+The screen is divided into `MAX_WINDOWS` columns once, at startup, and each
+surface is allocated at the size of the column it is created in. The last column
+absorbs the remainder when the screen is not an exact multiple of the column
+count: a strip of screen that no column owns is a strip no repaint ever paints.
 
-The compositor does not yet offer arbitrary drag-resize or mouse controls. The
-protocol still reserves `wm_event::CONFIGURE` for future client-driven size
-changes; maximize is implemented without replacing a live memory object.
+Surfaces used to be allocated at the width of the whole screen, so that a
+maximized window could use all of it without the compositor handing a running
+client a new memory object. That is the better design *once a client can be told
+that its window changed size*, and it is why `wm_event::CONFIGURE` is reserved --
+but until that exists, a client given a screen-wide surface lays out for a screen
+it cannot see: the console printed a hundred and twenty-seven columns of text
+through a hole the width of one column, and nothing stopped the extra pixels
+being blitted into its neighbour's. Allocating the column's own size is the
+honest version of the feature as it stands.
+
+What that costs is why maximize is currently cosmetic: the frame grows to the
+whole screen and the content stays the size it was allocated, with the rest of
+the area painted as desktop rather than left showing the previous frame.
+Giving a client a bigger surface when it maximizes is the change that would make
+maximize mean something, and it is what `CONFIGURE` exists for. Arbitrary
+drag-resize waits on the same thing.
+
+## Testing the pointer
+
+A cursor is not something a serial log can show, so the pointer is checked by
+`make test-mouse`: `scripts/mouse-test.py` boots the graphic ISO with a display,
+drives the mouse through QEMU's monitor, and then asks the two things that can
+answer back.
+
+* The **framebuffer**, read back with `screendump` and searched for the arrow --
+  a search pattern parsed out of `pointer.rs` itself, so the test cannot keep
+  passing after the shape changed. Counting the arrows it finds is a check of
+  its own, and is how the trail bug was found.
+* The **compositor's log**, which names the window it focused, moved or
+  maximized.
+
+Neither is enough alone. Pixels alone cannot tell an arrow that moved for the
+right reason from one drawn in the wrong place, and the log alone is a program
+reporting on itself. Together they close the loop: the log says what should have
+happened to which window, and the pixels say it happened on screen.
+
+The test also refuses to assume the scale between a monitor `mouse_move` and a
+screen pixel, which is QEMU's business rather than NodeOS's: it moves, reads back
+where the arrow landed, converts the remainder and repeats, so every step travels
+through the emulated controller, the kernel's PS/2 driver and the compositor's
+decoder before anything is asserted. It finishes by typing a character and
+requiring the focused window's pixels to change -- the only end-to-end test the
+keyboard path has.
 
 ## What building this uncovered
 

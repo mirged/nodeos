@@ -44,7 +44,7 @@ QEMU_FLAGS := -machine q35 -cpu $(QEMU_CPU) -smp $(QEMU_SMP) -m $(QEMU_MEM) \
               -audiodev $(AUDIODEV_ARGS),id=snd0 -device AC97,audiodev=snd0 \
               -drive file=$(DISK),if=virtio,format=raw
 
-.PHONY: all build help kernel tools user modules iso iso-graphic iso-doom run run-graphic run-doom debug debug-graphic debug-doom test test-audio test-fs test-doom-libc disk clean fmt clippy
+.PHONY: all build help kernel tools user modules iso iso-graphic iso-doom run run-graphic run-doom debug debug-graphic debug-doom test test-audio test-fs test-mouse test-doom-libc disk clean fmt clippy
 
 all: iso
 
@@ -77,6 +77,7 @@ help:
 	  '  make test            Run kernel self-tests' \
 	  '  make test-fs         Verify shell filesystem commands and disk output' \
 	  '  make test-audio      Verify audio output with QEMU' \
+	  '  make test-mouse      Drive the mouse through QEMU and check the pixels' \
 	  '  make test-doom-libc  Run the Doom libc host test' \
 	  '  make fmt             Format kernel Rust code' \
 	  '  make clippy          Run kernel Clippy checks' \
@@ -252,6 +253,12 @@ test-audio: $(ISO_DOOM) $(DISK)
 # the part that makes it a filesystem test rather than a self-consistency test.
 test-fs: $(ISO) $(DISK)
 	@scripts/run-fs-test.sh
+
+# The pointer is the one feature a headless boot cannot show, so this target
+# boots the graphic ISO with a display and drives the mouse from outside with
+# QEMU's monitor. Needs python3 on the host; no other target does.
+test-mouse: $(ISO_GRAPHIC) $(DISK)
+	@python3 scripts/mouse-test.py
 
 fmt:
 	cd kernel && cargo fmt

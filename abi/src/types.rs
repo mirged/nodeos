@@ -296,6 +296,8 @@ pub mod device_kind {
     pub const AC97: u32 = 3;
     /// A virtio block device on its legacy port-I/O interface (window 0).
     pub const VIRTIO_BLK: u32 = 4;
+    /// The PS/2 mouse, on the 8042's auxiliary port.
+    pub const PS2_MOUSE: u32 = 5;
 }
 
 /// Information returned by `device_info`. Fields not meaningful for a given
@@ -327,6 +329,13 @@ pub struct DeviceInfo {
     pub port_len: [u32; 2],
     /// Interrupt line the firmware routed the device to, or `0`.
     pub irq: u32,
+    /// 1 when the device answered at bring-up, 0 when it did not.
+    ///
+    /// Only a device the kernel probes can be absent while its capability
+    /// still exists: the PS/2 mouse is a capability whether or not a mouse is
+    /// plugged into the machine, and a driver that skipped this check would
+    /// wait forever on a byte stream nothing will ever fill.
+    pub present: u32,
     /// Padding.
     pub _reserved: u32,
 }

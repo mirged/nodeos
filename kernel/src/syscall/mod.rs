@@ -590,9 +590,15 @@ fn sys_device_info(args: &Args) -> Result<i64, Error> {
 
     let info = match device.kind() {
         DeviceKind::FramebufferMmio { width, height, pitch, bpp, .. } => {
-            DeviceInfo { kind: device_kind::FRAMEBUFFER, width, height, pitch, bpp: bpp as u32, ..Default::default() }
+            DeviceInfo { kind: device_kind::FRAMEBUFFER, width, height, pitch, bpp: bpp as u32, present: 1, ..Default::default() }
         }
-        DeviceKind::Ps2Keyboard => DeviceInfo { kind: device_kind::PS2_KEYBOARD, ..Default::default() },
+        DeviceKind::Ps2Keyboard => DeviceInfo { kind: device_kind::PS2_KEYBOARD, irq: 1, present: 1, ..Default::default() },
+        DeviceKind::Ps2Mouse { present } => DeviceInfo {
+            kind: device_kind::PS2_MOUSE,
+            irq: 12,
+            present: present as u32,
+            ..Default::default()
+        },
         DeviceKind::Pci { role, vendor, device, windows, irq } => {
             let mut info = DeviceInfo {
                 kind: match role {
@@ -602,6 +608,7 @@ fn sys_device_info(args: &Args) -> Result<i64, Error> {
                 vendor: vendor as u32,
                 device: device as u32,
                 irq: irq as u32,
+                present: 1,
                 ..Default::default()
             };
             for (index, window) in windows.iter().enumerate() {

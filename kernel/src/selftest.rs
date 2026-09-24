@@ -14,7 +14,7 @@ use crate::ipc::message::{Message, MessageFlags};
 use crate::ipc::{Channel, ChannelError};
 use crate::mm::space::MapFlags;
 use crate::mm::vmo::Vmo;
-use crate::obj::{CapClass, CapSet, Handle, HandleTable, KernelObject, Rights};
+use crate::obj::{CapClass, CapSet, Handle, HandleTable, KernelObject, Rights, Signals};
 use crate::sched::{self, SchedParams};
 use crate::task::Process;
 use crate::{info, mm};
@@ -44,6 +44,8 @@ pub fn run() {
     ipc_is_typed_and_capability_carrying();
     ipc_request_reply_across_threads();
     scheduler_classes_are_ordered();
+    input_streams_are_independent();
+    input_queue_overflow_drops_oldest();
 
     let passed = PASSED.load(Ordering::Relaxed);
     let failed = FAILED.load(Ordering::Relaxed);
@@ -428,3 +430,65 @@ fn ipc_request_reply_across_threads() {
     }
     check!(worker.state() == crate::task::ThreadState::Dead, "the echo server did not exit");
 }
+
+/// The two PS/2 devices share one controller and one data port, so the thing
+/// most worth checking about them is that they do *not* share a queue.
+///
+/// The handler that feeds them decides which device a byte belongs to from the
+/// controller's status register, and it is the only place that decision is
+/// made; below it there are two byte streams with two independent readable
+/// signals. A mouse packet read as a keystroke -- or the reverse -- is the
+/// classic PS/2 bug, and it is a quiet one: the input looks damaged rather
+/// than broken, which is why it is checked here rather than left to the
+/// driver above.
+fn input_streams_are_independent() {
+    let keyboard = crate::obj::Device::ps2_keyboard();
+    let pointer = crate::obj::Device::ps2_mouse(true);
+
+    keyboard.push_input(0x1E); // `a`
+    keyboard.push_input(0x9E); // and its release
+    pointer.push_input(0x08); // a mouse packet's first byte
+
+    check!(
+        keyboard.header().signals().get().contains(Signals::READABLE),
+        "a byte on the keyboard did not raise its readable signal"
+    );
+
+    let mut out = [0u8; 8];
+    let n = keyboard.drain(&mut out[..]);
+    check!(n == 2 && out[0] == 0x1E && out[1] == 0x9E, "keyboard drained {n} bytes, first {:#04x}", out[0]);
+    let n = pointer.drain(&mut out[..]);
+    check!(n == 1 && out[0] == 0x08, "mouse drained {n} bytes, first {:#04x}", out[0]);
+
+    // Drain is what lowers the signal, and an empty queue is empty rather than
+    // a place to block: a driver that waits on READABLE is woken by the byte,
+    // so the signal must not outlive the queue it describes.
+    check!(keyboard.drain(&mut out[..]) == 0, "an emptied queue still had bytes");
+    check!(
+        !keyboard.header().signals().get().contains(Signals::READABLE),
+        "the readable signal outlived the queue it describes"
+    );
+}
+
+/// A full input queue drops its *oldest* byte, not its newest.
+///
+/// The producer is an interrupt handler, which must never block and so can
+/// never wait for room. Which end loses is a real decision: a byte that
+/// arrived 64 events ago is worth less than the movement that just happened,
+/// and for the mouse a queue that dropped its newest bytes would chop the end
+/// off every packet while the pointer moved fast -- which is exactly when the
+/// user most wants to know where it went.
+fn input_queue_overflow_drops_oldest() {
+    let keyboard = crate::obj::Device::ps2_keyboard();
+    for byte in 0..100u8 {
+        keyboard.push_input(byte);
+    }
+
+    let mut out = [0u8; 64];
+    let n = keyboard.drain(&mut out[..]);
+    check!(n == 64, "a queue fed 100 bytes drained {n}, not its capacity of 64");
+    check!(out[0] == 36, "the oldest surviving byte is {} rather than 36", out[0]);
+    check!(out[63] == 99, "the newest byte is {} rather than 99", out[63]);
+    check!(keyboard.drain(&mut out[..]) == 0, "the queue held more than its capacity");
+}
+

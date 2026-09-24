@@ -34,6 +34,10 @@ pub const IRQ_BASE: u8 = 32;
 pub const VECTOR_TIMER: u8 = 32;
 /// Vector used by the legacy keyboard controller.
 pub const VECTOR_KEYBOARD: u8 = 33;
+/// Vector used by the legacy keyboard controller's auxiliary port -- the one
+/// the PS/2 mouse is on. IRQ12, the second of the two legacy lines this kernel
+/// unmasks.
+pub const VECTOR_MOUSE: u8 = 44;
 /// Vector used by the debug UART.
 pub const VECTOR_SERIAL: u8 = 36;
 /// Vector used for the local APIC spurious interrupt.

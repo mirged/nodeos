@@ -19,9 +19,10 @@
 //! `fs` drives a virtio-blk disk with no more authority than that.
 //!
 //! There is deliberately no standalone `Irq` object here even though
-//! [`ObjectType::Irq`] exists: the one interrupt this module deals with (the
-//! PS/2 keyboard's fixed IRQ1) is entirely internal to the keyboard `Device`.
-//! A bindable `Irq` object would only earn its keep for a driver claiming an
+//! [`ObjectType::Irq`] exists: the two interrupts this module deals with --
+//! the PS/2 keyboard's IRQ1 and the mouse's IRQ12, one per input `Device` --
+//! are entirely internal to the objects the kernel already owns and feeds. A
+//! bindable `Irq` object would only earn its keep for a driver claiming an
 //! arbitrary or dynamic interrupt line, which nothing in this tree does yet.
 
 use alloc::sync::Arc;
@@ -31,10 +32,10 @@ use crate::sync::IrqSpinLock;
 
 use super::{KernelObject, ObjectHeader, ObjectType, Rights, Signals};
 
-/// Depth of the keyboard scancode queue. Generous relative to how fast a human
-/// can type; a full queue drops the oldest byte rather than blocking the IRQ
-/// handler, which must never block.
-const SCANCODE_QUEUE_LEN: usize = 64;
+/// Depth of one input device's byte queue. Generous relative to how fast a
+/// human can type or move a hand; a full queue drops the oldest byte rather
+/// than blocking the IRQ handler, which must never block.
+const INPUT_QUEUE_LEN: usize = 64;
 
 /// What a [`Device`] actually is.
 #[derive(Clone, Copy, Debug)]
@@ -57,6 +58,16 @@ pub enum DeviceKind {
     },
     /// The PS/2 keyboard controller's data port, fed by IRQ1.
     Ps2Keyboard,
+    /// The PS/2 controller's auxiliary port -- the mouse -- fed by IRQ12.
+    ///
+    /// `present` records whether a mouse answered when the controller was
+    /// brought up. The capability exists either way: a machine with no mouse
+    /// still has an auxiliary port, and a driver that could not tell the
+    /// difference would wait forever on a byte stream nothing will fill.
+    Ps2Mouse {
+        /// Whether a mouse answered the bring-up probe.
+        present: bool,
+    },
     /// A claimed PCI function, reduced to what a userspace driver can use:
     /// the port windows its BARs decode, and its interrupt line.
     Pci {
@@ -117,23 +128,29 @@ pub enum DeviceError {
     OutOfRange,
 }
 
-struct ScancodeQueue {
-    buf: [u8; SCANCODE_QUEUE_LEN],
+/// Bytes one input device has produced and nobody has read yet.
+///
+/// A ring with the drop-oldest rule a device queue wants: the producer is an
+/// interrupt handler that must never block, so a full queue loses the oldest
+/// byte rather than the newest -- a stale scancode or half a mouse packet is
+/// worth less than the movement that just happened.
+struct InputQueue {
+    buf: [u8; INPUT_QUEUE_LEN],
     head: usize,
     len: usize,
 }
 
-impl ScancodeQueue {
+impl InputQueue {
     const fn new() -> Self {
-        Self { buf: [0; SCANCODE_QUEUE_LEN], head: 0, len: 0 }
+        Self { buf: [0; INPUT_QUEUE_LEN], head: 0, len: 0 }
     }
 
     fn push(&mut self, byte: u8) {
-        let tail = (self.head + self.len) % SCANCODE_QUEUE_LEN;
-        if self.len == SCANCODE_QUEUE_LEN {
+        let tail = (self.head + self.len) % INPUT_QUEUE_LEN;
+        if self.len == INPUT_QUEUE_LEN {
             // Queue is full: drop the oldest byte to make room. A stuck key
             // stream is a worse failure than losing one stale scancode.
-            self.head = (self.head + 1) % SCANCODE_QUEUE_LEN;
+            self.head = (self.head + 1) % INPUT_QUEUE_LEN;
             self.len -= 1;
         }
         self.buf[tail] = byte;
@@ -144,7 +161,7 @@ impl ScancodeQueue {
         let n = out.len().min(self.len);
         for slot in out.iter_mut().take(n) {
             *slot = self.buf[self.head];
-            self.head = (self.head + 1) % SCANCODE_QUEUE_LEN;
+            self.head = (self.head + 1) % INPUT_QUEUE_LEN;
         }
         self.len -= n;
         n
@@ -163,7 +180,10 @@ pub struct Device {
     /// anyone asks would commit a `Vmo::new_physical` call this object cannot
     /// yet justify holding a handle for.
     vmo: IrqSpinLock<Option<Arc<Vmo>>>,
-    scancodes: IrqSpinLock<ScancodeQueue>,
+    /// Bytes this device has produced and nobody has read yet -- scancodes for
+    /// the keyboard, packet bytes for the mouse. One queue type for every
+    /// input kind so that `drain` has one implementation and one contract.
+    input: IrqSpinLock<InputQueue>,
 }
 
 impl Device {
@@ -174,7 +194,7 @@ impl Device {
             header: ObjectHeader::new(ObjectType::Device, Signals::NONE),
             kind: DeviceKind::FramebufferMmio { phys_base, size, width, height, pitch, bpp },
             vmo: IrqSpinLock::new(None),
-            scancodes: IrqSpinLock::new(ScancodeQueue::new()),
+            input: IrqSpinLock::new(InputQueue::new()),
         })
     }
 
@@ -184,7 +204,20 @@ impl Device {
             header: ObjectHeader::new(ObjectType::Device, Signals::NONE),
             kind: DeviceKind::Ps2Keyboard,
             vmo: IrqSpinLock::new(None),
-            scancodes: IrqSpinLock::new(ScancodeQueue::new()),
+            input: IrqSpinLock::new(InputQueue::new()),
+        })
+    }
+
+    /// Claim the PS/2 controller's auxiliary port as a `Device`.
+    ///
+    /// `present` is what the bring-up probe found; see [`DeviceKind::Ps2Mouse`]
+    /// for why the object exists either way.
+    pub fn ps2_mouse(present: bool) -> Arc<Self> {
+        Arc::new(Self {
+            header: ObjectHeader::new(ObjectType::Device, Signals::NONE),
+            kind: DeviceKind::Ps2Mouse { present },
+            vmo: IrqSpinLock::new(None),
+            input: IrqSpinLock::new(InputQueue::new()),
         })
     }
 
@@ -221,7 +254,7 @@ impl Device {
                 irq: function.irq,
             },
             vmo: IrqSpinLock::new(None),
-            scancodes: IrqSpinLock::new(ScancodeQueue::new()),
+            input: IrqSpinLock::new(InputQueue::new()),
         })
     }
 
@@ -330,19 +363,24 @@ impl Device {
         Ok(vmo)
     }
 
-    /// Push one scancode byte, called from the keyboard IRQ handler.
+    /// Push one byte of input, called from the controller's IRQ handler.
+    ///
+    /// A scancode for the keyboard, a packet byte for the mouse; the handler
+    /// is one function for both because the byte stream is one stream, and
+    /// `super::super::arch::x86_64::ps2::service` decides which device a byte
+    /// belongs to before it gets here.
     ///
     /// Never blocks and never allocates, so it is safe to call with interrupts
     /// masked and no thread context.
-    pub fn push_scancode(&self, byte: u8) {
-        self.scancodes.lock().push(byte);
+    pub fn push_input(&self, byte: u8) {
+        self.input.lock().push(byte);
         self.header.signals().update(Signals::READABLE, Signals::NONE);
     }
 
-    /// Drain up to `out.len()` queued scancodes, returning how many were
+    /// Drain up to `out.len()` queued input bytes, returning how many were
     /// copied. Clears the readable signal once the queue is empty.
     pub fn drain(&self, out: &mut [u8]) -> usize {
-        let mut queue = self.scancodes.lock();
+        let mut queue = self.input.lock();
         let n = queue.drain_into(out);
         if queue.is_empty() {
             self.header.signals().update(Signals::NONE, Signals::READABLE);

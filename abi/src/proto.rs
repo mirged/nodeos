@@ -402,6 +402,32 @@ pub mod wm_event {
     /// The window's content area changed size; `width`/`height` are the new
     /// dimensions and the surface memory object has been replaced.
     pub const CONFIGURE: u32 = 5;
+    /// The pointer moved while it was over this surface, or while this
+    /// surface held the implicit grab of a button press. `x`/`y` are the
+    /// pointer's position relative to the surface's content origin, and
+    /// `buttons` is the mask of buttons held down -- a client that drags
+    /// wants both in one event, not a motion event and a separate query.
+    pub const POINTER_MOTION: u32 = 6;
+    /// A pointer button changed state over this surface. `button` names the
+    /// button, `pressed` says which way, and `x`/`y`/`buttons` carry the same
+    /// meaning as for [`POINTER_MOTION`].
+    pub const POINTER_BUTTON: u32 = 7;
+}
+
+/// Pointer buttons, as the bits of [`super::WmEvent::buttons`].
+///
+/// Bit values rather than indices: the state of every button at once is what
+/// a client that is dragging something needs, and one field carrying all of
+/// them costs no more than one carrying a single button. The button named by
+/// [`super::WmEvent::button`] on a [`wm_event::POINTER_BUTTON`] event is
+/// exactly one of these bits.
+pub mod wm_button {
+    /// The primary button.
+    pub const LEFT: u32 = 1 << 0;
+    /// The secondary button.
+    pub const RIGHT: u32 = 1 << 1;
+    /// The middle button.
+    pub const MIDDLE: u32 = 1 << 2;
 }
 
 /// Modifier bits carried in [`WmEvent::modifiers`].
@@ -508,6 +534,21 @@ pub struct WmEvent {
     pub width: u32,
     /// New content height, for [`wm_event::CONFIGURE`].
     pub height: u32,
+    /// Pointer X relative to the surface's content origin, for
+    /// [`wm_event::POINTER_MOTION`] and [`wm_event::POINTER_BUTTON`].
+    ///
+    /// Signed, and deliberately not clamped to the surface: a client holding
+    /// an implicit grab keeps receiving motion after the pointer has left its
+    /// window, and a value that wrapped at the edge would turn a drag off the
+    /// top-left corner into a jump across the window.
+    pub x: i32,
+    /// Pointer Y. See [`WmEvent::x`].
+    pub y: i32,
+    /// Buttons held down, as [`wm_button`] bits, for the pointer events.
+    pub buttons: u32,
+    /// The button whose state changed, for [`wm_event::POINTER_BUTTON`]: one
+    /// [`wm_button`] bit. Zero for every other event.
+    pub button: u32,
 }
 
 // ---------------------------------------------------------------------------

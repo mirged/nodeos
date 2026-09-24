@@ -81,6 +81,20 @@ impl Canvas {
         unsafe { core::ptr::write_volatile(self.base.add(offset) as *mut u32, color & 0x00FF_FFFF) };
     }
 
+    /// Read one pixel, or `None` outside the canvas.
+    ///
+    /// The read is volatile for the same reason the write is: this memory is
+    /// either a device's MMIO range or a mapping another process is writing,
+    /// so it is not memory the compiler may assume it knows the contents of.
+    /// The compositor reads it for exactly that case -- saving the pixels a
+    /// client's window is about to be blitted over.
+    pub fn pixel(&self, x: u32, y: u32) -> Option<Rgb> {
+        let offset = self.offset(x, y)?;
+        // SAFETY: `offset` is in bounds by the check above, and the mapping is
+        // readable by the contract on `from_raw`.
+        Some(unsafe { core::ptr::read_volatile(self.base.add(offset) as *const u32) })
+    }
+
     /// Fill an axis-aligned rectangle, clipped to the canvas.
     ///
     /// Fills a scanline at a time rather than a pixel at a time: clearing a
