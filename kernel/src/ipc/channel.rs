@@ -213,6 +213,28 @@ impl Channel {
         }
     }
 
+    /// Put a message back at the front of this endpoint's inbox.
+    ///
+    /// Used when a receive found a message but could not copy it out (the
+    /// caller's buffers were too small): the message -- and every capability
+    /// it carries -- has to survive so the caller can retry with bigger
+    /// buffers, rather than being dropped on the floor.
+    pub fn requeue_front(&self, message: Message) {
+        let cost = message.cost();
+        {
+            let mut inbox = self.inbox.lock();
+            if inbox.closed {
+                // The endpoint is gone; dropping the message releases its
+                // capabilities, which is the correct teardown behaviour.
+                return;
+            }
+            inbox.bytes += cost;
+            inbox.queue.push_front(message);
+        }
+        self.header.signals().update(Signals::READABLE, Signals::NONE);
+        self.header.signals().queue().wake_all();
+    }
+
     /// Whether a reply with `txid` is already queued.
     fn has_reply(&self, txid: u64) -> bool {
         self.inbox

@@ -411,7 +411,7 @@ fn ipc_request_reply_across_threads() {
         let reply = client.call(request).expect("call");
         check!(reply.kind == 0x8020, "reply kind wrong in round {round}");
         check!(reply.flags.contains(MessageFlags::REPLY), "reply not marked as a reply");
-        check!(&reply.payload[..] == &[4u8, 3, 2, round as u8], "reply payload wrong in round {round}");
+        check!(reply.payload[..] == [4u8, 3, 2, round as u8], "reply payload wrong in round {round}");
         check!(reply.handles.len() == 1, "capability did not come back");
         check!(
             reply.handles[0].object().header().koid() == koid,

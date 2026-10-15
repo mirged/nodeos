@@ -3,7 +3,7 @@
 Before this, a NodeOS program that wanted to draw was handed the framebuffer
 device -- and with it the whole screen, every other program's output included.
 That is why `console` and `doom` could not run at the same time: there was one
-screen and one keyboard, and `grub/grub-doom.cfg` had to decide who got them.
+screen and one keyboard, and a boot configuration had to decide who got them.
 
 `compositor` is the process that holds them now, and it is the only one that
 does. Everything else gets a memory object the size of its own window and a
@@ -12,14 +12,16 @@ agreed to share, but because neither can reach the other's pixels.
 
 ```
    GRUB
-     |  module2 /boot/compositor.nxf  console.nxf  shell.nxf  doom.nxf
+     |  module2 /boot/compositor.nxf  console.nxf  shell.nxf
      v
   kernel/src/launch.rs
-     |  Display + Input  ->  compositor      (framebuffer, keyboard, mouse)
-     |  Memory + Channel ->  console         (a channel to the compositor)
-     |  + Clock          ->  doom            (a channel, and the IWAD)
+     |  Display + Input  ->  compositor   (framebuffer, keyboard, mouse)
+     |  Memory + Channel ->  console      (a channel to the compositor)
+     |  session channels ->  shell        (console, fs, compositor, audio)
      v
-  compositor (ring 3)
+  nodeos> run /bin/doom.nxf
+     v
+  compositor (ring 3)                 doom gets one of shell's compositor
      +-- window.rs     columns, frames, title bars
      +-- keyboard.rs   PS/2 set 1 -> events, decoded once for everyone
      +-- pointer.rs    PS/2 mouse packets -> motion, and the arrow on screen
@@ -91,14 +93,18 @@ The compositor shortcuts are:
 
 | Shortcut | Action |
 | --- | --- |
-| Meta/Windows or Scroll Lock | Cycle keyboard focus |
+| Meta/Windows or Scroll Lock (tap) | Cycle keyboard focus |
 | Meta+Tab | Cycle keyboard focus |
 | Meta+Enter | Toggle the focused window between tiled and maximized mode |
 | Meta+Q | Ask the focused client to close |
 
-Meta is aliased to Scroll Lock for virtual machines that eat the Windows key.
-The compositor swallows these shortcuts; all other keys go to the focused
-client.
+Scroll Lock is a full alias for Meta, not a second hotkey: both are tracked as
+the same modifier, so Scroll Lock+Tab, Scroll Lock+Enter and Scroll Lock+Q are
+the same shortcuts Meta+Tab, Meta+Enter and Meta+Q are. That alias exists for
+virtual machines that eat the Windows key. A *tap* of either key -- press and
+release with nothing in between -- cycles the focus; holding either and pressing
+another key makes it a modifier. The compositor swallows these shortcuts; all
+other keys go to the focused client.
 
 ## The pointer
 
@@ -184,27 +190,23 @@ window to go, and the exchange is what makes the gesture reversible.
 
 ## The layout is tiled by default
 
-The screen is divided into `MAX_WINDOWS` columns once, at startup, and each
-surface is allocated at the size of the column it is created in. The last column
-absorbs the remainder when the screen is not an exact multiple of the column
-count: a strip of screen that no column owns is a strip no repaint ever paints.
+The screen is divided into `MAX_WINDOWS` columns, and a window created while
+tiled is allocated a surface the size of its column. The last column absorbs the
+remainder when the screen is not an exact multiple of the column count: a strip
+of screen that no column owns is a strip no repaint ever paints.
 
-Surfaces used to be allocated at the width of the whole screen, so that a
-maximized window could use all of it without the compositor handing a running
-client a new memory object. That is the better design *once a client can be told
-that its window changed size*, and it is why `wm_event::CONFIGURE` is reserved --
-but until that exists, a client given a screen-wide surface lays out for a screen
-it cannot see: the console printed a hundred and twenty-seven columns of text
-through a hole the width of one column, and nothing stopped the extra pixels
-being blitted into its neighbour's. Allocating the column's own size is the
-honest version of the feature as it stands.
+Maximizing replaces that surface. The compositor allocates a new memory object
+the size of the whole content area, swaps its own mapping of the window's pixels,
+and sends the client a `wm_event::CONFIGURE` carrying the new geometry and a
+handle to the new object; restoring does the same back at column size. A client
+that handles `CONFIGURE` -- `console` and `doom` both do -- maps the new object
+and redraws, so the picture grows with the frame. A client that ignores it keeps
+drawing into an object the compositor no longer reads, which is why a resize and
+the `CONFIGURE` that announces it have to arrive together.
 
-What that costs is why maximize is currently cosmetic: the frame grows to the
-whole screen and the content stays the size it was allocated, with the rest of
-the area painted as desktop rather than left showing the previous frame.
-Giving a client a bigger surface when it maximizes is the change that would make
-maximize mean something, and it is what `CONFIGURE` exists for. Arbitrary
-drag-resize waits on the same thing.
+The console has no scrollback, so a resize clears it; Doom re-reads the geometry
+and recomputes its integer scale on its next frame. Arbitrary drag-resize would
+use the same event.
 
 ## Testing the pointer
 

@@ -11,12 +11,13 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
 mod files;
+mod lineedit;
 
 use libnode::abi::proto;
 use libnode::{println, Channel, Env, Message};
-use nodeos_abi::{Syscall, Rights, Signals};
 
 libnode::main! {
     fn main(env: Env) -> i32 {
@@ -24,7 +25,7 @@ libnode::main! {
     }
 }
 
-const PROMPT: &str = "nodeos> ";
+pub(crate) const PROMPT: &str = "nodeos> ";
 
 fn run(mut env: Env) -> i32 {
     let Some(handle) = env.take_extra(0) else {
@@ -36,7 +37,14 @@ fn run(mut env: Env) -> i32 {
     // shell, and the file commands say so rather than the shell refusing to
     // start over a disk it may not need.
     let files = env.take_extra(0).map(Channel::from_handle);
+    // The two channels the shell holds only to hand to the programs it
+    // launches: the compositor (so a graphical program such as Doom can open a
+    // window) and the mixer (so Doom can make a noise). The shell itself draws
+    // through the console and never touches either.
+    let compositor = env.take_extra(0).map(Channel::from_handle);
+    let audio = env.take_extra(0).map(Channel::from_handle);
     let mut cwd = String::from("/");
+    let mut history: Vec<String> = Vec::new();
 
     write_text(&console, "NodeOS shell. Type 'help' for a list of commands.\n");
     if files.is_none() {
@@ -44,9 +52,8 @@ fn run(mut env: Env) -> i32 {
     }
 
     loop {
-        write_text(&console, PROMPT);
-        let line = read_line(&console);
-        run_command(&console, files.as_ref(), &mut cwd, line.trim());
+        let line = lineedit::read_line(&console, files.as_ref(), &cwd, &mut history);
+        run_command(&console, files.as_ref(), compositor.as_ref(), audio.as_ref(), &mut cwd, line.trim());
     }
 }
 
@@ -54,14 +61,14 @@ fn write_text(console: &Channel, text: &str) {
     let _ = console.call(Message::new(proto::CONSOLE_WRITE_TEXT).with_payload(text.as_bytes()));
 }
 
-fn read_line(console: &Channel) -> String {
-    match console.call(Message::new(proto::CONSOLE_READ_LINE)) {
-        Ok(reply) => reply.text().unwrap_or("").into(),
-        Err(_) => String::new(),
-    }
-}
-
-fn run_command(console: &Channel, files: Option<&Channel>, cwd: &mut String, line: &str) {
+fn run_command(
+    console: &Channel,
+    files: Option<&Channel>,
+    compositor: Option<&Channel>,
+    audio: Option<&Channel>,
+    cwd: &mut String,
+    line: &str,
+) {
     let mut parts = line.splitn(2, ' ');
     let command = parts.next().unwrap_or("");
     let rest = parts.next().unwrap_or("");
@@ -75,9 +82,12 @@ fn run_command(console: &Channel, files: Option<&Channel>, cwd: &mut String, lin
                  files:    ls [dir], cat <file>, touch <file>, write <file> <text>,\n\
                  \x20         append <file> <text>, mkdir <dir>, rm <path>, stat <path>,\n\
                  \x20         df, fstest, run <program>\n\
-                 demos:    draw, chaos\n\
+                 demos:    draw\n\
                  paths may be absolute (/docs/NODEOS.MD) or relative to pwd.\n\
-                 NXF programs installed by make disk are visible under /bin.\n\
+                 /bin holds the packaged programs; try `run /bin/sysinfo.nxf`,\n\
+                 `run /bin/edit.nxf /notes.txt`, `run /bin/cc.nxf /tests/hello.c`,\n\
+                 `run /bin/tree.nxf`, `run /bin/bench.nxf` or `run /bin/doom.nxf`.\n\
+                 Up/Down recall history, Tab completes, Ctrl+C abandons a line.\n\
                  compositor: Meta/Windows or Scroll Lock switches focus;\n\
                  Meta+Enter maximizes, Meta+Tab switches, Meta+Q closes.\n",
         ),
@@ -91,7 +101,7 @@ fn run_command(console: &Channel, files: Option<&Channel>, cwd: &mut String, lin
         },
         "ls" | "cat" | "write" | "append" | "mkdir" | "rm" | "stat" | "df" | "fstest" | "touch" | "run" => {
             match files {
-                Some(files) => files::run(console, files, cwd, command, rest),
+                Some(files) => files::run(console, files, compositor, audio, cwd, command, rest),
                 None => write_text(console, "no filesystem is connected\n"),
             }
         }

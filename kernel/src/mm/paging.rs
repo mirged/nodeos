@@ -329,7 +329,7 @@ impl Mapper {
     /// this translation does not violate any other subsystem's invariants
     /// (aliasing a frame writably into two address spaces, for instance).
     pub unsafe fn map(&self, virt: u64, phys_addr: u64, flags: PageFlags, overwrite: bool) -> Result<(), MapError> {
-        if virt % PAGE_SIZE as u64 != 0 || !super::layout::is_canonical(virt) {
+        if !virt.is_multiple_of(PAGE_SIZE as u64) || !super::layout::is_canonical(virt) {
             return Err(MapError::BadAddress);
         }
         // SAFETY: caller owns the address space.
@@ -353,7 +353,10 @@ impl Mapper {
     /// See [`Mapper::map`]; additionally `virt` and `phys_addr` must be 2 MiB
     /// aligned.
     pub unsafe fn map_large(&self, virt: u64, phys_addr: u64, flags: PageFlags, overwrite: bool) -> Result<(), MapError> {
-        if virt % LARGE_PAGE_SIZE as u64 != 0 || phys_addr % LARGE_PAGE_SIZE as u64 != 0 {
+        if !virt.is_multiple_of(LARGE_PAGE_SIZE as u64)
+            || !phys_addr.is_multiple_of(LARGE_PAGE_SIZE as u64)
+            || !super::layout::is_canonical(virt)
+        {
             return Err(MapError::BadAddress);
         }
         let user = flags.contains(PageFlags::USER);
@@ -385,7 +388,11 @@ impl Mapper {
         if table.entries[index].is_present() && !overwrite {
             return Err(MapError::AlreadyMapped);
         }
+        let existing = table.entries[index];
         table.entries[index] = Entry::new(phys_addr, flags.or(PageFlags::PRESENT).or(PageFlags::HUGE));
+        if existing.is_present() {
+            flush(virt);
+        }
         Ok(())
     }
 

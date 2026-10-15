@@ -197,8 +197,20 @@ impl Fat {
         let root_sectors = (root_entries * ENTRY_SIZE as u32).div_ceil(bytes_per_sector);
         let root_start = reserved as u64 + (fat_copies as u64 * fat_sectors as u64);
         let data_start = root_start + root_sectors as u64;
-        let data_sectors = total_sectors.saturating_sub(data_start as u32);
-        let clusters = data_sectors / sectors_per_cluster;
+
+        // Compute the cluster count in 64 bits and reject anything that does
+        // not fit the rest of this file's `clusters + 2` bound. Doing the
+        // subtraction in `u32` (as this used to) truncated `data_start` and
+        // could produce a `clusters` value within two of `u32::MAX`, making
+        // every later `clusters + 2` overflow and panic on a crafted volume.
+        if data_start >= total_sectors as u64 {
+            return Err(Error::BadState);
+        }
+        let cluster_count = (total_sectors as u64 - data_start) / sectors_per_cluster as u64;
+        if cluster_count > (u32::MAX - 2) as u64 {
+            return Err(Error::NotSupported);
+        }
+        let clusters = cluster_count as u32;
 
         // The count of clusters is what decides the flavour -- not the label
         // in the boot sector, which is documentation. This is the rule from
@@ -212,6 +224,14 @@ impl Fat {
             Flavour::Fat32
         };
 
+        // A FAT32 root directory lives in a real cluster chain, and clusters
+        // below 2 are not valid. A zero here would make `cluster_sector`
+        // subtract two from zero the first time the root fills up.
+        let root_cluster = if flavour == Flavour::Fat32 { u32(&boot, 0x2C) } else { 0 };
+        if flavour == Flavour::Fat32 && root_cluster < 2 {
+            return Err(Error::BadState);
+        }
+
         Ok(Self {
             disk,
             flavour,
@@ -222,7 +242,7 @@ impl Fat {
             fat_copies,
             root_start,
             root_sectors,
-            root_cluster: if flavour == Flavour::Fat32 { u32(&boot, 0x2C) } else { 0 },
+            root_cluster,
             data_start,
             clusters,
             fat_cache: None,
@@ -651,6 +671,15 @@ impl Fat {
         if data.is_empty() {
             return Ok(0);
         }
+        // A FAT directory entry stores the file size in 32 bits. An offset or
+        // length that would push the end past that is refused rather than
+        // silently truncated: `end as u32` used to wrap, so a write at
+        // `2^32 * cluster_bytes` would land back at the start of the file and
+        // corrupt it.
+        let end = offset.checked_add(data.len() as u64).ok_or(Error::InvalidArgument)?;
+        if end > u32::MAX as u64 {
+            return Err(Error::InvalidArgument);
+        }
         let cluster_bytes = self.cluster_bytes() as u64;
 
         // A file created empty has no first cluster; it gets one on the first
@@ -683,6 +712,7 @@ impl Fat {
 
         let end = offset + written as u64;
         if end > entry.size as u64 {
+            // The guard above keeps this inside u32.
             entry.size = end as u32;
         }
         self.write_back(entry)?;
@@ -695,9 +725,21 @@ impl Fat {
         if entry.is_dir() {
             return Err(Error::InvalidArgument);
         }
+        // See `write`: a FAT size is 32 bits, and wrapping is corruption.
+        if length > u32::MAX as u64 {
+            return Err(Error::InvalidArgument);
+        }
         if length >= entry.size as u64 {
-            entry.size = length as u32;
-            return self.write_back(entry);
+            if length > entry.size as u64 {
+                // Extending is not just a bigger number in the directory
+                // entry: the clusters have to exist and the gap has to read as
+                // zero, or a subsequent read would fail on a chain that ends
+                // early (or return the previous owner's bytes).
+                self.zero_extend(entry, length)?;
+            } else {
+                self.write_back(entry)?;
+            }
+            return Ok(());
         }
         entry.size = length as u32;
         if length == 0 {
@@ -716,6 +758,23 @@ impl Fat {
             self.flush_fat()?;
         }
         self.write_back(entry)
+    }
+
+    /// Grow `entry` to `length` bytes by writing zeros over the new range.
+    ///
+    /// Chunked through [`Fat::write`] rather than buffering the whole range,
+    /// which can be up to 4 GiB. `write` allocates and links the clusters and
+    /// keeps `entry.size` in step, so no separate chain surgery is needed.
+    fn zero_extend(&mut self, entry: &mut Entry, length: u64) -> Result<(), Error> {
+        const CHUNK: usize = 16 * 1024;
+        let zeros = vec![0u8; CHUNK];
+        let mut at = entry.size as u64;
+        while at < length {
+            let take = (length - at).min(CHUNK as u64) as usize;
+            self.write(entry, at, &zeros[..take])?;
+            at += take as u64;
+        }
+        Ok(())
     }
 
     /// Update the on-disk record of `entry` from its in-memory fields.
@@ -768,11 +827,20 @@ impl Fat {
         }
         let short = short_name_bytes(&name).ok_or(Error::InvalidArgument)?;
 
-        // A directory needs a cluster before its record exists, because the
-        // first thing written into it is its own `.` entry pointing at it.
+        // A directory's cluster is allocated before its record because the
+        // record has to name it (and its own `.` entry points back at it). If
+        // there is no room for the record after all -- a full FAT16 root, say
+        // -- release the cluster again rather than leaking it.
         let cluster = if directory { self.allocate()? } else { 0 };
-
-        let (sector, offset) = self.free_slot(dir)?;
+        let (sector, offset) = match self.free_slot(dir) {
+            Ok(slot) => slot,
+            Err(error) => {
+                if cluster >= 2 {
+                    let _ = self.free_chain(cluster);
+                }
+                return Err(error);
+            }
+        };
         let mut bytes = vec![0u8; SECTOR_SIZE];
         self.disk.read(sector, &mut bytes)?;
         let record = &mut bytes[offset..offset + ENTRY_SIZE];

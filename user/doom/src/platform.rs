@@ -29,8 +29,9 @@
 use core::cell::UnsafeCell;
 
 use libnode::abi::proto::{self, wm_event};
+use libnode::abi::types::{MapFlags, MapWindow};
 use libnode::mem::{Mapping, Vmo};
-use libnode::{Channel, Message};
+use libnode::{Channel, Handle, Message};
 
 /// Depth of the scancode queue between the compositor and Doom's own decoder.
 /// Doom drains it once a frame; this is several frames' worth of a fast
@@ -48,6 +49,9 @@ struct Platform {
     fb_width: u32,
     fb_height: u32,
     fb_pitch: u32,
+    /// Bumped whenever the compositor replaces the surface. The C side polls
+    /// this each frame and re-runs its blit setup when it changes.
+    fb_serial: u32,
 
     /// The compositor connection: commits go out on it, input comes back.
     wm: Channel,
@@ -138,6 +142,7 @@ pub fn install(
         fb_width: surface.width,
         fb_height: surface.height,
         fb_pitch: surface.pitch,
+        fb_serial: 0,
         wm,
         surface_id: surface.surface,
         keys: ScancodeQueue::new(),
@@ -149,6 +154,34 @@ pub fn install(
 
     // SAFETY: single-threaded, and this is the only write.
     unsafe { *PLATFORM.0.get() = Some(platform) };
+}
+
+impl Platform {
+    /// Adopt a surface the compositor replaced, as a `CONFIGURE` names.
+    ///
+    /// The old mapping is unmapped before its object is released, so the frames
+    /// are never freed while still translated. The C side learns the geometry
+    /// changed through [`ndos_fb_serial`] and re-runs its blit setup.
+    fn resize_surface(&mut self, handle: Handle, width: u32, height: u32) {
+        let pitch = width * 4;
+        let size = pitch as u64 * height as u64;
+        let vmo = Vmo::from_handle(handle, size);
+        let Ok(mapping) = vmo.map(
+            0,
+            size,
+            MapFlags::READ.or(MapFlags::WRITE).or(MapFlags::SHARED).or(MapFlags::POPULATE),
+            MapWindow::Shared,
+        ) else {
+            return;
+        };
+        self._surface_mapping = mapping;
+        self._surface_vmo = vmo;
+        self.fb_base = self._surface_mapping.base() as *mut u8;
+        self.fb_width = width;
+        self.fb_height = height;
+        self.fb_pitch = pitch;
+        self.fb_serial = self.fb_serial.wrapping_add(1);
+    }
 }
 
 /// The IWAD's length in bytes.
@@ -204,6 +237,16 @@ fn pump_events(platform: &mut Platform) {
                 platform.keys.push(event.scancode | if event.pressed != 0 { 0x00 } else { 0x80 });
             }
             wm_event::CLOSE => libnode::exit(0),
+            // The compositor replaced the surface: the window was maximized or
+            // restored. Map the new object and bump the serial so the C blit
+            // re-reads the geometry on its next frame. Doom's own 320x200
+            // screen is unchanged; only the scale to the window changes.
+            wm_event::CONFIGURE => {
+                let (width, height) = (event.width, event.height);
+                if let Some(handle) = message.handles.into_iter().next() {
+                    platform.resize_surface(handle, width, height);
+                }
+            }
             // Focus changes need no action: the compositor simply stops
             // sending keys, and Doom carries on rendering into its own window.
             _ => {}
@@ -242,8 +285,6 @@ pub unsafe extern "C" fn ndos_write(buf: *const u8, len: usize) {
 /// window; the C allocator in `libc/malloc.c` links them together.
 #[no_mangle]
 pub extern "C" fn ndos_sbrk(len: usize) -> *mut u8 {
-    use libnode::abi::types::{MapFlags, MapWindow};
-
     let Ok(vmo) = Vmo::create(len as u64, false) else {
         return core::ptr::null_mut();
     };
@@ -316,6 +357,16 @@ pub unsafe extern "C" fn ndos_fb_info(width: *mut u32, height: *mut u32, pitch: 
         }
     }
     platform.fb_base
+}
+
+/// `uint32_t ndos_fb_serial(void)`
+///
+/// A number that changes whenever `ndos_fb_info` would return something
+/// different. The C blit caches the window geometry and polls this once a frame
+/// so a maximize or restore is picked up without a second entry point to call.
+#[no_mangle]
+pub extern "C" fn ndos_fb_serial() -> u32 {
+    platform().map_or(0, |platform| platform.fb_serial)
 }
 
 /// `void ndos_fb_commit(uint32_t x, uint32_t y, uint32_t w, uint32_t h)`

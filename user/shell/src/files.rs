@@ -27,7 +27,19 @@ use libnode::{println, Channel, Error, Message};
 use crate::write_text;
 
 /// Run one file command.
-pub fn run(console: &Channel, files: &Channel, cwd: &str, command: &str, rest: &str) {
+///
+/// `compositor` and `audio` are only used by `run`: they are the session
+/// channels every child gets, so a program that needs a window or a mixer finds
+/// them without having to ask.
+pub fn run(
+    console: &Channel,
+    files: &Channel,
+    compositor: Option<&Channel>,
+    audio: Option<&Channel>,
+    cwd: &str,
+    command: &str,
+    rest: &str,
+) {
     let rest = rest.trim();
     match command {
         "ls" => list(console, files, &resolve(cwd, if rest.is_empty() { "." } else { rest })),
@@ -40,7 +52,7 @@ pub fn run(console: &Channel, files: &Channel, cwd: &str, command: &str, rest: &
         "df" => df(console, files),
         "fstest" => self_test(console, files),
         "touch" => touch(console, files, cwd, rest),
-        "run" => run_program(console, files, cwd, rest),
+        "run" => run_program(console, files, compositor, audio, cwd, rest),
         _ => {}
     }
 }
@@ -57,7 +69,7 @@ pub fn change_dir(console: &Channel, files: &Channel, cwd: &mut String, rest: &s
     }
 }
 
-fn resolve(cwd: &str, input: &str) -> String {
+pub fn resolve(cwd: &str, input: &str) -> String {
     let mut components: Vec<String> = Vec::new();
     let source = if input.starts_with('/') { input } else { cwd };
     for component in source.split('/').chain(if input.starts_with('/') { "" } else { input }.split('/')) {
@@ -208,12 +220,23 @@ fn touch(console: &Channel, files: &Channel, cwd: &str, rest: &str) {
     }
 }
 
-fn run_program(console: &Channel, files: &Channel, cwd: &str, rest: &str) {
-    let input = rest.trim();
-    if input.is_empty() {
-        return write_text(console, "usage: run <program>\n");
-    }
-    let path = resolve(cwd, input);
+fn run_program(
+    console: &Channel,
+    files: &Channel,
+    compositor: Option<&Channel>,
+    audio: Option<&Channel>,
+    cwd: &str,
+    rest: &str,
+) {
+    // `run <program> [args...]`: the first word names the program, the rest are
+    // its command line. Splitting on whitespace is the whole of this shell's
+    // quoting; a path with a space in it is not something it can express.
+    let mut words = rest.split_whitespace();
+    let Some(program) = words.next() else {
+        return write_text(console, "usage: run <program> [args...]\n");
+    };
+    let args: Vec<&str> = words.collect();
+    let path = resolve(cwd, program);
     let Ok(node) = open(files, &path) else {
         return report(console, &path, Error::NotFound);
     };
@@ -260,9 +283,18 @@ fn run_program(console: &Channel, files: &Channel, cwd: &str, rest: &str) {
         CapClass::FileRead,
         CapClass::FileWrite,
         CapClass::FileCreate,
+        CapClass::Audio,
     ]
     .into_iter()
     .fold(0u32, |mask, class| mask | (1 << class as u32));
+
+    // Every child gets the shell's session capabilities, in a fixed order the
+    // programs know: console (0), filesystem (1), compositor (2), audio (3). A
+    // program reads the ones it needs and ignores the rest -- the console apps
+    // take 0 and 1, Doom takes 1 (for its IWAD), 2 and 3.
+    let sources = [Some(console), Some(files), compositor, audio];
+    let extra_count = sources.iter().flatten().count() as u32;
+
     let info = proto::Encoded::new(BootstrapMessage {
         version: 1,
         granted_caps,
@@ -271,20 +303,30 @@ fn run_program(console: &Channel, files: &Channel, cwd: &str, rest: &str) {
         thread: nodeos_abi::HandleValue::INVALID,
         namespace: nodeos_abi::HandleValue::INVALID,
         image_base: 0,
-        heap_size: 4 * 1024 * 1024,
-        extra_count: 2,
+        // Generous: the compiler maps an 8 MiB address space for the programs
+        // it runs on top of its own allocations, and the editor maps a window.
+        // The object is demand-paged, so wanting the room costs nothing until
+        // a program uses it.
+        heap_size: 16 * 1024 * 1024,
+        extra_count,
         _reserved: 0,
     });
-    let Ok(console_handle) = console.handle().duplicate(Rights::DEFAULT) else {
-        return write_text(console, "run: could not duplicate console\n");
-    };
-    let Ok(files_handle) = files.handle().duplicate(Rights::DEFAULT) else {
-        return write_text(console, "run: could not duplicate filesystem\n");
-    };
-    let message = Message::new(KIND_BOOTSTRAP)
-        .with_payload(info.bytes())
-        .with_handle(console_handle)
-        .with_handle(files_handle);
+
+    // The command line rides after the bootstrap struct, one NUL-terminated
+    // argument after another, with the resolved program path as `argv[0]`.
+    let mut payload = Vec::from(info.bytes());
+    for arg in core::iter::once(path.as_str()).chain(args.iter().copied()) {
+        payload.extend_from_slice(arg.as_bytes());
+        payload.push(0);
+    }
+
+    let mut message = Message::new(KIND_BOOTSTRAP).with_payload(&payload);
+    for source in sources.into_iter().flatten() {
+        let Ok(handle) = source.handle().duplicate(Rights::DEFAULT) else {
+            return write_text(console, "run: could not duplicate a capability\n");
+        };
+        message = message.with_handle(handle);
+    }
     if parent_bootstrap.send(message).is_err() {
         return write_text(console, "run: could not deliver bootstrap\n");
     }

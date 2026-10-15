@@ -241,7 +241,13 @@ impl VirtioBlk {
 
     /// Publish one three-descriptor chain and wait for it to come back.
     fn request(&mut self, kind: u32, sector: u64, length: usize) -> Result<(), Error> {
-        if sector * SECTOR_SIZE as u64 >= self.capacity * SECTOR_SIZE as u64 {
+        // The whole transfer has to fit, not just its first sector: a request
+        // at the last sector with a multi-sector length would otherwise address
+        // past the end of the device. Compare in sectors and with a checked
+        // add, so neither a huge sector nor a huge length can wrap.
+        let sectors = (length as u64).div_ceil(SECTOR_SIZE as u64);
+        let end = sector.checked_add(sectors).ok_or(Error::InvalidArgument)?;
+        if end > self.capacity {
             return Err(Error::InvalidArgument);
         }
 

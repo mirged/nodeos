@@ -7,7 +7,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ISO="${ROOT}/build/nodeos.iso"
+ISO="${ROOT}/build/nodeos-test.iso"
 LOG="${ROOT}/build/serial.log"
 TIMEOUT="${TIMEOUT:-90}"
 

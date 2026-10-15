@@ -284,14 +284,16 @@ impl Device {
         // Unaligned port access is a device-specific hazard rather than a
         // fault, and no register in either driver wants one, so refuse it
         // here instead of finding out on hardware that is not QEMU.
-        if offset % width as u16 != 0 {
+        if !offset.is_multiple_of(width as u16) {
             return Err(DeviceError::OutOfRange);
         }
         let end = offset.checked_add(width as u16).ok_or(DeviceError::OutOfRange)?;
         if end > window.len {
             return Err(DeviceError::OutOfRange);
         }
-        Ok(window.base + offset)
+        // Checked as well: a window whose base is near the top of the 16-bit
+        // I/O space must not wrap into somebody else's ports.
+        window.base.checked_add(offset).ok_or(DeviceError::OutOfRange)
     }
 
     /// Read a device register through a port window.

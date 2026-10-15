@@ -11,6 +11,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bench"
+version = "0.1.0"
+dependencies = [
+ "libnode",
+ "nodeos-abi",
+]
+
+[[package]]
+name = "cc"
+version = "0.1.0"
+dependencies = [
+ "libnode",
+ "nodeos-abi",
+]
+
+[[package]]
 name = "compositor"
 version = "0.1.0"
 dependencies = [
@@ -32,6 +48,15 @@ dependencies = [
 name = "doom"
 version = "0.1.0"
 dependencies = [
+ "libnode",
+ "nodeos-abi",
+]
+
+[[package]]
+name = "edit"
+version = "0.1.0"
+dependencies = [
+ "libdraw",
  "libnode",
  "nodeos-abi",
 ]
@@ -69,6 +94,22 @@ version = "0.1.0"
 
 [[package]]
 name = "shell"
+version = "0.1.0"
+dependencies = [
+ "libnode",
+ "nodeos-abi",
+]
+
+[[package]]
+name = "sysinfo"
+version = "0.1.0"
+dependencies = [
+ "libnode",
+ "nodeos-abi",
+]
+
+[[package]]
+name = "tree"
 version = "0.1.0"
 dependencies = [
  "libnode",

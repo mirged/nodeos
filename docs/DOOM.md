@@ -1,20 +1,24 @@
 # Doom on NodeOS
 
-Doom runs on NodeOS as an ordinary userspace process holding two capabilities.
-This document is about what that took, because the interesting part of the
-exercise is not that Doom runs -- it runs on everything -- but which of
-NodeOS's design choices made the port easy and which made it hard.
+Doom runs on NodeOS as an ordinary disk program, launched from the shell with
+`run /bin/doom.nxf`. This document is about what that took, because the
+interesting part of the exercise is not that Doom runs -- it runs on everything
+-- but which of NodeOS's design choices made the port easy and which made it
+hard.
 
 ```
-   GRUB
-     |  module2 /boot/compositor.nxf  console.nxf  shell.nxf
-     |  module2 /boot/doom.nxf  module2 /boot/doom.wad
+   make run
+     |  GRUB boots compositor, console, shell
      v
-  kernel/src/launch.rs
-     |  Memory + Channel + Clock
-     |  two handles: a compositor connection, the IWAD
+   nodeos> run /bin/doom.nxf
+     v
+  shell (ring 3)
+     |  duplicates its session channels into the child
+     |  console, filesystem, compositor, audio
      v
   doom (ring 3)
+     |  opens /DOOM.WAD through the filesystem channel
+     |  asks the compositor for a window
      +-- src/main.rs, src/platform.rs   the ndos_* boundary
      +-- csrc/                          doomgeneric
      +-- libc/                          just enough libc
@@ -22,43 +26,53 @@ NodeOS's design choices made the port easy and which made it hard.
 
 ## What Doom is given, and nothing else
 
-The launcher hands `doom` exactly two handles in its bootstrap message:
+The shell hands every program it launches the same four session handles, in a
+fixed order; Doom uses three of them and ignores the first:
 
-| # | Handle | Rights | What it is |
+| # | Handle | Rights | What Doom does with it |
 | --- | --- | --- | --- |
-| 0 | `Channel` | channel default | a connection to `compositor` |
-| 1 | `Vmo` | `READ_ONLY` | the IWAD, where the boot loader put it |
+| 0 | `Channel` | channel default | nothing -- the console |
+| 1 | `Channel` | channel default | opens `/DOOM.WAD` on the filesystem |
+| 2 | `Channel` | channel default | asks `compositor` for a window |
+| 3 | `Channel` | channel default | the mixer, when there is one |
 
-That is the complete list. Doom cannot open a file, create a process, or reach
-any device -- including the screen it is drawing on -- because it holds nothing
-that would let it, and there is no ambient authority to fall back on, which is
-the whole point of §1 of [`ARCHITECTURE.md`](ARCHITECTURE.md). "What can Doom
-do?" is answered by reading one message.
+That is the complete list. Doom cannot create a process or reach any device --
+including the screen it is drawing on -- because it holds nothing that would let
+it, and there is no ambient authority to fall back on, which is the whole point
+of §1 of [`ARCHITECTURE.md`](ARCHITECTURE.md). "What can Doom do?" is answered
+by reading one message.
 
-It used to hold two more: the framebuffer and the keyboard, *instead of*
-`console`, because there was one screen and one keyboard and the boot
-configuration had to decide who got them. `compositor` holds those now and
-hands Doom a window instead, so the two run side by side --
-[`COMPOSITOR.md`](COMPOSITOR.md) is what that took. Doom's own authority went
-*down* in the process: a window is strictly less than a framebuffer.
+It used to be a boot module the launcher handed an IWAD and a window. Loading
+from the filesystem removed that special case: Doom is a program on the disk
+now, and the shell can start it the way it starts any other. It once held two
+*more* handles -- the framebuffer and the keyboard, *instead of* `console` --
+because there was one screen and one keyboard and the boot configuration had to
+decide who got them. `compositor` holds those now and hands out windows instead,
+so Doom and the console run side by side; [`COMPOSITOR.md`](COMPOSITOR.md) is
+what that took. Doom's own authority went *down* in the process: a window is
+strictly less than a framebuffer.
 
-## The IWAD is a memory object, not a file
+## The IWAD comes from the filesystem
 
-NodeOS has no filesystem service wired into this process, and the IWAD is 14
-MiB. Rather than build a path to a file, the boot loader's copy of the WAD is
-turned into a memory object over the physical pages it already occupies
-(`Vmo::new_physical`), granted read-only, and mapped into Doom's
-memory-mapped-file window.
+`/DOOM.WAD` sits on the same FAT disk as `/bin/doom.nxf`. Doom opens it over the
+filesystem channel, reads it in 32 KiB chunks into a fresh memory object, and
+maps that read-only. The mini-libc's `fopen("doom.wad")` then resolves to a
+stream over the mapping, so the game reads the WAD in place: `fread` is a
+`memcpy` out of the mapping and the remaining ~11 MiB never travels through an
+IPC message.
 
-The result is that "loading the WAD" is a page-table operation. Doom's
-`fopen("doom.wad")` resolves, in the mini-libc, to a stream over that mapping;
-`fread` is a `memcpy` out of it; the 14 MiB is never copied onto the heap and
-never travels through an IPC message. This is §5's "bulk data moves by shared
-memory object" arriving exactly where the design predicted it would.
+It used to be a boot module instead: the boot loader's copy of the WAD was
+turned into a memory object over the physical pages it already occupied
+(`Vmo::new_physical`) and granted read-only. That worked, and it made Doom
+unlaunchable any other way. Reading it through the filesystem costs one startup
+pass -- a few hundred 32 KiB reads, into an object that is then mapped -- and
+buys the ordinary-program status. Bulk data still moves by shared memory object;
+the filesystem is just the thing that fills it.
 
 Reading a memory object you did not create needs to know how big it is, which
 the ABI could not previously answer -- so `HandleInfo` gained a `size` field
-(`capability_query`). That is the only syscall-surface change the port needed.
+(`capability_query`). The filesystem path uses `FS_OPEN`'s reply for the same
+information.
 
 ## No floating point, enforced by the compiler
 
@@ -132,8 +146,9 @@ one back into the bytes the C side already knew how to read. Arrows move, Ctrl
 fires, Space opens, Shift runs, Alt strafes, Tab is the automap, 1-7 select
 weapons; Meta hands the keyboard to the window next door.
 
-There is no sound: NodeOS has no audio device, and `i_sound.c` is compiled with
-its null driver.
+Sound goes through the `audio` service: Doom's `i_nodeossound.c` turns each of
+Doom's channel decisions into one `AUDIO_PLAY` on the mixer, which holds the
+sound card. Doom holds a channel to it, not the device.
 
 ## Building it
 
@@ -142,22 +157,29 @@ no cross-compiler is needed, since the host is already x86-64 and only has to
 be told to stop assuming an operating system. The flags that matter are in that
 file's module comment.
 
-The IWAD is not in this repository. Point `DOOM_WAD` at one:
+The IWAD is not in this repository. Put one at `DOOM.WAD` in the repository
+root, or point `DOOM_WAD` at it, and `make` packages it onto the disk as
+`/DOOM.WAD`:
 
 ```sh
-make run-doom DOOM_WAD=/path/to/doom1.wad
+make DOOM_WAD=/path/to/doom1.wad
+make run
+nodeos> run /bin/doom.nxf
 ```
 
-Shareware `doom1.wad` works; so does a full `doom.wad`.
+Shareware `doom1.wad` works; so does a full `doom.wad`. A build without one
+still compiles and boots -- `run /bin/doom.nxf` just reports that it cannot read
+the IWAD.
 
 ## What this exercised
 
 The port touched five subsystems and found one gap.
 
-* **Capabilities** did what they claim: the launcher's grant is the whole of
-  Doom's authority, and it is three lines of policy in `launch.rs`.
-* **Memory objects** made a 14 MiB read-only data file a page-table operation
-  rather than a copy.
+* **Capabilities** did what they claim: the handles the shell forwards are the
+  whole of Doom's authority, and they are the same session every program gets.
+* **Memory objects** make the IWAD a read-through-then-map operation rather
+  than a copy held on the heap: the filesystem fills one, the game reads it in
+  place.
 * **Device capabilities** were already the right shape -- Doom used the
   framebuffer exactly as `console` did, with no new kernel code. It holds
   neither any more; see [`COMPOSITOR.md`](COMPOSITOR.md).

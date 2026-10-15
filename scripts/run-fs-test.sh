@@ -9,14 +9,14 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ISO="${ISO:-${ROOT}/build/nodeos-graphic.iso}"
+ISO="${ISO:-${ROOT}/build/nodeos.iso}"
 DISK="${DISK:-${ROOT}/build/disk.img}"
 LOG="${ROOT}/build/fs-test.log"
 PORT="${PORT:-45471}"
 BOOTWAIT="${BOOTWAIT:-14}"
 
 for required in "${ISO}" "${DISK}"; do
-    [[ -f "${required}" ]] || { echo "run-fs-test: ${required} not found; run 'make iso-graphic disk'" >&2; exit 1; }
+    [[ -f "${required}" ]] || { echo "run-fs-test: ${required} not found; run 'make'" >&2; exit 1; }
 done
 
 # A file left behind by an earlier run would make the "the host can read it"

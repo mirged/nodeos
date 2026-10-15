@@ -52,22 +52,42 @@ and the whole thing runs in QEMU today.
 
 ```sh
 # Prerequisites: Rust (stable), QEMU, GRUB + xorriso for the ISO.
-sudo apt-get install -y qemu-system-x86 grub-pc-bin grub-common xorriso mtools
+sudo apt-get install -y qemu-system-x86 grub-pc-bin grub-efi-amd64-bin grub-common xorriso mtools
 
-make            # build the kernel, userspace, tools, and a bootable ISO
-make run        # boot it in QEMU with the console on stdout
-make test       # boot and assert that every self-test passed
-make test-mouse # boot with a display, drive the mouse, check the pixels
+make      # build everything: kernel, userspace, ISO and disk
+make run  # boot the window system in QEMU
 ```
+
+At the shell, `run /bin/doom.nxf` plays Doom; `/bin` also holds `sysinfo`,
+`tree` and `bench`. Every other target is a debug or CI check; `make help`
+lists them all.
+
+```sh
+make test         # headless kernel self-tests
+make test-fs      # filesystem I/O through the shell
+make test-apps    # run the console apps from the shell
+make test-cc      # compile and run a C program
+make test-edit    # edit and save a file
+make test-audio   # check sound using QEMU's wav backend
+make test-mouse   # drive the mouse and check the pixels
+make debug        # boot and wait for GDB on :1234
+```
+
+`build/nodeos.iso` is a hybrid BIOS/UEFI boot image. To boot a physical
+machine, write that ISO to a USB drive with an image writer (for example,
+Rufus in DD mode or `dd`), then select the USB device from the firmware boot
+menu. Writing an image erases the selected drive. On Linux, first identify the
+whole USB device with `lsblk`, then run `sudo dd if=build/nodeos.iso
+of=/dev/sdX bs=4M status=progress oflag=sync` with `/dev/sdX` replaced by the
+correct device (not a partition such as `/dev/sdX1`).
 
 You should see the kernel bring itself up, run 121 self-tests, launch `init`
 from an NXF module, and `init` report back from ring 3.
 
 ## The window system
 
-```sh
-make run-graphic                            # compositor + console + shell
-```
+`make run` boots `compositor`, `console` and `shell`, and typing
+`run /bin/doom.nxf` adds Doom as a second window beside the console.
 
 `compositor` holds the framebuffer, the PS/2 keyboard and the mouse, and it is
 the only process in the system that does. Everything else -- the console, Doom
@@ -84,20 +104,62 @@ checking any of it needs a framebuffer rather than a serial log.
 
 ## Doom
 
+Put a Doom IWAD at `DOOM.WAD` in the repository root before `make` (or pass
+`DOOM_WAD=/path/to/doom1.wad`); `make` packages it as `/DOOM.WAD` on the disk.
+Shareware `doom1.wad` works, so does a full `doom.wad`. Then:
+
 ```sh
-make run-doom DOOM_WAD=/path/to/doom1.wad
+make run
+nodeos> run /bin/doom.nxf
 ```
 
-Doom runs as an ordinary NodeOS process holding exactly two capabilities: a
-channel to the compositor, and the IWAD as a read-only memory object. It cannot
-open a file, create a process, or reach any device -- including the screen it
-is drawing on -- because it was handed nothing that would let it. That is also
-why it now runs *beside* the shell rather than instead of it: the boot that
-starts Doom starts the console too, in the next column.
+Doom is an ordinary disk program now: launched from the shell, it reads its IWAD
+from the filesystem like any other client. It holds a channel to the compositor,
+a channel to the filesystem and, when there is a mixer, a channel to `audio` --
+it cannot create a process or reach any device, including the screen it is
+drawing on, because it was handed nothing that would let it. That is also why it
+runs *beside* the shell rather than instead of it: it occupies the next column.
 
 The interesting part is not that Doom runs -- it runs on everything -- but
 which design choices made the port easy and which made it hard. That is
 [`docs/DOOM.md`](docs/DOOM.md).
+
+## The shell and the programs it runs
+
+The shell is an ordinary console client, but it reads raw keys now, so it has
+history (Up/Down), cursor movement, Tab completion of commands and file names,
+and Ctrl+C to abandon a line. It launches programs with `run /bin/<name>.nxf
+[args...]`, handing each child the same session -- console, filesystem,
+compositor, audio channels -- and its command line.
+
+* `sysinfo` -- a process's view of the system: its capability set, the clock,
+  the console's geometry, a memory object it allocates, and filesystem
+  statistics and directory listing. `make test-apps` runs it.
+* `tree` -- a recursive filesystem listing. `make test-apps`.
+* `bench` -- a memory fill/verify and scheduler-yield benchmark. `make test-apps`.
+* `edit` -- a full-screen text editor in its own window: type, move with the
+  arrow keys, save with Ctrl+S, quit with Ctrl+Q. `make test-edit` types into it
+  and reads the saved file back with mtools.
+* `doom` -- see above.
+* `cc` -- a small C compiler. It reads a `.c` file from the disk, compiles it to
+  a stack machine, and runs it, with a standard library of builtins (`printf`,
+  `strlen`, `malloc`, `rand`, and friends). `make test-cc` compiles and runs
+  `user/cc/tests/hello.c` and checks the output.
+
+```
+nodeos> run /bin/edit.nxf /notes.txt
+nodeos> run /bin/cc.nxf /tests/hello.c
+hello, world
+sum 1..10 = 55
+...
+```
+
+The compiler is a real one -- tokenizer, recursive-descent parser, type-aware
+code generator, virtual machine -- for a deliberate subset of C: one machine
+word (`int`), `char`, pointers and arrays, functions with recursion, `for`,
+`while`, `if`, and the usual operators. No structs, floating point, or
+preprocessor. See `user/cc/src/`; the subset's boundaries are argued in the
+module comments, not hidden.
 
 ## Layout
 

@@ -165,8 +165,6 @@ pub struct Thread {
     pub(crate) vruntime: AtomicU64,
     /// Nanoseconds left in the current timeslice.
     pub(crate) timeslice_ns: AtomicU64,
-    /// Trap frame of the thread while it is stopped in an exception.
-    pub(crate) fault_frame: IrqSpinLock<Option<TrapFrame>>,
     /// A wakeup that arrived while this thread was still running.
     ///
     /// Every blocking path in the kernel has the same shape: park on a wait
@@ -240,7 +238,6 @@ impl Thread {
             runtime_ns: AtomicU64::new(0),
             vruntime: AtomicU64::new(0),
             timeslice_ns: AtomicU64::new(0),
-            fault_frame: IrqSpinLock::new(None),
             wake_pending: AtomicBool::new(false),
         });
         thread.header.set_name(name);
@@ -268,7 +265,6 @@ impl Thread {
             runtime_ns: AtomicU64::new(0),
             vruntime: AtomicU64::new(0),
             timeslice_ns: AtomicU64::new(0),
-            fault_frame: IrqSpinLock::new(None),
             wake_pending: AtomicBool::new(false),
         });
         thread.header.set_name(name);
@@ -449,15 +445,17 @@ fn enter_user(thread: &Arc<Thread>, entry: u64, stack: u64, arg0: u64, arg1: u64
     let stack_top = thread.kernel_stack_top();
     let frame_ptr = trap_frame_slot(stack_top) as *mut TrapFrame;
 
-    let mut frame = TrapFrame::default();
-    frame.rip = entry;
-    frame.cs = USER_CS as u64;
-    // IF set so the thread is preemptible; bit 1 is the reserved always-one bit.
-    frame.rflags = (1 << 9) | (1 << 1);
-    frame.rsp = stack;
-    frame.ss = USER_SS as u64;
-    frame.rdi = arg0;
-    frame.rsi = arg1;
+    let frame = TrapFrame {
+        rip: entry,
+        cs: USER_CS as u64,
+        // IF set so the thread is preemptible; bit 1 is the reserved always-one bit.
+        rflags: (1 << 9) | (1 << 1),
+        rsp: stack,
+        ss: USER_SS as u64,
+        rdi: arg0,
+        rsi: arg1,
+        ..TrapFrame::default()
+    };
 
     // SAFETY: `frame_ptr` is inside this thread's own kernel stack, above the
     // switch frame we are currently running on, and is 8-byte aligned.

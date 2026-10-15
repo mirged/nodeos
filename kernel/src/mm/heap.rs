@@ -116,9 +116,14 @@ pub fn live_bytes() -> u64 {
 }
 
 /// Buddy order needed for a large allocation of `size` bytes.
-fn large_order(size: usize) -> usize {
+///
+/// Returns `None` when the rounded-up request is larger than the largest
+/// buddy block, which is a failed allocation rather than a reason to panic:
+/// `GlobalAlloc::alloc` is required to return null, not unwind.
+fn large_order(size: usize) -> Option<usize> {
     let pages = size.div_ceil(PAGE_SIZE);
-    pages.next_power_of_two().trailing_zeros() as usize
+    let order = pages.next_power_of_two().trailing_zeros() as usize;
+    (order < phys::MAX_ORDER).then_some(order)
 }
 
 /// The kernel's global allocator.
@@ -135,7 +140,9 @@ unsafe impl GlobalAlloc for KernelAllocator {
                 // Large: straight from the buddy allocator. Alignments above a
                 // page are satisfied automatically because buddy blocks are
                 // naturally aligned to their own size.
-                let order = large_order(layout.size().max(layout.align()));
+                let Some(order) = large_order(layout.size().max(layout.align())) else {
+                    return ptr::null_mut();
+                };
                 match phys::alloc_order(order) {
                     Some(pfn) => {
                         HEAP_PAGES.fetch_add(1 << order, Ordering::Relaxed);
@@ -159,7 +166,9 @@ unsafe impl GlobalAlloc for KernelAllocator {
         match Heap::class_for(layout.size(), layout.align()) {
             Some(class) => HEAP.lock().free_small(ptr, class),
             None => {
-                let order = large_order(layout.size().max(layout.align()));
+                // A larger-than-max block could never have been handed out, so
+                // there is nothing to return to the buddy allocator.
+                let Some(order) = large_order(layout.size().max(layout.align())) else { return };
                 let pfn = phys::phys_to_pfn(phys::virt_to_phys(ptr as u64));
                 HEAP_PAGES.fetch_sub(1 << order, Ordering::Relaxed);
                 // SAFETY: the block came from `alloc_order` with this order and

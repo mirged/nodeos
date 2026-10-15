@@ -288,7 +288,7 @@ impl<'a> Iterator for TagIter<'a> {
         let advance = (size + 7) & !7;
         // SAFETY: `advance >= size`, and we verified the tag fits.
         self.cursor = unsafe { self.cursor.add(advance) };
-        return Some((header.kind, body, body_len));
+        Some((header.kind, body, body_len))
     }
 }
 

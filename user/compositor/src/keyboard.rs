@@ -36,8 +36,14 @@ pub struct KeyEvent {
 /// has any use for -- every function key, every modifier and every letter is
 /// spoken for somewhere.
 pub const META_MAKE: u8 = 0x5B;
-/// Scroll Lock, accepted as an alias for [`META_MAKE`] on keyboards (and
-/// virtual machines) that swallow Meta before it reaches the guest.
+/// Scroll Lock, an alias for [`META_MAKE`] on keyboards (and virtual machines)
+/// that swallow Meta before it reaches the guest.
+///
+/// It is a full alias, not just a second way to cycle focus: the decoder tracks
+/// it as the Meta modifier, so Scroll Lock+Tab, Scroll Lock+Enter and
+/// Scroll Lock+Q are the same shortcuts Meta+Tab, Meta+Enter and Meta+Q are.
+/// A *tap* of either key -- press and release with nothing in between -- cycles
+/// the focus; holding either and pressing another key is a modifier.
 pub const SCROLL_LOCK_MAKE: u8 = 0x46;
 
 const BACKSPACE_MAKE: u8 = 0x0E;
@@ -148,6 +154,9 @@ impl Decoder {
             (LEFT_CTRL_MAKE, _) => self.ctrl = pressed,
             (LEFT_ALT_MAKE, _) => self.alt = pressed,
             (META_MAKE, true) => self.meta = pressed,
+            // Scroll Lock is the same modifier as Meta. It is not `0xE0`-
+            // prefixed, which is why it needs its own arm.
+            (SCROLL_LOCK_MAKE, false) => self.meta = pressed,
             _ => {}
         }
 
@@ -191,12 +200,10 @@ impl Decoder {
 }
 
 impl KeyEvent {
-    /// Whether this is the press of the compositor's focus-cycling hotkey.
-    pub fn is_focus_hotkey(&self) -> bool {
-        self.pressed && !self.extended && self.scancode == SCROLL_LOCK_MAKE
-    }
-
+    /// Whether this key *is* the Meta modifier: the extended Windows key or its
+    /// Scroll Lock alias. Both are swallowed by the compositor and both take
+    /// part in the tap-to-cycle-shortcut logic in `main`.
     pub fn is_meta_key(&self) -> bool {
-        self.extended && self.scancode == META_MAKE
+        (self.extended && self.scancode == META_MAKE) || (!self.extended && self.scancode == SCROLL_LOCK_MAKE)
     }
 }

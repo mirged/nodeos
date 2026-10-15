@@ -1,0 +1,14 @@
+[package]
+name = "cc"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cc"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+libnode = { workspace = true }
+nodeos-abi = { workspace = true }

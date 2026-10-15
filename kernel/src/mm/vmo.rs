@@ -282,10 +282,8 @@ impl Vmo {
         let mut inner = self.inner.lock();
         let pages = (size / PAGE_SIZE as u64) as usize;
         if pages < inner.pages.len() {
-            for slot in inner.pages.drain(pages..) {
-                if let Some(pfn) = slot {
-                    phys::decref(pfn);
-                }
+            for pfn in inner.pages.drain(pages..).flatten() {
+                phys::decref(pfn);
             }
         } else {
             let extra = pages - inner.pages.len();

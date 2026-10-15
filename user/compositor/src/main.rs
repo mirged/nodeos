@@ -76,9 +76,6 @@ struct Drag {
     /// The window, named by identity rather than by index: `windows` is a
     /// vector, and indices move under it whenever a client disconnects.
     window: (u32, u32),
-    /// Where in the title bar the pointer grabbed it, so that the window does
-    /// not jump to put its own left edge under the cursor on the first motion.
-    grab_x: i32,
 }
 
 /// Everything the compositor owns.
@@ -372,46 +369,10 @@ fn create_surface(compositor: &mut Compositor, client_index: usize, message: Mes
     let pitch = content.w * 4;
     let size = pitch as u64 * content.h as u64;
 
-    let Ok(vmo) = Vmo::create(size, false) else {
+    let Some((surface, client_handle)) = make_surface(content.w, content.h) else {
         reply_error(&compositor.clients[client_index].channel, &message, Error::NoMemory);
         return;
     };
-    // Mapped eagerly: the alternative is that the first fault on each page
-    // happens in whichever of the two processes touches it first, and a
-    // shared buffer whose backing depends on the order two processes run is
-    // a race waiting for a slower machine.
-    let Ok(mapping) = vmo.map(
-        0,
-        size,
-        MapFlags::READ.or(MapFlags::WRITE).or(MapFlags::SHARED).or(MapFlags::POPULATE),
-        MapWindow::Shared,
-    ) else {
-        reply_error(&compositor.clients[client_index].channel, &message, Error::NoSpace);
-        return;
-    };
-
-    // The client gets a handle that can map and write the buffer, and nothing
-    // else -- notably not `DESTROY`, so it cannot pull its own window's pixels
-    // out from under the compositor mid-blit.
-    let client_rights = Rights::DUPLICATE
-        .or(Rights::TRANSFER)
-        .or(Rights::READ)
-        .or(Rights::WRITE)
-        .or(Rights::MAP)
-        .or(Rights::GET_PROPERTY)
-        .or(Rights::WAIT);
-    let Ok(client_handle) = vmo.handle().duplicate(client_rights) else {
-        reply_error(&compositor.clients[client_index].channel, &message, Error::AccessDenied);
-        return;
-    };
-
-    // SAFETY: the mapping was just made over the whole object, which is
-    // `pitch * content.h` bytes, and no other mapping of it exists here.
-    let mut surface = unsafe { Surface::new(vmo, mapping, content.w, content.h, pitch) };
-    // A freshly created memory object is zero-filled, which is black; being
-    // explicit costs one pass and means the window is never showing a
-    // half-drawn client's first frame over an assumption.
-    surface.canvas.clear(0x0000_0000);
 
     let client = &mut compositor.clients[client_index];
     let surface_id = client.next_surface;
@@ -425,9 +386,11 @@ fn create_surface(compositor: &mut Compositor, client_index: usize, message: Mes
         title: if title.is_empty() { String::from("window") } else { title },
         surface,
     });
-    if compositor.focus.is_none() {
-        compositor.focus = Some(compositor.windows.len() - 1);
-    }
+    // A new window takes the keyboard, the way it does on every desktop: the
+    // program the user just asked for is the one they want to type at.
+    let new_index = compositor.windows.len() - 1;
+    let previous = compositor.focus;
+    compositor.focus = Some(new_index);
     repaint(compositor);
 
     let info = proto::Encoded::new(proto::WmSurfaceInfo {
@@ -442,15 +405,98 @@ fn create_surface(compositor: &mut Compositor, client_index: usize, message: Mes
         .with_handle(client_handle);
     let _ = compositor.clients[client_index].channel.reply(&message, reply);
 
-    // Sent after the reply so the client learns it has the focus only once it
-    // has a surface identifier to attach the event to.
-    if compositor.focus == Some(compositor.windows.len() - 1) {
-        send_event(
-            &compositor.clients[client_index].channel,
-            proto::WmEvent { surface: surface_id, kind: wm_event::FOCUS_IN, ..Default::default() },
-        );
+    // The old window is told it lost the focus, the new one that it gained it.
+    // The gain goes after the reply so the client already has the surface
+    // identifier the event names.
+    if let Some(previous) = previous {
+        if previous != new_index {
+            notify_focus(compositor, previous, wm_event::FOCUS_OUT);
+        }
     }
+    send_event(
+        &compositor.clients[client_index].channel,
+        proto::WmEvent { surface: surface_id, kind: wm_event::FOCUS_IN, ..Default::default() },
+    );
     println!("compositor: client {client_id} surface {surface_id} in column {slot}, {}x{}", content.w, content.h);
+}
+
+/// Allocate and map a surface of `width`x`height`, plus a handle for the client.
+///
+/// Returns `None` if any step fails. Surface *creation* turns that into an
+/// error reply; a resize only logs it and keeps the old surface.
+fn make_surface(width: u32, height: u32) -> Option<(Surface, libnode::Handle)> {
+    let pitch = width * 4;
+    let size = pitch as u64 * height as u64;
+
+    let vmo = Vmo::create(size, false).ok()?;
+    // Mapped eagerly: the alternative is that the first fault on each page
+    // happens in whichever of the two processes touches it first, and a
+    // shared buffer whose backing depends on the order two processes run is
+    // a race waiting for a slower machine.
+    let mapping = vmo
+        .map(
+            0,
+            size,
+            MapFlags::READ.or(MapFlags::WRITE).or(MapFlags::SHARED).or(MapFlags::POPULATE),
+            MapWindow::Shared,
+        )
+        .ok()?;
+
+    // The client gets a handle that can map and write the buffer, and nothing
+    // else -- notably not `DESTROY`, so it cannot pull its own window's pixels
+    // out from under the compositor mid-blit.
+    let client_rights = Rights::DUPLICATE
+        .or(Rights::TRANSFER)
+        .or(Rights::READ)
+        .or(Rights::WRITE)
+        .or(Rights::MAP)
+        .or(Rights::GET_PROPERTY)
+        .or(Rights::WAIT);
+    let client_handle = vmo.handle().duplicate(client_rights).ok()?;
+
+    // SAFETY: the mapping was just made over the whole object, which is
+    // `pitch * height` bytes, and no other mapping of it exists here.
+    let mut surface = unsafe { Surface::new(vmo, mapping, width, height, pitch) };
+    // A freshly created memory object is zero-filled, which is black; being
+    // explicit costs one pass and means the window is never showing a
+    // half-drawn client's first frame over an assumption.
+    surface.canvas.clear(0x0000_0000);
+    Some((surface, client_handle))
+}
+
+/// Resize a window's surface to its tiled or maximized content, and tell the
+/// client with a `wm_event::CONFIGURE`.
+///
+/// The compositor allocates the new memory object, swaps its own mapping of the
+/// window's pixels, and hands the client a handle to the new one. A client that
+/// does not handle `CONFIGURE` keeps drawing into the object it already mapped
+/// -- which the compositor no longer reads -- so this is only useful together
+/// with clients that do (see `console` and `doom`).
+fn resize_window(compositor: &mut Compositor, index: usize, maximized: bool) {
+    let (slot, client_id, surface_id) = {
+        let window = &compositor.windows[index];
+        (window.slot, window.client, window.surface_id)
+    };
+    let content = compositor.layout.content_for(slot, maximized);
+    let Some((surface, handle)) = make_surface(content.w, content.h) else {
+        println!(
+            "compositor: could not allocate a {}x{} surface; window {surface_id} keeps its old one",
+            content.w, content.h
+        );
+        return;
+    };
+    compositor.windows[index].surface = surface;
+
+    let event = proto::WmEvent {
+        surface: surface_id,
+        kind: wm_event::CONFIGURE,
+        width: content.w,
+        height: content.h,
+        ..Default::default()
+    };
+    let Some(client) = compositor.clients.iter().find(|client| client.id == client_id) else { return };
+    send_event_with_handle(&client.channel, event, handle);
+    println!("compositor: client {client_id} surface {surface_id} configured to {}x{}", content.w, content.h);
 }
 
 fn commit(compositor: &mut Compositor, client_index: usize, message: Message) {
@@ -463,6 +509,16 @@ fn commit(compositor: &mut Compositor, client_index: usize, message: Message) {
         reply_error(&compositor.clients[client_index].channel, &message, Error::NotFound);
         return;
     };
+
+    // A window hidden behind a maximized one is not on screen. Acknowledge the
+    // commit -- the client is waiting on it -- but do not let its pixels paint
+    // over the maximized frame.
+    if compositor.maximized.is_some_and(|maximized| maximized != index) {
+        let _ = compositor.clients[client_index]
+            .channel
+            .reply(&message, Message::new(proto::reply_kind(proto::WM_COMMIT)));
+        return;
+    }
 
     //println!("compositor: DEBUG commit c{} s{} slot {} rect {},{} {}x{}", client_id, damage.surface, compositor.windows[index].slot, damage.x, damage.y, damage.w, damage.h);
     let content = compositor.layout.content_for(
@@ -564,10 +620,9 @@ fn drain_keyboard(compositor: &mut Compositor, keyboard: &Device, decoder: &mut 
     let Ok(count) = keyboard.read(&mut bytes) else { return };
     for byte in &bytes[..count] {
         let Some(event) = decoder.feed(*byte) else { continue };
-        if event.is_focus_hotkey() {
-            cycle_focus(compositor);
-            continue;
-        }
+        // Meta and its Scroll Lock alias are handled the same way: a tap cycles
+        // the focus, and holding it makes the next key a shortcut. Neither the
+        // key itself nor the shortcut is ever delivered to a client.
         if event.is_meta_key() {
             if event.pressed {
                 compositor.meta_used = false;
@@ -629,15 +684,19 @@ fn cycle_focus(compositor: &mut Compositor) {
     // Cycling away from a maximized window tiling the screen again is
     // deliberate: this shortcut is how a maximized window is escaped on a
     // machine with no pointer, so it must not leave the screen covered by a
-    // window that no longer has the focus.
-    compositor.maximized = None;
+    // window that no longer has the focus. Its surface goes back to column
+    // size with the state, or the client would keep a screen-sized buffer
+    // while tiled.
+    if let Some(maximized) = compositor.maximized {
+        compositor.maximized = None;
+        resize_window(compositor, maximized, false);
+    }
     set_focus(compositor, Some(next));
 }
 
 fn toggle_maximize(compositor: &mut Compositor) {
     let Some(index) = compositor.focus else { return };
-    compositor.maximized = if compositor.maximized == Some(index) { None } else { Some(index) };
-    repaint(compositor);
+    set_maximized(compositor, index, compositor.maximized != Some(index));
 }
 
 fn close_focus(compositor: &mut Compositor) {
@@ -689,6 +748,15 @@ fn notify_focus(compositor: &Compositor, index: usize, kind: u32) {
 fn send_event(channel: &Channel, event: proto::WmEvent) {
     let event = proto::Encoded::new(event);
     let mut message = Message::new(proto::WM_EVENT).with_payload(event.bytes());
+    message.flags = MessageFlags::NON_BLOCKING;
+    let _ = channel.send(message);
+}
+
+/// As [`send_event`], for the one event that carries a capability: the new
+/// surface memory object on a `CONFIGURE`.
+fn send_event_with_handle(channel: &Channel, event: proto::WmEvent, handle: libnode::Handle) {
+    let event = proto::Encoded::new(event);
+    let mut message = Message::new(proto::WM_EVENT).with_payload(event.bytes()).with_handle(handle);
     message.flags = MessageFlags::NON_BLOCKING;
     let _ = channel.send(message);
 }
@@ -810,8 +878,7 @@ fn apply_button(compositor: &mut Compositor, button: u32, pressed: bool) {
         return;
     }
 
-    let frame = compositor.layout.frame_for(compositor.windows[index].slot, false);
-    compositor.drag = Some(Drag { window: key, grab_x: x as i32 - frame.x as i32 });
+    compositor.drag = Some(Drag { window: key });
     compositor.grab = Some(key);
     deliver_pointer_event(compositor, wm_event::POINTER_BUTTON, button, true);
 }
@@ -897,21 +964,32 @@ fn move_to_slot(compositor: &mut Compositor, index: usize, slot: usize) {
     repaint(compositor);
 }
 
-/// Set a window's maximized state.
+/// Set a window's maximized state, giving it a surface of the matching size.
 fn set_maximized(compositor: &mut Compositor, index: usize, maximized: bool) {
     let wanted = if maximized { Some(index) } else { None };
     if compositor.maximized == wanted {
         return;
     }
+    // Maximizing a second window while one is already maximized moves the
+    // state implicitly: the first must get its column-sized surface back, or it
+    // would keep a screen-sized buffer while tiled.
+    let previous = compositor.maximized;
     compositor.maximized = wanted;
+    if let Some(previous) = previous.filter(|previous| *previous != index) {
+        resize_window(compositor, previous, false);
+    }
 
-    let window = &compositor.windows[index];
+    let (client, surface) = {
+        let window = &compositor.windows[index];
+        (window.client, window.surface_id)
+    };
     println!(
-        "compositor: pointer: client {} surface {} {}",
-        window.client,
-        window.surface_id,
+        "compositor: client {} surface {} {}",
+        client,
+        surface,
         if maximized { "maximized" } else { "restored" }
     );
+    resize_window(compositor, index, maximized);
     repaint(compositor);
 }
 
@@ -935,8 +1013,14 @@ fn double_clicked(compositor: &mut Compositor, key: (u32, u32)) -> bool {
 /// which is what makes a click on the "desktop" focus it rather than dropping
 /// the focus, and why the desktop is clickable only when nothing is maximized.
 fn window_at(compositor: &Compositor, x: u32, y: u32) -> Option<usize> {
+    // The maximized window is on top of everything, so it is the hit-test
+    // winner regardless of the order the windows happen to be stored in.
+    if let Some(index) = compositor.maximized {
+        let frame = compositor.layout.frame_for(compositor.windows[index].slot, true);
+        return frame.contains(x, y).then_some(index);
+    }
     for (index, window) in compositor.windows.iter().enumerate() {
-        let frame = compositor.layout.frame_for(window.slot, compositor.maximized == Some(index));
+        let frame = compositor.layout.frame_for(window.slot, false);
         if frame.contains(x, y) {
             return Some(index);
         }
@@ -1004,45 +1088,55 @@ impl Compositor {
 /// of what each client last put there.
 fn repaint(compositor: &mut Compositor) {
     compositor.uncover_pointer();
+    // A maximized window owns the whole screen. Painting the columns and the
+    // other windows underneath it would let their blits land on top of it, and
+    // then a click would focus one window while another was visible.
+    if let Some(index) = compositor.maximized {
+        paint_window(compositor, index, true);
+        compositor.paint_pointer();
+        return;
+    }
     for slot in 0..MAX_WINDOWS {
         if !compositor.windows.iter().any(|w| w.slot == slot) {
             window::draw_empty(&mut compositor.screen, &compositor.layout, slot);
         }
     }
     for index in 0..compositor.windows.len() {
-        let focused = compositor.focus == Some(index);
-        window::draw_frame(
-            &mut compositor.screen,
-            &compositor.layout,
-            &compositor.windows[index],
-            focused,
-            compositor.maximized == Some(index),
-        );
-
-        let content = compositor.layout.content_for(
-            compositor.windows[index].slot,
-            compositor.maximized == Some(index),
-        );
-        let source = &compositor.windows[index].surface.canvas;
-        // A maximized window's frame is the whole screen, and its surface is
-        // still the size of the column it was allocated in: a surface is mapped
-        // once, and the protocol has no way to hand a running client a bigger
-        // one (see `window`). So the content covers what it can and the rest is
-        // painted as desktop, which is a limitation stated on the screen rather
-        // than the previous frame's pixels left lying in the gap -- the
-        // difference between "the window is not that big" and "the window looks
-        // corrupted".
-        let w = content.w.min(source.width());
-        let h = content.h.min(source.height());
-        compositor.screen.blit(content.x, content.y, source, 0, 0, w, h);
-        if w < content.w {
-            compositor.screen.fill_rect(content.x + w, content.y, content.w - w, content.h, window::DESKTOP);
-        }
-        if h < content.h {
-            compositor.screen.fill_rect(content.x, content.y + h, content.w, content.h - h, window::DESKTOP);
-        }
+        paint_window(compositor, index, false);
     }
     compositor.paint_pointer();
+}
+
+/// Paint one window's frame and its last committed content.
+///
+/// `maximized` says whether the frame fills the screen. A maximized window's
+/// surface is still the size of the column it was allocated in -- a surface is
+/// mapped once and the protocol has no way to hand a running client a bigger
+/// one (see `window`) -- so the content covers what it can and the rest is
+/// painted as desktop. That is a limitation stated on the screen rather than
+/// the previous frame's pixels left lying in the gap: the difference between
+/// "the window is not that big" and "the window looks corrupted".
+fn paint_window(compositor: &mut Compositor, index: usize, maximized: bool) {
+    let focused = compositor.focus == Some(index);
+    window::draw_frame(
+        &mut compositor.screen,
+        &compositor.layout,
+        &compositor.windows[index],
+        focused,
+        maximized,
+    );
+
+    let content = compositor.layout.content_for(compositor.windows[index].slot, maximized);
+    let source = &compositor.windows[index].surface.canvas;
+    let w = content.w.min(source.width());
+    let h = content.h.min(source.height());
+    compositor.screen.blit(content.x, content.y, source, 0, 0, w, h);
+    if w < content.w {
+        compositor.screen.fill_rect(content.x + w, content.y, content.w - w, content.h, window::DESKTOP);
+    }
+    if h < content.h {
+        compositor.screen.fill_rect(content.x, content.y + h, content.w, content.h - h, window::DESKTOP);
+    }
 }
 
 // ---------------------------------------------------------------------------

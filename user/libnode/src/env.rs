@@ -18,22 +18,33 @@ pub struct Env {
     bootstrap: Option<Channel>,
     info: BootstrapMessage,
     extras: Vec<Handle>,
+    args: Vec<alloc::string::String>,
 }
 
 impl Env {
     /// An environment with nothing in it.
     pub fn empty() -> Self {
-        Self { bootstrap: None, info: BootstrapMessage::default(), extras: Vec::new() }
+        Self { bootstrap: None, info: BootstrapMessage::default(), extras: Vec::new(), args: Vec::new() }
     }
 
     /// An environment with only a bootstrap channel.
     pub fn with_channel(channel: Channel) -> Self {
-        Self { bootstrap: Some(channel), info: BootstrapMessage::default(), extras: Vec::new() }
+        Self {
+            bootstrap: Some(channel),
+            info: BootstrapMessage::default(),
+            extras: Vec::new(),
+            args: Vec::new(),
+        }
     }
 
     /// Build from a received bootstrap message.
-    pub fn from_bootstrap(info: BootstrapMessage, channel: Channel, extras: Vec<Handle>) -> Self {
-        Self { bootstrap: Some(channel), info, extras }
+    pub fn from_bootstrap(
+        info: BootstrapMessage,
+        channel: Channel,
+        extras: Vec<Handle>,
+        args: Vec<alloc::string::String>,
+    ) -> Self {
+        Self { bootstrap: Some(channel), info, extras, args }
     }
 
     /// Resize the heap to whatever the launcher asked for, now that the
@@ -92,5 +103,12 @@ impl Env {
         } else {
             None
         }
+    }
+
+    /// The command line, `argv`-style: element 0 is the program path the shell
+    /// resolved, the rest are the words that followed `run`. Empty when the
+    /// program was started without one.
+    pub fn args(&self) -> &[alloc::string::String] {
+        &self.args
     }
 }

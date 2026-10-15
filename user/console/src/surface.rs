@@ -35,7 +35,11 @@ impl Damage {
         if w == 0 || h == 0 {
             return;
         }
-        let (x1, y1) = (x + w, y + h);
+        // Saturating: the coordinates come from client messages, and a
+        // `CONSOLE_FILL_RECT` with `x = u32::MAX, w = 1` would otherwise panic
+        // this service on the addition alone. The compositor clips the
+        // (possibly too-large) rectangle to the surface.
+        let (x1, y1) = (x.saturating_add(w), y.saturating_add(h));
         self.bounds = Some(match self.bounds {
             None => (x, y, x1, y1),
             Some((ax, ay, ax1, ay1)) => (ax.min(x), ay.min(y), ax1.max(x1), ay1.max(y1)),
@@ -73,6 +77,27 @@ impl Surface {
         Self { _vmo: vmo, _mapping: mapping, canvas, grid, id: info.surface, damage: Damage::default() }
     }
 
+    /// Adopt a new surface memory object, as a `CONFIGURE` event asks.
+    ///
+    /// The window changed size, so the canvas and the text grid are rebuilt
+    /// around the new geometry. The old mapping is unmapped before its object
+    /// is released, so the frames are never freed while still translated.
+    ///
+    /// # Safety
+    /// `mapping` must cover at least `pitch * height` bytes of `vmo`, and no
+    /// other mapping in this process may write it.
+    pub unsafe fn replace(&mut self, vmo: Vmo, mapping: Mapping, width: u32, height: u32, pitch: u32) {
+        // SAFETY: the caller guarantees the mapping covers the geometry, and
+        // `_mapping` below keeps it alive for as long as the canvas.
+        let canvas = unsafe { Canvas::from_raw(mapping.base() as *mut u8, width, height, pitch) };
+        let grid = TextGrid::new(&canvas, FOREGROUND, BACKGROUND);
+        self._mapping = mapping;
+        self._vmo = vmo;
+        self.canvas = canvas;
+        self.grid = grid;
+        self.damage = Damage::default();
+    }
+
     /// Width in pixels.
     pub fn width(&self) -> u32 {
         self.canvas.width()
@@ -91,6 +116,11 @@ impl Surface {
     /// Text rows.
     pub fn rows(&self) -> u32 {
         self.grid.rows()
+    }
+
+    /// Where the cursor is, in glyph cells.
+    pub fn cursor(&self) -> (u32, u32) {
+        self.grid.cursor()
     }
 
     /// Clear the window and reset the cursor.
@@ -139,7 +169,7 @@ impl Surface {
     pub fn draw_line(&mut self, x0: u32, y0: u32, x1: u32, y1: u32, color: Rgb) {
         self.canvas.draw_line(x0, y0, x1, y1, color);
         let (x, y) = (x0.min(x1), y0.min(y1));
-        self.damage.add(x, y, x0.abs_diff(x1) + 1, y0.abs_diff(y1) + 1);
+        self.damage.add(x, y, x0.abs_diff(x1).saturating_add(1), y0.abs_diff(y1).saturating_add(1));
     }
 
     fn damage_all(&mut self) {

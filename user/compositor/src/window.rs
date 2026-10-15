@@ -1,13 +1,12 @@
 //! Windows, and where they go.
 //!
 //! The layout is a fixed set of columns, decided once at startup and never
-//! recomputed. That is a real limitation and worth stating plainly: a window's
-//! content buffer is allocated when the surface is created and the client maps
-//! it exactly once, so changing a window's size means replacing the memory
-//! object under a client that is very likely mid-frame. The protocol has
-//! `wm_event::CONFIGURE` for that day; fixed columns are what this compositor
-//! can implement without it, and they are enough for the thing it was built to
-//! do -- show two programs at once.
+//! recomputed, and a window created while tiled gets a surface the size of its
+//! column. Maximizing replaces that surface rather than restructuring the
+//! layout: the compositor allocates a new memory object and announces it with
+//! `wm_event::CONFIGURE`. Keeping the columns fixed is what lets the screen
+//! show two programs at once without a general stacking model; the resize is
+//! the part a client has to cooperate with.
 
 use alloc::string::String;
 
@@ -202,10 +201,20 @@ pub fn draw_frame(screen: &mut Canvas, layout: &Layout, window: &Window, focused
     screen.stroke_rect(frame.x, frame.y, frame.w, frame.h, bar);
 
     // Clipped by the canvas, so a long title stops at the window edge rather
-    // than running into its neighbour.
+    // than running into its neighbour. Truncate by *character*, not byte: a
+    // client may hand us any valid UTF-8 title, and slicing a `str` at a byte
+    // offset that lands inside a multi-byte sequence panics -- which, with
+    // `panic = abort`, would let one client take the compositor down.
     let text_w = frame.w.saturating_sub(2 * BORDER + 4);
     let max_chars = (text_w / GLYPH_SIZE as u32) as usize;
-    let title = &window.title[..window.title.len().min(max_chars)];
+    let mut end = window.title.len();
+    for (count, (index, _)) in window.title.char_indices().enumerate() {
+        if count == max_chars {
+            end = index;
+            break;
+        }
+    }
+    let title = &window.title[..end];
     screen.draw_text_at(frame.x + BORDER + 2, frame.y + 2, title, text, None);
 }
 

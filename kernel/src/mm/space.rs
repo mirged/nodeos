@@ -326,7 +326,16 @@ impl AddressSpace {
     pub fn protect(&self, base: u64, flags: MapFlags) -> Result<(), SpaceError> {
         let mut regions = self.regions.lock();
         let region = regions.get_mut(&base).ok_or(SpaceError::NotMapped)?;
-        if flags.0 & !region.flags.0 & (MapFlags::WRITE.0 | MapFlags::EXECUTE.0) != 0 {
+        // A COW write is weaker authority than a direct write: it needs only
+        // READ on the backing object because the fault handler makes a private
+        // copy. Dropping COW while keeping WRITE would therefore turn a
+        // read-only handle into a mapping that writes the shared object, which
+        // is exactly the laundering the escalation check exists to stop.
+        let old_direct_write = region.flags.contains(MapFlags::WRITE) && !region.flags.contains(MapFlags::COW);
+        let new_direct_write = flags.contains(MapFlags::WRITE) && !flags.contains(MapFlags::COW);
+        if (new_direct_write && !old_direct_write)
+            || (flags.contains(MapFlags::EXECUTE) && !region.flags.contains(MapFlags::EXECUTE))
+        {
             return Err(SpaceError::PermissionEscalation);
         }
         region.flags = flags;
@@ -491,10 +500,12 @@ unsafe fn free_user_tables(root: phys::Pfn) {
                 unsafe { free_level(entry.pfn(), level - 1) };
             }
         }
-        if level > 0 {
-            // SAFETY: every child has been freed; this table is now garbage.
-            unsafe { phys::free(pfn) };
-        }
+        // Every table in the tree is owned by this address space, including the
+        // level-0 page tables (and the PML4 itself) -- the `level > 0` guard
+        // that used to be here leaked one page-table frame per touched 2 MiB
+        // region on every process teardown.
+        // SAFETY: every child has been freed; this table is now garbage.
+        unsafe { phys::free(pfn) };
     }
 }
 

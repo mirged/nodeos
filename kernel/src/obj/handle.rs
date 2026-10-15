@@ -195,8 +195,25 @@ impl HandleTable {
         Ok(handle)
     }
 
-    /// Remove a handle, returning it.
+    /// Take a handle out of the table without treating it as closed.
+    ///
+    /// Used when a handle is being *transferred* (put into a message, or moved
+    /// into a child at `process_start`). The object is still owned by the
+    /// handle in flight, so no "last handle closed" hook may run; running it
+    /// here is what used to close a channel endpoint in the middle of handing
+    /// it to its new owner.
+    pub fn take(&self, value: HandleValue) -> Result<Handle, ObjectError> {
+        self.detach(value, false)
+    }
+
+    /// Remove a handle, returning it. This is a close: the object's
+    /// [`KernelObject::on_zero_handles`] hook runs if no other handle to it
+    /// remains anywhere.
     pub fn remove(&self, value: HandleValue) -> Result<Handle, ObjectError> {
+        self.detach(value, true)
+    }
+
+    fn detach(&self, value: HandleValue, notify: bool) -> Result<Handle, ObjectError> {
         if value.is_invalid() {
             return Err(ObjectError::BadHandle);
         }
@@ -222,7 +239,11 @@ impl HandleTable {
         inner.live -= 1;
         drop(inner);
 
-        if Arc::strong_count(handle.object()) <= 2 {
+        // `handle` is the only reference this removal still holds, so a count
+        // of one means it was the last handle to the object. (`<= 2` was an
+        // off-by-one that fired the hook while a sibling handle -- a duplicate,
+        // or the in-flight copy in a transfer -- was still live.)
+        if notify && Arc::strong_count(handle.object()) == 1 {
             handle.object().on_zero_handles();
         }
         Ok(handle)
@@ -282,7 +303,7 @@ impl HandleTable {
             out
         };
         for handle in drained {
-            if Arc::strong_count(handle.object()) <= 2 {
+            if Arc::strong_count(handle.object()) == 1 {
                 handle.object().on_zero_handles();
             }
         }

@@ -34,6 +34,7 @@ static uint32_t fb_pitch;   /* bytes per scanline */
 static uint32_t blit_scale;    /* integer magnification */
 static uint32_t blit_x;        /* left edge of the image, in pixels */
 static uint32_t blit_y;        /* top edge of the image, in pixels */
+static uint32_t fb_serial_seen; /* ndos_fb_serial() when the blit was set up */
 
 /* One scaled output row, reused every row of every frame. Sized for the
    widest window we are willing to drive. */
@@ -43,6 +44,11 @@ static uint32_t row_scratch[MAX_FB_WIDTH];
 static void display_init(void)
 {
     fb_base = ndos_fb_info(&fb_width, &fb_height, &fb_pitch);
+    /* Remember which surface this setup describes, so DG_DrawFrame can tell a
+       compositor resize from an ordinary frame. Set even on the failure paths
+       below, or a window that was never granted would re-run this every
+       frame. */
+    fb_serial_seen = ndos_fb_serial();
 
     if (fb_base == NULL)
     {
@@ -98,6 +104,14 @@ static void display_init(void)
 
 void DG_DrawFrame(void)
 {
+    /* The compositor replaces the surface when the window is maximized or
+       restored. Re-read the geometry and recompute the scale before drawing
+       into what may be a different object than the last frame used. */
+    if (ndos_fb_serial() != fb_serial_seen)
+    {
+        display_init();
+    }
+
     if (fb_base == NULL)
     {
         return;

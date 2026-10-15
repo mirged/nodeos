@@ -5,6 +5,8 @@
 //! vector, and no stack layout convention to get wrong. Everything else arrives
 //! as a message.
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::arch::global_asm;
 
 use nodeos_abi::message::{BootstrapMessage, KIND_BOOTSTRAP};
@@ -68,7 +70,11 @@ pub unsafe extern "C" fn __libnode_start(bootstrap: u32) -> ! {
                 // least one `BootstrapMessage`, which is plain-old-data.
                 let info: BootstrapMessage =
                     unsafe { (message.payload.as_ptr() as *const BootstrapMessage).read_unaligned() };
-                Env::from_bootstrap(info, channel, message.handles)
+                // Anything after the struct is the command line, one
+                // NUL-terminated argument after another. A launcher that sends
+                // none leaves it empty.
+                let args = parse_args(&message.payload[core::mem::size_of::<BootstrapMessage>()..]);
+                Env::from_bootstrap(info, channel, message.handles, args)
             }
             Ok(_) | Err(_) => Env::with_channel(channel),
         }
@@ -79,6 +85,22 @@ pub unsafe extern "C" fn __libnode_start(bootstrap: u32) -> ! {
     // macro, which enforces this exact signature.
     let code = unsafe { __libnode_main(env) };
     crate::exit(code)
+}
+
+/// Split the trailing bootstrap bytes into NUL-terminated arguments.
+///
+/// Invalid UTF-8 is replaced rather than rejected: an argument is a string the
+/// program will print or use as a path, and no byte the shell can send is a
+/// reason to refuse to start.
+fn parse_args(bytes: &[u8]) -> Vec<String> {
+    let mut args = Vec::new();
+    for field in bytes.split(|byte| *byte == 0) {
+        if field.is_empty() {
+            continue;
+        }
+        args.push(String::from_utf8_lossy(field).into_owned());
+    }
+    args
 }
 
 /// Declare a program's entry point.

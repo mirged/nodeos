@@ -213,6 +213,12 @@ impl Buddy {
             Ordering::Relaxed,
         );
 
+        // The block being freed is not yet counted as free; each buddy it
+        // merges with already is and was removed from its free list above. So
+        // the free-page count grows by the size of the *original* block, not by
+        // the size of the merged block -- adding the merged size would count
+        // every absorbed buddy a second time.
+        let freed_pages = 1u64 << order;
         let mut pfn = pfn;
         let mut order = order;
         while order + 1 < MAX_ORDER {
@@ -227,7 +233,7 @@ impl Buddy {
             order += 1;
         }
         self.list_push(pfn, order);
-        self.free_pages += 1 << order;
+        self.free_pages += freed_pages;
     }
 
     /// Add `[start, end)` (in frames) to the allocator, decomposing it into

@@ -36,6 +36,11 @@ const unsigned char *ndos_wad_data(size_t *len);
    used to be. */
 uint8_t *ndos_fb_info(uint32_t *width, uint32_t *height, uint32_t *pitch);
 
+/* A counter that changes whenever the values `ndos_fb_info` returns have
+   changed -- the compositor maximized or restored the window and handed over a
+   new surface. The blit polls it once a frame and re-reads the geometry. */
+uint32_t ndos_fb_serial(void);
+
 /* Publish a finished rectangle of the window to the compositor. Blocks until
    the compositor has copied it, so the next frame cannot overwrite pixels it
    is still reading. */

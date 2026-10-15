@@ -129,7 +129,9 @@ pub unsafe fn is_real(vector: u8) -> bool {
         return true;
     }
     let command_port = if irq == 7 { PIC1_COMMAND } else { PIC2_COMMAND };
-    let bit = if irq == 7 { 7 } else { 7 };
+    // Both spurious lines are bit 7 of their own controller's ISR: IRQ 15 is
+    // the slave's IRQ 7, and the slave's command port is the one being read.
+    let bit = 7;
     // SAFETY: OCW3 selects the ISR for the next read of the command port.
     unsafe {
         port::outb(command_port, CMD_READ_ISR);

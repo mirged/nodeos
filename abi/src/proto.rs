@@ -291,6 +291,17 @@ pub const CONSOLE_DRAW_LINE: u32 = 0x5006;
 /// they arrive. No request payload. Reply payload: the UTF-8 line, without
 /// the trailing newline.
 pub const CONSOLE_READ_LINE: u32 = 0x5007;
+/// Read one raw key press, sent with `channel_call`. The console holds the
+/// reply until the next key is pressed, and does *not* echo it or edit a line:
+/// the client is doing its own editing. Key releases are not reported. This is
+/// what a shell or a full-screen text program reads to build a line editor
+/// with history and cursor movement. No request payload. Reply payload:
+/// [`ConsoleKey`].
+pub const CONSOLE_READ_KEY: u32 = 0x5008;
+/// Report the cursor's cell. No payload. Reply payload: [`ConsoleCursor`].
+/// A client that redraws a line needs to know where the console last put the
+/// cursor, which only the console tracks.
+pub const CONSOLE_GET_CURSOR: u32 = 0x5009;
 
 /// Reply to [`CONSOLE_GET_INFO`].
 #[repr(C)]
@@ -306,7 +317,7 @@ pub struct ConsoleInfo {
     pub rows: u32,
 }
 
-/// Payload of [`CONSOLE_SET_CURSOR`].
+/// Payload of [`CONSOLE_SET_CURSOR`], and the reply to [`CONSOLE_GET_CURSOR`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ConsoleCursor {
@@ -314,6 +325,27 @@ pub struct ConsoleCursor {
     pub col: u32,
     /// Row, in glyph cells.
     pub row: u32,
+}
+
+/// Reply to [`CONSOLE_READ_KEY`].
+///
+/// The same fields the compositor's `WmEvent` carries for a key, minus the
+/// surface and geometry: a key press, decoded once in the compositor.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ConsoleKey {
+    /// PS/2 set 1 make code, without the release bit.
+    pub scancode: u8,
+    /// 1 when the code arrived `0xE0`-prefixed.
+    pub extended: u8,
+    /// Always 1 today; releases are not reported.
+    pub pressed: u8,
+    /// Decoded character, or 0 for a key with no printable form.
+    pub ascii: u8,
+    /// See [`wm_mod`].
+    pub modifiers: u32,
+    /// Padding.
+    pub _reserved: u32,
 }
 
 /// A packed 0xRRGGBB colour, as used by [`ConsoleFillRect`] and

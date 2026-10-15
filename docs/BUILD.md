@@ -48,7 +48,7 @@ spill, a very long way from the cause.
 ## Prerequisites
 
 ```sh
-sudo apt-get install -y qemu-system-x86 grub-pc-bin grub-common xorriso mtools
+sudo apt-get install -y qemu-system-x86 grub-pc-bin grub-efi-amd64-bin grub-common xorriso mtools
 rustup toolchain install stable
 ```
 
@@ -58,16 +58,29 @@ the whole tree builds from `core` and `alloc`.
 ## Targets
 
 ```sh
-make            # kernel + userspace + tools + bootable ISO
+make            # kernel + userspace + tools + ISO + disk (the whole build)
+make run        # boot the window system in QEMU
 make kernel     # just the kernel ELF
 make user       # just the userspace programs
-make modules    # pack userspace programs into NXF boot modules
-make iso        # build build/nodeos.iso
-make run        # boot in QEMU, console on stdout
-make debug      # boot in QEMU and wait for gdb on :1234
-make test       # boot and assert every self-test passed
+make modules    # pack userspace programs into NXF images
+make iso        # build the interactive ISO, build/nodeos.iso
+make disk       # build the FAT disk, build/disk.img
+make debug      # boot and wait for gdb on :1234
+make test       # headless self-tests
 make clean
 ```
+
+The ISO build includes GRUB's BIOS and UEFI boot images when both GRUB module
+sets are installed. Do not restrict `grub-mkrescue` to `i386-pc`: that produces
+a BIOS-only ISO, which does not show up in the boot menu of UEFI-only machines.
+The generated `build/nodeos.iso` can be written directly to a USB drive with
+Rufus in DD mode or another raw image writer. On Linux, use `lsblk` to identify
+the whole USB device, then write with `sudo dd if=build/nodeos.iso
+of=/dev/sdX bs=4M status=progress oflag=sync` (replace `/dev/sdX` with the
+device, not a partition). This erases the selected drive.
+
+`make help` lists the rest; everything past `make`/`make run` is a debug or CI
+target.
 
 ## Three cargo workspaces, on purpose
 

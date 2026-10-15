@@ -53,7 +53,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
-ISO = os.path.join(BUILD, "nodeos-graphic.iso")
+ISO = os.path.join(BUILD, "nodeos.iso")
 DISK = os.path.join(BUILD, "disk.img")
 LOG = os.path.join(BUILD, "mouse-serial.log")
 # Named for this process, so that a QEMU left behind by an interrupted run
@@ -71,6 +71,10 @@ FRAME_ACTIVE = 0x3366A0
 FRAME_INACTIVE = 0x3A4048
 CURSOR_EDGE = 0x000000
 CURSOR_FILL = 0xFFFFFF
+# The console's own background, from `user/console/src/surface.rs`. A
+# maximized window whose surface really grew is painted this; one that did not
+# still shows the desktop colour where the frame outran the old surface.
+CONSOLE_BG = 0x101010
 
 # How long a whole boot may take before the test gives up, in seconds.
 BOOT_TIMEOUT = 90.0
@@ -537,7 +541,7 @@ def click(guest, hold=0.15, gap=SETTLE):
 def main():
     report = Report()
     if not os.path.exists(ISO):
-        raise SystemExit(f"mouse-test: {ISO} not found; run 'make iso-graphic' first")
+        raise SystemExit(f"mouse-test: {ISO} not found; run 'make' first")
     if not shutil.which("qemu-system-x86_64"):
         raise SystemExit("mouse-test: qemu-system-x86_64 not found")
 
@@ -665,6 +669,19 @@ def main():
             frame.at(*probe(other)) == FRAME_ACTIVE,
             "the maximized frame covers the whole screen",
             hexstr(frame.at(*probe(other))),
+        )
+
+        # Maximizing has to grow the window *inside* the frame, not just the
+        # frame: the compositor replaces the client's memory object with a
+        # screen-sized one and sends CONFIGURE, and the console repaints. Sample
+        # near the bottom of the area that belonged to the empty column -- far
+        # from where any text lands -- and look for the console's background
+        # rather than the desktop showing through.
+        content_probe = (other * guest.column_w + guest.column_w // 2, guest.screen[1] - 50)
+        report.check(
+            frame.at(*content_probe) == CONSOLE_BG,
+            "the maximized window's content grew to fill the frame",
+            hexstr(frame.at(*content_probe)),
         )
 
         marker = guest.log_size()

@@ -99,6 +99,10 @@ fn policy(name: &str) -> CapSet {
         // The shell is a console client like any other; it holds no device
         // capability of its own, only the channels the launcher hands it --
         // one to the console, one to the filesystem.
+        // The shell launches programs entered at its prompt and forwards the
+        // channels it holds to them, so its capability set is a superset of
+        // theirs: `Audio` is here because Doom needs it and Doom is now an
+        // ordinary disk program (`run /bin/doom.nxf`), not a boot module.
         "shell" => base
             .with(CapClass::Process)
             .with(CapClass::Load)
@@ -106,7 +110,8 @@ fn policy(name: &str) -> CapSet {
             .with(CapClass::Clock)
             .with(CapClass::FileRead)
             .with(CapClass::FileWrite)
-            .with(CapClass::FileCreate),
+            .with(CapClass::FileCreate)
+            .with(CapClass::Audio),
         // Doom is a compositor client too. It does not go through `console`
         // -- it repaints its whole window 35 times a second and wants raw
         // make/break scancodes, neither of which the console protocol offers
@@ -154,7 +159,7 @@ unsafe fn data_module_vmo(name: &str, start: u64, len: u64) -> Option<Arc<crate:
     // page-align modules, so this is a check rather than a code path with an
     // alternative -- if it ever fails, refusing beats handing out a mapping
     // that is silently offset from the data.
-    if start % crate::arch::PAGE_SIZE as u64 != 0 {
+    if !start.is_multiple_of(crate::arch::PAGE_SIZE as u64) {
         crate::error!("data module {name:?} is not page-aligned at {start:#x}; ignoring it");
         return None;
     }
@@ -295,10 +300,17 @@ pub unsafe fn launch_boot_modules(boot_info: &BootInfo, devices: &BootDevices) -
             // it one handle and the shell's file commands report that they
             // have nowhere to look, which is better than a shell that will not
             // start.
+            // The shell reads its capabilities positionally: console first,
+            // filesystem second, then the two it only forwards to the programs
+            // it launches -- the compositor (so a graphical program like Doom
+            // can open a window) and the mixer (so Doom can make a noise). A
+            // boot with no `audio` module simply omits the last one.
             "shell" => {
                 let mut handles: Vec<Handle> = connect_to(&launched, "console", name).into_iter().collect();
                 if !handles.is_empty() {
                     handles.extend(connect_to(&launched, "fs", name));
+                    handles.extend(connect_to(&launched, "compositor", name));
+                    handles.extend(connect_to(&launched, "audio", name));
                 }
                 handles
             }
@@ -439,11 +451,12 @@ fn launch_one(name: &str, bytes: &[u8], extra_handles: Vec<Handle>) -> Result<La
     })
 }
 
-/// Give `child` a capability under `name`, as a launcher would.
+/// Give `target` a capability, as a launcher would.
 ///
-/// Used to wire services to each other after they are all running.
-pub fn grant(target: &Launched, handle: Handle) -> Result<crate::obj::HandleValue, ()> {
-    target.process.install(handle).map_err(|_| ())
+/// Used to wire services to each other after they are all running. Returns
+/// `None` only when the process's handle table is full.
+pub fn grant(target: &Launched, handle: Handle) -> Option<crate::obj::HandleValue> {
+    target.process.install(handle).ok()
 }
 
 /// Wait for every launched process to terminate, then report.

@@ -19,6 +19,8 @@ extern crate alloc;
 
 mod surface;
 
+use alloc::collections::VecDeque;
+
 use libnode::abi::message::MessageFlags;
 use libnode::abi::proto::{self, wm_event};
 use libnode::abi::types::{MapFlags, MapWindow};
@@ -113,8 +115,24 @@ struct PendingReadLine {
     line: alloc::string::String,
 }
 
+/// Keys that arrived before a client asked for one, and the two kinds of read
+/// that can be outstanding.
+///
+/// A client uses either `CONSOLE_READ_LINE` (the console edits and echoes) or
+/// `CONSOLE_READ_KEY` (the client edits); never both at once. The queue exists
+/// because a shell using `READ_KEY` makes one round trip per keystroke, and a
+/// fast typist can outrun it.
+struct Input {
+    line: Option<PendingReadLine>,
+    key: Option<Message>,
+    queue: VecDeque<proto::ConsoleKey>,
+}
+
+/// How many key presses to buffer between reads.
+const KEY_QUEUE_LEN: usize = 64;
+
 fn serve(screen: &mut Surface, wm: &Channel, bootstrap: &Channel) {
-    let mut pending: Option<PendingReadLine> = None;
+    let mut input = Input { line: None, key: None, queue: VecDeque::new() };
     // Exactly one client in this system today (`shell`); a service meant to
     // hold several would keep a list here instead of one `Option`.
     let mut client: Option<Channel> = None;
@@ -145,13 +163,13 @@ fn serve(screen: &mut Surface, wm: &Channel, bootstrap: &Channel) {
                 // `channel_call` itself, correlated by transaction id, so
                 // anything left here is an unsolicited event.
                 if let Ok(message) = wm.try_receive() {
-                    handle_event(screen, wm, message, client.as_ref(), &mut pending);
+                    handle_event(screen, wm, message, client.as_ref(), &mut input);
                 }
             }
             _ => {
                 let Some(channel) = client.as_ref() else { continue };
                 let Ok(message) = channel.try_receive() else { continue };
-                handle_request(screen, wm, channel, message, &mut pending);
+                handle_request(screen, wm, channel, message, &mut input);
             }
         }
     }
@@ -166,7 +184,7 @@ fn handle_event(
     wm: &Channel,
     message: Message,
     client: Option<&Channel>,
-    pending: &mut Option<PendingReadLine>,
+    input: &mut Input,
 ) {
     if message.kind != proto::WM_EVENT {
         return;
@@ -174,14 +192,39 @@ fn handle_event(
     let Some(event) = proto::decode::<proto::WmEvent>(&message.payload) else { return };
     match event.kind {
         wm_event::KEY if event.pressed != 0 => {
-            // Only a pending `CONSOLE_READ_LINE` gives a keystroke anywhere to
-            // go: the console has no scrollback and nothing else to type at.
-            let Some(state) = pending.as_mut() else { return };
+            let key = proto::ConsoleKey {
+                scancode: event.scancode,
+                extended: event.extended,
+                pressed: event.pressed,
+                ascii: event.ascii,
+                modifiers: event.modifiers,
+                _reserved: 0,
+            };
+
+            // A client waiting for a raw key gets it and does its own editing.
+            if let Some(request) = input.key.take() {
+                if let Some(client) = client {
+                    let reply = Message::new(proto::reply_kind(proto::CONSOLE_READ_KEY))
+                        .with_payload(proto::Encoded::new(key).bytes());
+                    let _ = client.reply(&request, reply);
+                }
+                return;
+            }
+
+            // Otherwise a `CONSOLE_READ_LINE` client, or a queue for the next
+            // reader. Only a line read gives a keystroke anywhere to go on its
+            // own: the console has no scrollback.
+            let Some(state) = input.line.as_mut() else {
+                if input.queue.len() < KEY_QUEUE_LEN {
+                    input.queue.push_back(key);
+                }
+                return;
+            };
             match event.ascii {
                 0 => {}
                 b'\n' => {
                     let Some(client) = client else { return };
-                    let Some(state) = pending.take() else { return };
+                    let Some(state) = input.line.take() else { return };
                     screen.write_text("\n");
                     screen.commit(wm);
                     let reply = Message::new(proto::reply_kind(proto::CONSOLE_READ_LINE))
@@ -208,6 +251,35 @@ fn handle_event(
         // fight the line editor the shell is typing into. A client that wants
         // the pointer reads the same events on the same channel.
         wm_event::POINTER_MOTION | wm_event::POINTER_BUTTON => {}
+        // The compositor replaced the surface under us -- the window was
+        // maximized or restored. Its new memory object travels in the message;
+        // rebuild the canvas and text grid around it, then repaint. The text
+        // that was on screen is gone with the old surface, which is the honest
+        // outcome of resizing a terminal with no scrollback.
+        wm_event::CONFIGURE => {
+            let Some(handle) = message.handles.into_iter().next() else { return };
+            let width = event.width;
+            let height = event.height;
+            let pitch = width * 4;
+            let size = pitch as u64 * height as u64;
+            let vmo = Vmo::from_handle(handle, size);
+            let Ok(mapping) = vmo.map(
+                0,
+                size,
+                MapFlags::READ.or(MapFlags::WRITE).or(MapFlags::SHARED).or(MapFlags::POPULATE),
+                MapWindow::Shared,
+            ) else {
+                println!("console: failed to map the resized surface; exiting");
+                libnode::exit(1);
+            };
+            // SAFETY: the mapping covers the whole object and nothing else here
+            // maps it.
+            unsafe { screen.replace(vmo, mapping, width, height, pitch) };
+            screen.clear();
+            screen.write_text("NodeOS console online.\n");
+            screen.commit(wm);
+            println!("console: resized to {width}x{height}");
+        }
         wm_event::CLOSE => libnode::exit(0),
         other => println!("console: unknown compositor event kind {other}"),
     }
@@ -222,10 +294,25 @@ fn handle_request(
     wm: &Channel,
     client: &Channel,
     message: Message,
-    pending: &mut Option<PendingReadLine>,
+    input: &mut Input,
 ) {
-    println!("console: DEBUG request {:#x}", message.kind);
     match message.kind {
+        proto::CONSOLE_READ_KEY => {
+            if let Some(key) = input.queue.pop_front() {
+                let reply = Message::new(proto::reply_kind(message.kind))
+                    .with_payload(proto::Encoded::new(key).bytes());
+                let _ = client.reply(&message, reply);
+            } else {
+                // Held open until a key arrives; `handle_event` replies.
+                input.key = Some(message);
+            }
+        }
+        proto::CONSOLE_GET_CURSOR => {
+            let (col, row) = screen.cursor();
+            let cursor = proto::Encoded::new(proto::ConsoleCursor { col, row });
+            let reply = Message::new(proto::reply_kind(message.kind)).with_payload(cursor.bytes());
+            let _ = client.reply(&message, reply);
+        }
         proto::CONSOLE_GET_INFO => {
             let info = proto::Encoded::new(proto::ConsoleInfo {
                 width_px: screen.width(),
@@ -271,7 +358,7 @@ fn handle_request(
         proto::CONSOLE_READ_LINE => {
             // Held open, not replied to, until Enter arrives from the
             // compositor side of `serve`'s loop.
-            *pending = Some(PendingReadLine { request: message, line: alloc::string::String::new() });
+            input.line = Some(PendingReadLine { request: message, line: alloc::string::String::new() });
         }
         other => {
             println!("console: unknown request kind {other:#x}");

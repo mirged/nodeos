@@ -128,9 +128,76 @@ impl Canvas {
     }
 
     /// Draw a one-pixel-wide line with Bresenham's algorithm.
+    ///
+    /// The segment is first clipped to the canvas. Without that, a line whose
+    /// endpoints are far outside the surface -- which any client can ask for
+    /// through the console protocol -- would still step pixel by pixel across
+    /// the entire span, turning one message into billions of iterations.
     pub fn draw_line(&mut self, x0: u32, y0: u32, x1: u32, y1: u32, color: Rgb) {
+        if self.width == 0 || self.height == 0 {
+            return;
+        }
         let (mut x0, mut y0) = (x0 as i64, y0 as i64);
-        let (x1, y1) = (x1 as i64, y1 as i64);
+        let (mut x1, mut y1) = (x1 as i64, y1 as i64);
+
+        // Cohen-Sutherland outcodes against the inclusive pixel rectangle.
+        const LEFT: i64 = 1;
+        const RIGHT: i64 = 2;
+        const BOTTOM: i64 = 4;
+        const TOP: i64 = 8;
+        let x_min = 0i64;
+        let y_min = 0i64;
+        let x_max = self.width as i64 - 1;
+        let y_max = self.height as i64 - 1;
+        let outcode = |x: i64, y: i64| -> i64 {
+            let mut code = 0;
+            if x < x_min {
+                code |= LEFT;
+            } else if x > x_max {
+                code |= RIGHT;
+            }
+            if y < y_min {
+                code |= BOTTOM;
+            } else if y > y_max {
+                code |= TOP;
+            }
+            code
+        };
+
+        let mut code0 = outcode(x0, y0);
+        let mut code1 = outcode(x1, y1);
+        loop {
+            if (code0 | code1) == 0 {
+                break;
+            }
+            if (code0 & code1) != 0 {
+                return;
+            }
+            let out = if code0 != 0 { code0 } else { code1 };
+            // A division by zero cannot happen here: an endpoint outside a
+            // vertical edge with the other endpoint sharing its y would have
+            // set TOP/BOTTOM on both, so the AND test above would have
+            // already rejected the segment.
+            let (x, y) = if out & TOP != 0 {
+                (x0 + (x1 - x0) * (y_max - y0) / (y1 - y0), y_max)
+            } else if out & BOTTOM != 0 {
+                (x0 + (x1 - x0) * (y_min - y0) / (y1 - y0), y_min)
+            } else if out & RIGHT != 0 {
+                (x_max, y0 + (y1 - y0) * (x_max - x0) / (x1 - x0))
+            } else {
+                (x_min, y0 + (y1 - y0) * (x_min - x0) / (x1 - x0))
+            };
+            if out == code0 {
+                x0 = x;
+                y0 = y;
+                code0 = outcode(x0, y0);
+            } else {
+                x1 = x;
+                y1 = y;
+                code1 = outcode(x1, y1);
+            }
+        }
+
         let dx = (x1 - x0).abs();
         let sx: i64 = if x0 < x1 { 1 } else { -1 };
         let dy = -(y1 - y0).abs();

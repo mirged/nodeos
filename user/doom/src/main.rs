@@ -2,21 +2,21 @@
 //!
 //! The game itself is doomgeneric's C tree, compiled freestanding and linked
 //! in by `build.rs`. This file is the other side of that boundary: it collects
-//! the two capabilities the launcher grants -- a channel to `compositor` and
-//! the IWAD as a read-only memory object -- turns the first into a window, and
-//! exposes both to C through the handful of `ndos_*` functions declared in
-//! `include/nodeos_platform.h`.
+//! the capabilities the shell hands it -- a filesystem channel, a channel to
+//! `compositor`, and optionally the mixer -- turns the first into the IWAD and
+//! the second into a window, and exposes them to C through the handful of
+//! `ndos_*` functions declared in `include/nodeos_platform.h`.
 //!
-//! That is the whole port surface. Doom performs no syscall of its own beyond
-//! what those functions do on its behalf: it cannot, having been handed no
-//! other handle. A capability system makes that statement checkable rather
-//! than aspirational -- `kernel/src/launch.rs` grants `doom` exactly `Memory`,
-//! `Channel` and `Clock`, and there is no ambient authority behind them to
-//! fall back on.
+//! Doom is an ordinary disk program now: launched from the shell with
+//! `run /bin/doom.nxf`, reading `/DOOM.WAD` from the filesystem like any other
+//! client. It used to be a boot module handed the IWAD by the launcher, which
+//! meant it could not be started any other way. Loading from the filesystem
+//! removes that distinction and is the reason Doom needs no authority the shell
+//! does not already hold.
 //!
-//! Doom used to hold the framebuffer and keyboard devices directly, which is
-//! why it and `console` could not be on screen at once. It now holds neither,
-//! and they can.
+//! Doom performs no syscall of its own beyond what those functions do on its
+//! behalf: it cannot, having been handed no other handle. A capability system
+//! makes that statement checkable rather than aspirational.
 //!
 //! See `docs/DOOM.md` for how the pieces fit together.
 
@@ -52,23 +52,26 @@ const WANTED_WIDTH: u32 = 640;
 /// See [`WANTED_WIDTH`].
 const WANTED_HEIGHT: u32 = 400;
 
+/// Where the IWAD lives on the NodeOS disk.
+const IWAD_PATH: &[u8] = b"/DOOM.WAD";
+
 fn run(mut env: Env) -> i32 {
     println!("doom: starting");
 
-    // The launcher's grant order, from `kernel/src/launch.rs`: the compositor
-    // connection, then the IWAD.
+    // The shell's session layout, in order: console (which Doom does not use),
+    // filesystem (for the IWAD), compositor, then the mixer. `take_extra(0)`
+    // pops from the front, so the order here matches the order the shell
+    // pushed them.
+    let _console = env.take_extra(0);
+    let Some(files_handle) = env.take_extra(0) else {
+        println!("doom: no filesystem connection granted; exiting");
+        return 1;
+    };
     let Some(wm_handle) = env.take_extra(0) else {
         println!("doom: no compositor connection granted; exiting");
         return 1;
     };
-    // Sound is optional and last: a boot with no `audio` module leaves this
-    // `None` and Doom plays silently rather than refusing to start. Taken
-    // after the WAD because `take_extra(0)` pops, so the order here is the
-    // order the launcher pushed them.
-    let Some(wad_handle) = env.take_extra(0) else {
-        println!("doom: no IWAD memory object granted; exiting");
-        return 1;
-    };
+    let files = Channel::from_handle(files_handle);
     let wm = Channel::from_handle(wm_handle);
 
     // --- the window ------------------------------------------------------
@@ -109,20 +112,18 @@ fn run(mut env: Env) -> i32 {
     println!("doom: {}x{} window from the compositor", surface.width, surface.height);
 
     // --- the IWAD --------------------------------------------------------
-    // The launcher granted a memory object over the bytes the boot loader
-    // placed in memory. Mapping it read-only is the whole of "loading" the
-    // WAD: `fopen` in the mini-libc hands Doom a stream over this range, so
-    // the 14 MiB is read in place and never copied onto the heap.
-    let Ok(wad_info) = wad_handle.query() else {
-        println!("doom: could not query the IWAD memory object; exiting");
+    // Read the whole file into a memory object and map it read-only. The mini-
+    // libc's `fopen` resolves `doom.wad` to this range, so the game reads the
+    // WAD in place and never copies it onto its heap.
+    let Some((wad, wad_size)) = load_iwad(&files) else {
+        println!("doom: could not read {IWAD_PATH:?} from the filesystem; exiting");
         return 1;
     };
-    let wad = Vmo::from_handle(wad_handle, wad_info.size);
-    let Ok(wad_mapping) = wad.map(0, wad_info.size, MapFlags::READ, MapWindow::MappedFile) else {
+    let Ok(wad_mapping) = wad.map(0, wad_size, MapFlags::READ, MapWindow::MappedFile) else {
         println!("doom: failed to map the IWAD; exiting");
         return 1;
     };
-    println!("doom: IWAD mapped, {} KiB", wad_info.size / 1024);
+    println!("doom: IWAD mapped, {} KiB", wad_size / 1024);
 
     let audio = env.take_extra(0).map(Channel::from_handle);
     println!("doom: sound is {}", if audio.is_some() { "on" } else { "off (no audio service)" });
@@ -158,3 +159,57 @@ fn run(mut env: Env) -> i32 {
     unsafe { doom_main(argv.len() as i32 - 1, argv.as_mut_ptr()) }
 }
 
+/// Read `/DOOM.WAD` into a memory object, returning it and its exact size.
+///
+/// The reply buffer for each read is one 32 KiB chunk, the filesystem
+/// service's own maximum, and sits inside the runtime allocator's largest size
+/// class -- so the hundreds of chunks a WAD takes reuse one buffer instead of
+/// leaking a fresh one each time.
+fn load_iwad(files: &Channel) -> Option<(Vmo, u64)> {
+    let reply = call(files, Message::new(proto::FS_OPEN).with_payload(IWAD_PATH))?;
+    let open = proto::decode::<proto::FsOpenReply>(&reply.payload)?;
+    if open.kind != proto::fs_kind::FILE || open.size == 0 {
+        return None;
+    }
+    let size = open.size;
+    let vmo = Vmo::create(size, false).ok()?;
+
+    const CHUNK: u32 = 32 * 1024;
+    let mut offset = 0u64;
+    while offset < size {
+        let request = proto::Encoded::new(proto::FsReadRequest {
+            node: open.node,
+            offset,
+            length: CHUNK,
+            _reserved: 0,
+        });
+        let Ok(reply) = files.call_with(
+            Message::new(proto::FS_READ).with_payload(request.bytes()),
+            CHUNK as usize + 64,
+            0,
+        ) else {
+            break;
+        };
+        if reply.flags.contains(MessageFlags::ERROR) || reply.payload.is_empty() {
+            break;
+        }
+        if vmo.write(offset, &reply.payload).is_err() {
+            break;
+        }
+        offset += reply.payload.len() as u64;
+    }
+
+    let close = proto::Encoded::new(proto::FsCloseRequest { node: open.node });
+    let _ = files.call_with(Message::new(proto::FS_CLOSE).with_payload(close.bytes()), 64, 0);
+
+    (offset == size).then_some((vmo, size))
+}
+
+/// A filesystem call whose reply is small, turning an error reply into `None`.
+fn call(files: &Channel, request: Message) -> Option<Message> {
+    let reply = files.call_with(request, 4096, 0).ok()?;
+    if reply.flags.contains(MessageFlags::ERROR) {
+        return None;
+    }
+    Some(reply)
+}

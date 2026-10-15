@@ -225,7 +225,7 @@ fn sys_process_start(args: &Args) -> Result<i64, Error> {
     let bootstrap_value = if bootstrap.is_invalid() {
         HandleValue::INVALID
     } else {
-        let moved = parent.handles().remove(bootstrap).map_err(map_object_error)?;
+        let moved = parent.handles().take(bootstrap).map_err(map_object_error)?;
         child.install(moved).map_err(map_object_error)?
     };
 
@@ -236,6 +236,19 @@ fn sys_process_start(args: &Args) -> Result<i64, Error> {
         SchedParams::normal(),
     )
     .ok_or(Error::NoMemory)?;
+
+    // A thread holds only a `Weak` reference to its process, so now that this
+    // process is about to run, nothing but its own handle table keeps it alive
+    // -- the parent may drop its handle a moment later, and the child must not
+    // be torn down from under its running thread. The boot launcher gives every
+    // process a handle to itself for exactly this reason; do the same, here
+    // rather than at `process_create` so that a process which is created and
+    // never started can still be freed by dropping the parent's handle.
+    // `Process::terminate` breaks the resulting cycle by clearing the table.
+    if child.install_object(child.clone(), Rights::PROCESS_DEFAULT).is_err() {
+        return Err(Error::NoMemory);
+    }
+
     sched::enqueue(&thread);
     Ok(0)
 }
@@ -381,8 +394,21 @@ fn sys_thread_start(args: &Args) -> Result<i64, Error> {
         .get_checked(handle_of(args.a0), Rights::MANAGE_THREAD)
         .map_err(map_object_error)?;
     let thread = thread_arc(handle.object())?;
-    sched::enqueue(&thread);
-    Ok(0)
+    // `thread_create` already makes a new thread runnable, and `Thread::new`
+    // starts in `Ready`. Enqueueing an already-runnable thread a second time
+    // would push a duplicate entry (and, for the weighted-fair-sharing class,
+    // bump the run-queue count without adding a distinct entry, corrupting
+    // `len`/`is_empty`). A start on a thread that is already running is a
+    // no-op; a start on a blocked thread is refused rather than silently
+    // dropped, because only a wakeup may make a blocked thread runnable.
+    match thread.state() {
+        crate::task::ThreadState::Ready | crate::task::ThreadState::Running => Ok(0),
+        crate::task::ThreadState::Suspended => {
+            sched::enqueue(&thread);
+            Ok(0)
+        }
+        crate::task::ThreadState::Blocked | crate::task::ThreadState::Dead => Err(Error::BadState),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -742,7 +768,14 @@ fn sys_channel_create(args: &Args) -> Result<i64, Error> {
             return Err(map_object_error(error));
         }
     };
-    uaccess::write_array(args.a0, &[first.0, second.0])?;
+    // Both endpoints already exist in the caller's table; if the handle values
+    // cannot be written back, close them rather than leaking a channel the
+    // process has no way to name.
+    if let Err(error) = uaccess::write_array(args.a0, &[first.0, second.0]) {
+        let _ = process.handles().remove(first);
+        let _ = process.handles().remove(second);
+        return Err(error);
+    }
     Ok(0)
 }
 
@@ -767,7 +800,9 @@ fn take_message(process: &Arc<Process>, descriptor: &MessageDescriptor) -> Resul
     let mut handles = Vec::new();
     handles.try_reserve_exact(handle_count).map_err(|_| Error::NoMemory)?;
     for value in values {
-        let handle = process.handles().remove(HandleValue(value)).map_err(map_object_error)?;
+        // A transfer, not a close: the handle is now owned by the message in
+        // flight and may not be treated as the last reference to its object.
+        let handle = process.handles().take(HandleValue(value)).map_err(map_object_error)?;
         handles.push(handle);
     }
 
@@ -783,6 +818,7 @@ fn take_message(process: &Arc<Process>, descriptor: &MessageDescriptor) -> Resul
 /// Deliver a received message into user memory, installing its capabilities.
 fn deliver_message(
     process: &Arc<Process>,
+    channel: &Arc<Channel>,
     message: Message,
     descriptor_addr: u64,
     mut descriptor: MessageDescriptor,
@@ -790,11 +826,14 @@ fn deliver_message(
     if message.payload.len() > descriptor.payload_len as usize
         || message.handles.len() > descriptor.handle_count as usize
     {
-        // Report what would have been needed rather than truncating: silently
-        // losing a capability is not an acceptable failure mode.
+        // Report what would have been needed rather than truncating, and put
+        // the message back so the caller can retry: silently losing a
+        // capability -- or, worse, dropping a message that has already been
+        // removed from the queue -- is not an acceptable failure mode.
         descriptor.payload_len = message.payload.len() as u32;
         descriptor.handle_count = message.handles.len() as u32;
         uaccess::write_struct(descriptor_addr, &descriptor)?;
+        channel.requeue_front(message);
         return Err(Error::NoSpace);
     }
 
@@ -811,11 +850,22 @@ fn deliver_message(
         }
     }
 
-    if !message.payload.is_empty() {
-        uaccess::write_bytes(descriptor.payload, &message.payload)?;
-    }
-    if !installed.is_empty() {
-        uaccess::write_array(descriptor.handles, &installed)?;
+    // Copy out. If a user pointer turns out to be bad, undo the capability
+    // installation rather than leaking handles the caller can never name.
+    let copy = (|| {
+        if !message.payload.is_empty() {
+            uaccess::write_bytes(descriptor.payload, &message.payload)?;
+        }
+        if !installed.is_empty() {
+            uaccess::write_array(descriptor.handles, &installed)?;
+        }
+        Ok::<(), Error>(())
+    })();
+    if let Err(error) = copy {
+        for value in &installed {
+            let _ = process.handles().remove(HandleValue(*value));
+        }
+        return Err(error);
     }
 
     descriptor.kind = message.kind;
@@ -857,7 +907,7 @@ fn sys_channel_receive(args: &Args) -> Result<i64, Error> {
     } else {
         channel.receive_blocking().map_err(map_channel_error)?
     };
-    deliver_message(&process, message, args.a1, descriptor)
+    deliver_message(&process, &channel, message, args.a1, descriptor)
 }
 
 /// `channel_call(channel, request_ptr, reply_ptr) -> status`
@@ -873,7 +923,7 @@ fn sys_channel_call(args: &Args) -> Result<i64, Error> {
     let reply_descriptor = uaccess::read_struct::<MessageDescriptor>(args.a2)?;
     let request = take_message(&process, &request_descriptor)?;
     let reply = channel.call(request).map_err(map_channel_error)?;
-    deliver_message(&process, reply, args.a2, reply_descriptor)
+    deliver_message(&process, &channel, reply, args.a2, reply_descriptor)
 }
 
 // ---------------------------------------------------------------------------
