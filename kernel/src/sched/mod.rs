@@ -369,6 +369,10 @@ pub fn schedule() {
     unsafe { segmentation::set_kernel_stack(cpu, stack_top) };
     // SAFETY: the syscall entry stub reads this slot.
     unsafe { percpu::current().kernel_rsp.get().write(stack_top) };
+    // The incoming thread's userspace thread pointer. `thread_set_fs_base`
+    // only accepts canonical lower-half values, so this cannot fault.
+    // SAFETY: the kernel never addresses through `FS`.
+    unsafe { cpu::wrmsr(cpu::MSR_FS_BASE, next.fs_base()) };
 
     // Switch address space if the incoming thread lives in a different one.
     if let Some(process) = next.process() {

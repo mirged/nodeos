@@ -1,0 +1,51 @@
+#!/bin/sh
+# A C compiler driver for NodeOS: the host gcc, against the musl sysroot, with
+# liblx underneath. Use it anywhere a Makefile wants $(CC):
+#
+#   scripts/lx-cc -O2 -c foo.c            compile, with musl's headers
+#   scripts/lx-cc -o prog foo.o bar.o     link a static NodeOS ELF
+#
+# The ELF it links is the input to nxfpack, like any other NodeOS program.
+# Linking is static and position-dependent at the NodeOS program window
+# (user/lx/lx.ld). `-lm`, `-lpthread`, `-ldl`, `-lrt` and `-lc` are accepted
+# and dropped: musl keeps all of them in libc.a.
+set -eu
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+sysroot=${LX_SYSROOT:-$root/build/sysroot}
+liblx=${LX_LIBLX:-$root/build/lx/liblx.a}
+cc=${LX_HOST_CC:-gcc}
+
+[ -f "$sysroot/lib/libc.a" ] || { echo "lx-cc: no sysroot at $sysroot; run scripts/build-musl.sh" >&2; exit 1; }
+
+link=1
+for arg in "$@"; do
+    case $arg in
+        -c|-S|-E|-M|-MM) link=0 ;;
+    esac
+done
+
+# Rebuild the argument list without the libraries libc.a already contains.
+for arg in "$@"; do
+    shift
+    case $arg in
+        -lm|-lpthread|-ldl|-lrt|-lc|-lutil|-lcrypt) ;;
+        *) set -- "$@" "$arg" ;;
+    esac
+done
+
+# -fno-pie: linked at a fixed address, so PIC buys nothing. The red zone and
+# SSE are fine: ring 3 traps switch stacks before pushing anything, and the
+# kernel saves FPU state on every entry from user mode (docs/MUSL.md, 4.1).
+compile="-nostdinc -isystem $sysroot/include -isystem $($cc -print-file-name=include) -fno-pie"
+
+if [ "$link" = 0 ]; then
+    exec "$cc" $compile "$@"
+fi
+
+[ -f "$liblx" ] || { echo "lx-cc: no liblx at $liblx; run 'make lx'" >&2; exit 1; }
+exec "$cc" $compile -static -no-pie -nostdlib -nostartfiles -fuse-ld=lld \
+    -Wl,--script="$root/user/lx/lx.ld" -Wl,-z,max-page-size=0x1000 -Wl,--build-id=none -Wl,--gc-sections \
+    "$@" \
+    -Wl,--start-group "$sysroot/lib/libc.a" "$liblx" -Wl,--end-group \
+    "$($cc -print-libgcc-file-name)"

@@ -6,8 +6,35 @@ result from the shell. This document is the plan for getting there. It covers
 what the work involves, the order to do it in, and which parts of NodeOS have to
 change, and why each change is still a mechanism rather than a return to Unix.
 
-It is a design. Apart from the measurement tool in `tools/syscall-census/`, none
-of it is implemented yet.
+## Status
+
+Phase 1, plus the parts of phase 2 that a program without `fork` needs, is
+implemented. **Lua 5.4.7, cloned from github.com/lua/lua and compiled without
+changes, runs on NodeOS**, both from a script on the disk and as an interactive
+REPL at the console. `make test-lua` builds it and checks it in QEMU.
+
+| Piece | Where | State |
+| --- | --- | --- |
+| K1: per-thread `FS_BASE`, `thread_set_fs_base` (syscall 32) | `kernel/src/task/thread.rs`, `sched/mod.rs`, `syscall/mod.rs` | done |
+| musl 1.2.6 with the seven-file overlay, pinned by hash | `user/lx/musl/`, `scripts/build-musl.sh` | done: 0 raw `syscall`s in `libc.a` (upstream has 512) |
+| liblx: startup, ~80 Linux syscalls | `user/lx/src/` | done for single-threaded programs |
+| Compiler driver and link layout | `scripts/lx-cc`, `user/lx/lx.ld` | done |
+| Raw-syscall check on every linked program | `scripts/build-lx-apps.sh` | done |
+| Shell: `run` waits for a foreground program, `&` for background | `user/shell/src/files.rs` | done |
+| K2 futex, threads | | not started: `clone` returns `ENOSYS` |
+| K3-K7: process lifecycle, `fork`/`exec`, signals | | not started |
+| K8: wall clock and entropy | | not started: realtime starts at the epoch at boot, `getrandom` is xorshift |
+
+What liblx answers today: `read`, `write`, `readv`, `writev`, `pread64` and
+`pwrite64`; `open`, `openat`, `close`, `lseek` and `ftruncate`; `stat`, `fstat`,
+`lstat` and `newfstatat`; `access` and `faccessat`; `getdents64`, `getcwd`,
+`chdir`, `mkdir`, `unlink`, `rmdir` and `rename` (done by copying);
+`dup`, `dup2`, `dup3`, `fcntl`, `ioctl` (`TCGETS`, `TIOCGWINSZ`) and `poll`;
+`mmap` and `munmap`; `arch_prctl`, `set_tid_address`, the clocks,
+`nanosleep`, `uname`, `getrandom`, `exit` and `exit_group`; and stubs
+that tell the truth for identity, signal masks and `brk`. Anything else
+returns `ENOSYS` and is logged once as `lx: unimplemented Linux syscall N`,
+so the kernel log of a program that fails is the to-do list for porting it.
 
 ---
 
@@ -235,27 +262,30 @@ links against Rust the same way.
 
 ### 4.0 Startup: from a bootstrap channel to `argc, argv, envp, auxv`
 
-A NodeOS process starts with one handle in `RDI`. musl's `_start` expects a
-Linux initial stack. liblx provides the real entry point, `_lx_start`, which
-bridges the two:
+A NodeOS process starts with one handle in `RDI`. musl expects a Linux
+initial stack. liblx bridges the two without a startup file of its own, by
+reusing libnode's (`user/lx/src/start.rs`):
 
-1. Receive the bootstrap message. It contains the session channels (console,
-   filesystem, compositor, audio, in the order `libnode::session` fixes),
-   `argv`, and from now on `envp`, the working directory and the inherited
-   descriptor table (§4.2).
-2. Build a Linux-style stack: `argc`, `argv[]`, `envp[]`, and an auxv with
-   `AT_PAGESZ`, `AT_RANDOM` (16 bytes from K8), `AT_PHDR`/`AT_PHNUM`/`AT_PHENT`,
-   `AT_ENTRY` and `AT_HWCAP`.
-3. Jump to musl's `_start_c` with that stack.
+1. libnode's `_start` receives the bootstrap message, as it does for every
+   NodeOS program, and calls `__libnode_main`, which liblx defines. The message
+   carries the session channels (console, filesystem, then compositor and
+   audio when present) and `argv`. Later it will also carry `envp`, the working
+   directory and the inherited descriptor table (§4.2).
+2. liblx builds the Linux block: `argv[]`, `envp[]` and an auxv with
+   `AT_PHDR`/`AT_PHNUM`/`AT_PHENT`, `AT_PAGESZ`, `AT_ENTRY`, `AT_RANDOM` and
+   `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`. The uid and gid entries matter: if
+   they are missing, musl treats the program as possibly setuid and
+   `poll`s descriptors 0-2 before `main`.
+3. It calls musl's `__libc_start_main(main, argc, argv, ...)`, which sets up
+   TLS (through `arch_prctl`, which becomes K1's syscall), runs constructors
+   and calls `main`.
 
-`AT_PHDR` needs care. musl's `static_init_tls` finds the TLS template by
-scanning the program headers for `PT_TLS`, but `nxfpack` keeps only `PT_LOAD`
-(`tools/nxfpack/src/elf.rs:84`). A static, non-PIE `ld -static` link puts the
-ELF header and program headers in the first `PT_LOAD` at file offset 0, so
-`image_base + e_phoff` is mapped already. `nxfpack` should check that this
-holds for every image, or the `TLS` segment kind (which `nxf.rs` already
-defines) should be carried through and liblx should synthesize a one-entry
-`PT_TLS` table from it. Either way, it should be tested.
+musl's `static_init_tls` finds the TLS template by walking the program headers
+from `AT_PHDR`, but `nxfpack` keeps only `PT_LOAD`. The link script
+(`user/lx/lx.ld`) solves this by mapping the ELF header and program headers
+at the start of the text segment (`FILEHDR PHDRS`) and emitting a `PT_TLS`
+header. liblx reads `__ehdr_start` and points `AT_PHDR` at
+`__ehdr_start + e_phoff`. The loader does not need to know any of this.
 
 ### 4.1 Memory
 
@@ -436,22 +466,31 @@ path from the exception hook. Programs that catch `SIGSEGV` on purpose
 ## 5. Toolchain
 
 ```
-build/sysroot/
-  include/          musl headers + Linux UAPI headers (busybox needs them)
-  lib/crt1.o crti.o crtn.o  libc.a  liblx.a
-  bin/nodeos-cc     wrapper: host gcc, -nostdinc -nostdlib, sysroot paths,
-                    -static, link order: crt1 crti <objs> libc.a liblx.a crtn
+build/sysroot/      musl headers and libc.a       scripts/build-musl.sh
+build/lx/liblx.a    liblx, libnode's mem* weak     make lx
+scripts/lx-cc       host gcc, -nostdinc against the sysroot, -fno-pie;
+                    links with lld and user/lx/lx.ld:
+                    <objs> --start-group libc.a liblx.a --end-group libgcc.a
 ```
 
-* musl is configured with `--target=x86_64`, `--disable-shared` and the host
-  gcc. The seven patched files go in `user/musl/patches/` and are applied over
-  an unmodified upstream tarball pinned by hash, so moving to a new musl
-  release means updating the hash and rebasing those patches.
+* musl is configured with `--disable-shared` and the host gcc. The seven
+  replacement files live in `user/lx/musl/` and are copied over an unmodified
+  upstream tarball pinned by hash, so moving to a new musl release means
+  updating the hash and checking those files against upstream. The build fails
+  if `libc.a` still contains a `syscall` instruction.
+* libnode defines `memcpy`, `memset` and the rest of its `rt.rs` because Rust
+  programs have no libc. A C program has one, so the copy of liblx it links
+  has those symbols weakened (`objcopy --weaken-symbol`), and musl's
+  optimised versions win.
+* No `crt1.o`: liblx's startup (§4.0) is the entry point.
+* There is no `-mno-red-zone` and no `-mgeneral-regs-only`. Lua's floating
+  point, which uses SSE, works.
 * Programs link at `0x400000` (gcc's default for non-PIE static links), and
   `nxfpack` translates them as it does today. Its `--cap` list for a POSIX
   program is the session set, and the launcher decides what to grant.
 * **A build-time check that matters:** disassemble the final image and fail if
-  any `syscall` instruction (`0f 05`) appears outside libnode's `sys` module.
+  any `syscall` instruction (`0f 05`) appears outside libnode and liblx
+  (`scripts/build-lx-apps.sh` does this for every program it builds).
   A Linux syscall number reaching the NodeOS kernel directly means the wrong
   call with the wrong arguments (Linux 1 is `write`, NodeOS 1 is
   `process_create`), and nothing stops it at runtime until K9 exists.
@@ -460,8 +499,11 @@ build/sysroot/
   -C link-self-contained=no`) and ordinary Rust programs that use
   `std`, such as ripgrep or fd, build for NodeOS with no NodeOS-specific code.
 
-`make test-musl` should follow the existing `test-cc` pattern: boot, `run` a
-musl program from the disk, and compare its output on the serial log.
+`make test-lua` follows the existing `test-cc` pattern. It boots, runs a C
+test program and Lua (a script, then an interactive session typed through
+QEMU's monitor), and compares their output on the serial log, where liblx
+mirrors everything written to stdout and stderr as `lx: | <line>`. It also
+saves a screenshot to `build/lua-test.ppm`.
 
 ---
 
@@ -506,7 +548,7 @@ targets.
 
 | Phase | Kernel | liblx / userspace | Proof |
 | --- | --- | --- | --- |
-| 1. hello | K1, K2, K8 | patched musl; sysroot; `_lx_start`; `write`/`writev`/`exit_group`/`mmap`/`ioctl(TIOCGWINSZ)`/`clock_gettime`; region table | `printf("%f", 1.5)` and a 4-thread mutex counter, `make test-musl` |
+| 1. hello | K1, K2, K8 | patched musl; sysroot; startup; `write`/`writev`/`exit_group`/`mmap`/`ioctl(TIOCGWINSZ)`/`clock_gettime`; region table | `printf("%f", 1.5)` and a 4-thread mutex counter; **done except threads (K2): Lua runs, `make test-lua`** |
 | 2. files | K5 (optional) | descriptor table; fs, tty, null, pipe; termios; `poll`; `FS_RENAME`; console escape parsing | `cat`, `sed`, `sort`, `vi` from busybox, built NOMMU |
 | 3. processes | K3, K4 | spawn-on-exec `vfork`/`execve`; `wait4`; cooperative signals; `proc` service | busybox `sh` (NOMMU) running the census workload |
 | 4. fork | K6 | userspace `fork` | busybox MMU build; `make` and `lua` from source |

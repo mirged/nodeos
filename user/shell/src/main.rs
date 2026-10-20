@@ -81,7 +81,7 @@ fn run_command(
                  session:  help, pwd, cd <dir>, echo <text>, clear, about\n\
                  files:    ls [dir], cat <file>, touch <file>, write <file> <text>,\n\
                  \x20         append <file> <text>, mkdir <dir>, rm <path>, stat <path>,\n\
-                 \x20         df, fstest, run <program>\n\
+                 \x20         df, fstest, run <program> [&]\n\
                  demos:    draw\n\
                  paths may be absolute (/docs/NODEOS.MD) or relative to pwd.\n\
                  /bin holds the packaged programs; try `run /bin/sysinfo.nxf`,\n\

@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use libnode::abi::message::{BootstrapMessage, KIND_BOOTSTRAP};
 use libnode::abi::message::MessageFlags;
 use libnode::abi::proto::{self, fs_kind};
-use libnode::abi::{CapClass, Rights};
+use libnode::abi::{CapClass, Rights, Signals};
 use libnode::mem::Vmo;
 use libnode::process::Process;
 use libnode::{println, Channel, Error, Message};
@@ -228,14 +228,25 @@ fn run_program(
     cwd: &str,
     rest: &str,
 ) {
-    // `run <program> [args...]`: the first word names the program, the rest are
-    // its command line. Splitting on whitespace is the whole of this shell's
-    // quoting; a path with a space in it is not something it can express.
-    let mut words = rest.split_whitespace();
-    let Some(program) = words.next() else {
-        return write_text(console, "usage: run <program> [args...]\n");
+    // `run <program> [args...] [&]`: the first word names the program, the rest
+    // are its command line. Splitting on whitespace is the whole of this
+    // shell's quoting; a path with a space in it is not something it can
+    // express.
+    //
+    // A program runs in the foreground: the shell waits for it to exit before
+    // it prompts again, so the two never draw over each other on the console
+    // or race for the keyboard. A trailing `&` runs it in the background
+    // instead, which is what a program in its own window (Doom, the editor)
+    // may want.
+    let mut words: Vec<&str> = rest.split_whitespace().collect();
+    let background = words.last() == Some(&"&");
+    if background {
+        words.pop();
+    }
+    let Some((&program, args)) = words.split_first() else {
+        return write_text(console, "usage: run <program> [args...] [&]\n");
     };
-    let args: Vec<&str> = words.collect();
+    let args: Vec<&str> = args.to_vec();
     let path = resolve(cwd, program);
     let Ok(node) = open(files, &path) else {
         return report(console, &path, Error::NotFound);
@@ -330,7 +341,11 @@ fn run_program(
     if parent_bootstrap.send(message).is_err() {
         return write_text(console, "run: could not deliver bootstrap\n");
     }
-    write_text(console, "process started\n");
+    if background {
+        write_text(console, "process started\n");
+    } else if process.handle().wait(Signals::PROCESS_TERMINATED, 0).is_err() {
+        write_text(console, "run: lost track of the process\n");
+    }
 }
 
 fn stat(console: &Channel, files: &Channel, path: &str) {

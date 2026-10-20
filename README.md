@@ -44,6 +44,7 @@ and the whole thing runs in QEMU today.
 | User x87/SSE state preserved across every entry from ring 3 | working |
 | `Device` capability: boot framebuffer + PS/2 keyboard + PS/2 mouse | working |
 | `compositor`: the only holder of the screen, keyboard and mouse (`docs/COMPOSITOR.md`) | working |
+| Linux programs: musl over an in-process Linux personality (`docs/MUSL.md`) | working: Lua 5.4 |
 | `console` (text/graphics service) and `shell`, as compositor clients | working |
 | Doom, in a window beside the shell (`docs/DOOM.md`) | working |
 | Userspace services (ramfs, devmgr) | in progress |
@@ -68,6 +69,7 @@ make test-fs      # filesystem I/O through the shell
 make test-apps    # run the console apps from the shell
 make test-cc      # compile and run a C program
 make test-edit    # edit and save a file
+make test-lua     # build Lua 5.4 against musl and run it
 make test-audio   # check sound using QEMU's wav backend
 make test-mouse   # drive the mouse and check the pixels
 make debug        # boot and wait for GDB on :1234
@@ -130,7 +132,11 @@ The shell is an ordinary console client, but it reads raw keys now, so it has
 history (Up/Down), cursor movement, Tab completion of commands and file names,
 and Ctrl+C to abandon a line. It launches programs with `run /bin/<name>.nxf
 [args...]`, handing each child the same session -- console, filesystem,
-compositor, audio channels -- and its command line.
+compositor, audio channels -- and its command line. A program runs in the
+foreground: the shell waits for it to exit before prompting again, so the two
+never draw over each other or race for the keyboard. End the line with `&` to
+run it in the background instead, which suits a program in its own window
+(`run /bin/doom.nxf &`).
 
 * `sysinfo` -- a process's view of the system: its capability set, the clock,
   the console's geometry, a memory object it allocates, and filesystem
@@ -153,6 +159,33 @@ hello, world
 sum 1..10 = 55
 ...
 ```
+
+## Linux programs
+
+Unmodified C programs written for Linux build against musl and run on
+NodeOS. `make lx-apps` fetches musl 1.2.6 and Lua 5.4.7 (from
+github.com/lua/lua), builds both, and the next `make` puts them on the disk:
+
+```
+nodeos> run /bin/lua.nxf /tests/hello.lua
+hello from Lua 5.4 on NodeOS
+fib(20) = 6765
+...
+nodeos> run /bin/lua.nxf
+Lua 5.4.7  Copyright (C) 1994-2024 Lua.org, PUC-Rio
+> print(6*7)
+42
+```
+
+musl is upstream except for the seven files that issue a raw `syscall`
+instruction (`user/lx/musl/`). Those now call `__lx_syscall`, and liblx
+(`user/lx/`) answers each Linux syscall in-process with the handles the
+program was given: descriptors 0-2 are the console, `open` is the filesystem
+channel, and `mmap` is memory objects. `scripts/lx-cc` is the compiler driver,
+for use as `$(CC)`. [`docs/MUSL.md`](docs/MUSL.md) has the design, what works,
+and what is still to do: threads, `fork`/`exec` and signals.
+
+## The C compiler
 
 The compiler is a real one -- tokenizer, recursive-descent parser, type-aware
 code generator, virtual machine -- for a deliberate subset of C: one machine

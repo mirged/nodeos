@@ -89,6 +89,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lx"
+version = "0.1.0"
+dependencies = [
+ "libnode",
+ "nodeos-abi",
+]
+
+[[package]]
 name = "nodeos-abi"
 version = "0.1.0"
 
