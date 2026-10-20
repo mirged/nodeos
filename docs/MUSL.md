@@ -270,8 +270,11 @@ reusing libnode's (`user/lx/src/start.rs`):
 1. libnode's `_start` receives the bootstrap message, as it does for every
    NodeOS program, and calls `__libnode_main`, which liblx defines. The message
    carries the session channels (console, filesystem, then compositor and
-   audio when present) and `argv`. Later it will also carry `envp`, the working
-   directory and the inherited descriptor table (§4.2).
+   audio when present) and `argv`. A launcher that sets the bootstrap's
+   `ENVIRONMENT` flag follows it with the environment, which libnode keeps
+   (`Env::vars`); the shell sends its exported variables, and liblx makes them
+   `envp` and starts in their `PWD`. Later the message will also carry the
+   inherited descriptor table (§4.2).
 2. liblx builds the Linux block: `argv[]`, `envp[]` and an auxv with
    `AT_PHDR`/`AT_PHNUM`/`AT_PHENT`, `AT_PAGESZ`, `AT_ENTRY`, `AT_RANDOM` and
    `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`. The uid and gid entries matter: if

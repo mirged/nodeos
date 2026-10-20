@@ -104,9 +104,10 @@ and inset margins. Prompts, headings and errors use restrained, high-contrast
 colours. Use `font large` for larger text, `font small` for a denser view, or
 `font normal` to restore the default; earlier output remains in scrollback.
 
-The prompt shows the working directory. Programs resolve in `/bin`, so type
-`sysinfo`, `tree`, `bench`, `edit /NOTES.TXT`, `cc /tests/hello.c` or `doom`.
-`run /bin/<name>.nxf [args...]` still accepts explicit paths.
+The prompt shows the working directory. Programs resolve in `/bin`, then in
+the working directory, so type `sysinfo`, `tree`, `bench`, `edit /NOTES.TXT`,
+`cc /tests/hello.c` or `doom`. `run /bin/<name>.nxf [args...]` still accepts
+explicit paths. Programs start in the shell's working directory.
 
 ```text
 /> help syntax
@@ -115,6 +116,9 @@ The prompt shows the working directory. Programs resolve in `/bin`, so type
 /> cd /docs; more NODEOS.MD
 /docs> cd -
 /> source /TESTS/SETUP.NSH
+/> NAME=world; echo "hello $NAME" > /HELLO.TXT
+/> ls -l /bin > /LIST.TXT && wc /LIST.TXT || echo "no listing"
+/> export GREETING=hi; mayupper < /HELLO.TXT >> /HELLO.TXT
 ```
 
 Single and double quotes preserve spaces and empty arguments. Backslash escapes
@@ -122,7 +126,17 @@ a character; double quotes additionally accept `\n` and `\t`. Newlines and
 semicolons separate commands; `#` starts a comment at a word boundary. Input is
 fully parsed before execution, so an unclosed quote cannot execute the commands
 before it. `source` runs UTF-8 command files, capped at 64 KiB and eight nested
-files. Operators `|`, `&`, `<` and `>` are explicitly rejected outside quotes.
+files.
+
+`NAME=value` sets a shell variable and `$NAME`, `${NAME}` or `$?` (the last
+exit status) use it; a value never splits into several arguments. `export`
+passes variables to every program started, `NAME=value program` to one; `env`
+and `set` list them, `unset` removes them. `a && b` runs `b` only if `a`
+succeeded and `a || b` only if it failed, using the exit status programs
+report. `>` replaces a file with a command's output, `>>` appends, and
+`program < file` feeds a program its input lines. A program's output and input
+are redirected by handing it a console channel the shell serves itself, not a
+file descriptor. Pipes (`|`) and background jobs (`&`) are rejected.
 
 `help` groups commands by task; `help cp` (or another command name) shows its usage.
 Directory listings put folders first and show readable file sizes.
@@ -131,8 +145,12 @@ Directory listings put folders first and show readable file sizes.
 `-f` is given. It refuses copying onto the same normalized, case-insensitive
 path. `grep` searches literal text and includes line numbers. `more` pages text
 with Space, Enter or q. The normal filesystem commands remain: `ls`, `cat`,
-`write`, `append`, `touch`, `mkdir`, `rm`, `stat`, `df` and `fstest`. Writes use
-exact text; include `\n` in a quoted argument when you want a trailing newline.
+`write`, `append`, `touch`, `mkdir`, `rm`, `stat`, `df` and `fstest`, and
+`mv`, `head`/`tail [-n N]`, `wc`, `find [dir] [text]`, `rmdir`, `rm -r` and
+`ls -l` (exact sizes, one entry per line). `mv` copies and deletes, because the
+filesystem has no rename, so it moves files only. Writes use exact text;
+include `\n` in a quoted argument when you want a trailing newline.
+`make test-shell-features` checks all of this by reading the disk back.
 FAT creation still uses 8.3 names.
 
 | Keys | Action |
@@ -186,9 +204,13 @@ display, audio channels -- and its command line.
   statistics and directory listing. `make test-apps` runs it.
 * `tree` -- a recursive filesystem listing. `make test-apps`.
 * `bench` -- a memory fill/verify and scheduler-yield benchmark. `make test-apps`.
-* `edit` -- a full-screen text editor on its own full-screen surface: type, move with the
-  arrow keys, save with Ctrl+S, quit with Ctrl+Q. `make test-edit` types into it
-  and reads the saved file back with mtools.
+* `edit` -- a full-screen code editor: syntax colouring for Maylang, C, Lua
+  and shell scripts, line numbers, several files in tabs (`edit a.may b.may`,
+  Ctrl+O, Ctrl+N), undo and redo, Shift-selection with cut, copy and paste,
+  find and replace, go to line, comment toggling, auto-indent and closing
+  brackets. F1 lists the keys. `make test-edit` types into it and reads the
+  saved file back with mtools; `make test-editor` tests its buffer and
+  highlighting on the host.
 * `doom` -- see above.
 * `cc` -- a small C compiler. It reads a `.c` file from the disk, compiles it to
   a stack machine, and runs it, with a standard library of builtins (`printf`,

@@ -75,11 +75,22 @@ message.
 
 `nxfpack --verify <image.nxf>` checks an image that `nxfpack` did not write.
 
+A launcher can pass an environment: `BootstrapMessage::flags` has an
+`ENVIRONMENT` bit announcing a `KIND_ENVIRONMENT` message of `NAME=value`
+strings after the bootstrap message. A program reads it only when the bit says
+it was sent, so it never waits for one or takes a message meant for later. The
+shell sends its exported variables, including `PWD`, so `cd /src; mayc
+main.may` compiles `/src/main.may`; libnode (`Env::vars`), liblx (`environ`,
+the working directory) and the Maylang runtime (`env`, the working directory)
+all read it. A launcher that sends none leaves a program in `/`.
+
+The kernel frees a process's memory when it terminates, rather than when the
+last reference to the process object goes. Running the compiler a few times
+in one boot used to exhaust memory, because the shell's references kept every
+finished compiler's hundred megabytes.
+
 ## Limits
 
 * No sockets: there is no network service.
 * No C externs: there is no dynamic loader.
 * No wall clock: time starts at boot.
-* A child does not inherit the working directory or environment, because the
-  bootstrap message does not carry them; `cd` at the shell does not change
-  where a program resolves relative paths (always from `/`).
