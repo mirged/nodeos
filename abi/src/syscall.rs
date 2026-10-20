@@ -86,11 +86,16 @@ pub enum Syscall {
     DevicePioWrite = 29,
     /// Allocate a physically contiguous buffer a device can be pointed at.
     DeviceDmaAlloc = 30,
+
+    // ---- Threads, continued ------------------------------------------------
+    /// Set a thread's `FS` base: the userspace thread pointer that a C
+    /// runtime's TLS hangs off.
+    ThreadSetFsBase = 32,
 }
 
 impl Syscall {
     /// Highest implemented syscall number.
-    pub const MAX: u64 = Self::ProcessLoad as u64;
+    pub const MAX: u64 = Self::ThreadSetFsBase as u64;
 
     /// Decode a raw syscall number.
     pub const fn from_u64(value: u64) -> Option<Self> {
@@ -130,7 +135,8 @@ impl Syscall {
             27 => Self::DeviceInfo,
             28 => Self::DevicePioRead,
             29 => Self::DevicePioWrite,
-            _ => Self::DeviceDmaAlloc,
+            30 => Self::DeviceDmaAlloc,
+            _ => Self::ThreadSetFsBase,
         })
     }
 
@@ -169,6 +175,7 @@ impl Syscall {
             Self::DevicePioRead => "device_pio_read",
             Self::DevicePioWrite => "device_pio_write",
             Self::DeviceDmaAlloc => "device_dma_alloc",
+            Self::ThreadSetFsBase => "thread_set_fs_base",
         }
     }
 }

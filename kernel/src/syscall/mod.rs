@@ -128,6 +128,7 @@ fn dispatch(syscall: Syscall, args: &Args, frame: &mut TrapFrame) -> Result<i64,
         Syscall::ThreadCreate => sys_thread_create(args),
         Syscall::ThreadExit => sys_thread_exit(args),
         Syscall::ThreadStart => sys_thread_start(args),
+        Syscall::ThreadSetFsBase => sys_thread_set_fs_base(args),
         Syscall::Yield => {
             sched::yield_now();
             Ok(0)
@@ -409,6 +410,39 @@ fn sys_thread_start(args: &Args) -> Result<i64, Error> {
         }
         crate::task::ThreadState::Blocked | crate::task::ThreadState::Dead => Err(Error::BadState),
     }
+}
+
+/// `thread_set_fs_base(thread, value) -> status`
+///
+/// The invalid handle means the calling thread, as it means the caller's own
+/// address space for `memory_map`. The value must be a canonical lower-half
+/// address: `wrmsr` with a non-canonical one would fault inside the kernel,
+/// and a kernel address would hand userspace nothing it could use.
+fn sys_thread_set_fs_base(args: &Args) -> Result<i64, Error> {
+    let value = args.a1;
+    if value >= 0x0000_8000_0000_0000 {
+        return Err(Error::InvalidArgument);
+    }
+    if args.a0 == 0 {
+        let thread = sched::current_thread().ok_or(Error::BadState)?;
+        thread.set_fs_base(value);
+        // SAFETY: `value` is canonical (checked above), and the kernel never
+        // addresses through `FS`.
+        unsafe { crate::arch::x86_64::cpu::wrmsr(crate::arch::x86_64::cpu::MSR_FS_BASE, value) };
+        return Ok(0);
+    }
+    let caller = current()?;
+    let handle = caller
+        .handles()
+        .get_checked(handle_of(args.a0), Rights::MANAGE_THREAD)
+        .map_err(map_object_error)?;
+    let thread = thread_arc(handle.object())?;
+    if sched::current_thread().is_some_and(|current| Arc::ptr_eq(&current, &thread)) {
+        // SAFETY: as above.
+        unsafe { crate::arch::x86_64::cpu::wrmsr(crate::arch::x86_64::cpu::MSR_FS_BASE, value) };
+    }
+    thread.set_fs_base(value);
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------

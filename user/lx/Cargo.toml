@@ -1,0 +1,17 @@
+[package]
+name = "lx"
+version = "0.1.0"
+edition = "2021"
+
+# A static archive, not a program: C programs link it after musl's libc.a, and
+# it supplies `_start` (through libnode) and `__lx_syscall`. See docs/MUSL.md.
+[lib]
+name = "lx"
+path = "src/lib.rs"
+crate-type = ["staticlib"]
+test = false
+bench = false
+
+[dependencies]
+libnode = { workspace = true }
+nodeos-abi = { workspace = true }

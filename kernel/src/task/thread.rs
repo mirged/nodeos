@@ -176,6 +176,13 @@ pub struct Thread {
     /// again. `wake` records the wakeup here instead of dropping it, and
     /// `block_current` consumes it and declines to block.
     wake_pending: AtomicBool,
+    /// This thread's `IA32_FS_BASE`: the userspace thread pointer.
+    ///
+    /// The kernel never uses `FS`, so the MSR keeps the running thread's value
+    /// across every entry and exit; the scheduler only has to load the incoming
+    /// thread's value on a switch. A C runtime keeps its thread control block
+    /// here -- musl reads `%fs:0` for `errno` and `pthread_self`.
+    fs_base: AtomicU64,
 }
 
 // SAFETY: `saved_rsp` is only touched by the scheduler, with interrupts
@@ -183,6 +190,17 @@ pub struct Thread {
 unsafe impl Sync for Thread {}
 
 impl Thread {
+    /// The userspace thread pointer this thread runs with.
+    pub fn fs_base(&self) -> u64 {
+        self.fs_base.load(Ordering::Relaxed)
+    }
+
+    /// Record a new userspace thread pointer. The caller is responsible for
+    /// loading it into the MSR if this thread is the one running.
+    pub fn set_fs_base(&self, value: u64) {
+        self.fs_base.store(value, Ordering::Relaxed);
+    }
+
     /// Create a thread that will run `entry` inside `process`.
     pub fn new(process: &Arc<Process>, name: &str, entry: ThreadEntry, params: SchedParams) -> Option<Arc<Self>> {
         let stack = KernelStack::new()?;
@@ -239,6 +257,7 @@ impl Thread {
             vruntime: AtomicU64::new(0),
             timeslice_ns: AtomicU64::new(0),
             wake_pending: AtomicBool::new(false),
+            fs_base: AtomicU64::new(0),
         });
         thread.header.set_name(name);
         process.add_thread(&thread);
@@ -266,6 +285,7 @@ impl Thread {
             vruntime: AtomicU64::new(0),
             timeslice_ns: AtomicU64::new(0),
             wake_pending: AtomicBool::new(false),
+            fs_base: AtomicU64::new(0),
         });
         thread.header.set_name(name);
         process.add_thread(&thread);

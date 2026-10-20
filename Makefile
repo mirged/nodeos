@@ -16,6 +16,10 @@
 #   DOOM_WAD=/path...  package a different IWAD as /DOOM.WAD
 #   DISK_SIZE_MB=128   larger filesystem image
 #   AUDIODEV=none      keep the host quiet
+#
+# Linux programs (docs/MUSL.md) are built separately, because building them
+# fetches musl and Lua once: `make lx-apps` puts them in build/lx, and from
+# then on `make` copies them onto the disk as /bin/hello.nxf and /bin/lua.nxf.
 
 PROFILE      ?= release
 QEMU         ?= qemu-system-x86_64
@@ -46,6 +50,11 @@ NXFPACK      := tools/target/release/nxfpack
 USER_DIR     := target/user/x86_64-unknown-linux-gnu/$(PROFILE)
 MODULE_DIR   := $(BUILD)/modules
 
+# musl and liblx: the Linux personality.
+SYSROOT      := $(BUILD)/sysroot
+LX_DIR       := $(BUILD)/lx
+LIBLX        := $(LX_DIR)/liblx.a
+
 # `-boot d` matters: the FAT image `make disk` builds has a boot signature of
 # its own, and the BIOS would boot it instead of the CD.
 QEMU_FLAGS   := -machine q35 -cpu $(QEMU_CPU) -smp $(QEMU_SMP) -m $(QEMU_MEM) \
@@ -54,8 +63,8 @@ QEMU_FLAGS   := -machine q35 -cpu $(QEMU_CPU) -smp $(QEMU_SMP) -m $(QEMU_MEM) \
                 -audiodev $(AUDIODEV_ARGS),id=snd0 -device AC97,audiodev=snd0 \
                 -drive file=$(DISK),if=virtio,format=raw
 
-.PHONY: all build kernel tools user modules iso disk run debug \
-        test test-fs test-apps test-cc test-edit test-audio test-shell test-shell-parser test-fat-read test-terminal test-doom-libc \
+.PHONY: all build kernel tools user modules iso disk run debug sysroot lx lx-apps \
+        test test-fs test-apps test-cc test-edit test-audio test-shell test-shell-parser test-fat-read test-terminal test-doom-libc test-lua \
         fmt clippy clean help
 
 # --- What you actually run --------------------------------------------------
@@ -122,6 +131,24 @@ modules: tools user
 		--cap CHANNEL --cap MEMORY --cap FILE_READ \
 		--stack 512K --heap 32M --max-memory 64M
 
+# --- Linux programs: musl over liblx -----------------------------------------
+
+# musl 1.2.6 with liblx's seven-file overlay, installed as a sysroot.
+sysroot: $(SYSROOT)/lib/libc.a
+$(SYSROOT)/lib/libc.a: scripts/build-musl.sh $(shell find user/lx/musl -type f)
+	scripts/build-musl.sh $(SYSROOT)
+
+# liblx is built with the rest of userspace; C programs link this copy, in
+# which libnode's memcpy and friends are weak so that musl's take precedence.
+lx: user
+	@mkdir -p $(LX_DIR)
+	objcopy $(foreach sym,memcpy memmove memset memcmp bcmp strlen,--weaken-symbol=$(sym)) \
+		$(USER_DIR)/liblx.a $(LIBLX)
+
+# hello and Lua, compiled with scripts/lx-cc and packed as NXF.
+lx-apps: sysroot lx tools
+	scripts/build-lx-apps.sh $(NXFPACK)
+
 # The interactive ISO: every module, and a GRUB menu whose default entry boots
 # the full-screen shell.
 iso: $(ISO)
@@ -162,6 +189,11 @@ $(DISK): modules README.md
 	mcopy -i $(DISK) README.md ::/docs/NODEOS.MD
 	mcopy -i $(DISK) $(MODULE_DIR)/*.nxf ::/bin/
 	mcopy -i $(DISK) user/cc/tests/hello.c ::/TESTS/HELLO.C
+	mcopy -i $(DISK) user/lx/tests/hello.lua ::/TESTS/HELLO.LUA
+	@if ls $(LX_DIR)/*.nxf >/dev/null 2>&1; then \
+	  mcopy -i $(DISK) $(LX_DIR)/*.nxf ::/bin/; \
+	  echo "disk: packaged Linux programs: $$(cd $(LX_DIR) && echo *.nxf)"; \
+	fi
 	@if [ -f "$(DOOM_WAD)" ]; then \
 	  mcopy -i $(DISK) "$(DOOM_WAD)" ::/DOOM.WAD; \
 	  echo "disk: packaged $(DOOM_WAD) as /DOOM.WAD"; \
@@ -194,6 +226,12 @@ test-apps: $(ISO) $(DISK)
 # The C compiler: run it on a program on the disk and check the output.
 test-cc: $(ISO) $(DISK)
 	@scripts/run-cc-test.sh
+
+# Linux programs: a musl C test and Lua 5.4, run from the shell. Builds them
+# first, which fetches musl and Lua the first time.
+test-lua: lx-apps $(ISO) $(DISK)
+	mcopy -o -i $(DISK) $(LX_DIR)/*.nxf ::/bin/
+	@scripts/run-lua-test.sh
 
 # The text editor: type, save, and read the file back with mtools.
 test-edit: $(ISO) $(DISK)
@@ -258,6 +296,8 @@ help:
 	  '  make test-fs       Filesystem I/O through the shell' \
 	  '  make test-apps     Run the console apps from the shell' \
 	  '  make test-cc       Compile and run a C program with cc' \
+	  '  make test-lua      Run Lua 5.4 and a C program built against musl' \
+	  '  make lx-apps       Build the Linux programs (musl + liblx) into build/lx' \
 	  '  make test-edit     Edit and save a file with the editor' \
 	  '  make test-audio    Check sound using QEMU'"'"'s wav backend' \
 	  '  make test-shell    Check shell workflows and fullscreen apps' \

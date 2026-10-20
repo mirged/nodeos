@@ -46,6 +46,7 @@ and the whole thing runs in QEMU today.
 | Full-screen display/input broker; no desktop, windows or mouse UI | working |
 | Text console, cursor, 512-line scrollback and command shell | working |
 | Doom as an explicitly launched full-screen program (`docs/DOOM.md`) | working |
+| Linux programs: musl over an in-process Linux personality (`docs/MUSL.md`) | working: Lua 5.4 |
 | Userspace services (ramfs, devmgr) | in progress |
 
 ## Quick start
@@ -68,6 +69,7 @@ make test-fs      # filesystem I/O through the shell
 make test-apps    # run the console apps from the shell
 make test-cc      # compile and run a C program
 make test-edit    # edit and save a file
+make test-lua     # build Lua 5.4 against musl and run it
 make test-audio   # check sound using QEMU's wav backend
 make test-shell   # scripts, editing, paging, foreground apps, Doom return
 make test-shell-parser # quotes, escapes and command-file syntax
@@ -199,6 +201,33 @@ sum 1..10 = 55
 ...
 ```
 
+## Linux programs
+
+Unmodified C programs written for Linux build against musl and run on
+NodeOS. `make lx-apps` fetches musl 1.2.6 and Lua 5.4.7 (from
+github.com/lua/lua), builds both, and the next `make` puts them on the disk:
+
+```
+nodeos> lua /tests/hello.lua
+hello from Lua 5.4 on NodeOS
+fib(20) = 6765
+...
+nodeos> lua
+Lua 5.4.7  Copyright (C) 1994-2024 Lua.org, PUC-Rio
+> print(6*7)
+42
+```
+
+musl is upstream except for the seven files that issue a raw `syscall`
+instruction (`user/lx/musl/`). Those now call `__lx_syscall`, and liblx
+(`user/lx/`) answers each Linux syscall in-process with the handles the
+program was given: descriptors 0-2 are the console, `open` is the filesystem
+channel, and `mmap` is memory objects. `scripts/lx-cc` is the compiler driver,
+for use as `$(CC)`. [`docs/MUSL.md`](docs/MUSL.md) has the design, what works,
+and what is still to do: threads, `fork`/`exec` and signals.
+
+## The C compiler
+
 The compiler is a real one -- tokenizer, recursive-descent parser, type-aware
 code generator, virtual machine -- for a deliberate subset of C: one machine
 word (`int`), `char`, pointers and arrays, functions with recursion, `for`,
@@ -228,6 +257,9 @@ docs/       design documents
   and shell workflows.
 * [`docs/DOOM.md`](docs/DOOM.md) -- what porting Doom exercised, and the one
   gap it found.
+* [`docs/MUSL.md`](docs/MUSL.md) -- the plan for running ordinary Linux
+  programs: musl over an in-process Linux personality, and what the kernel
+  needs for it.
 
 ## Licence
 
