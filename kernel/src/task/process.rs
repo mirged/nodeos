@@ -203,6 +203,10 @@ impl Process {
         // VMO handle may free memory, and so on.
         self.handles.clear();
         self.namespace.clear();
+        // And its memory: the process object may be referenced for a long time
+        // yet (by a parent's handle, by the scheduler), and a program that
+        // mapped hundreds of megabytes must not keep them after it exits.
+        self.space.release_regions();
 
         *self.state.lock() = ProcessState::Terminated;
         self.header.signals().update(Signals::PROCESS_TERMINATED, Signals::NONE);
