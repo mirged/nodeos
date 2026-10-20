@@ -283,6 +283,10 @@ pub struct HandleInfo {
     /// create -- the usual case, since capabilities arrive by message -- has
     /// no way to learn how much of it to map.
     pub size: u64,
+    /// For a process that has terminated, the code it exited with; `0`
+    /// otherwise. A parent holding the handle is the one party entitled to
+    /// ask, and waiting for `PROCESS_TERMINATED` then querying is how it does.
+    pub exit_code: i64,
 }
 
 /// Device kinds reported by `device_info`.
