@@ -16,6 +16,7 @@
 #   DOOM_WAD=/path...  package a different IWAD as /DOOM.WAD
 #   DISK_SIZE_MB=128   larger filesystem image
 #   AUDIODEV=none      keep the host quiet
+#   QEMU_ACCEL="-accel tcg"  run without KVM
 #
 # Linux programs (docs/MUSL.md) are built separately, because building them
 # fetches musl and Lua once: `make lx-apps` puts them in build/lx, and from
@@ -30,6 +31,9 @@ QEMU         ?= qemu-system-x86_64
 QEMU_MEM     ?= 512M
 QEMU_CPU     ?= qemu64,+pdpe1gb
 QEMU_SMP     ?= 1
+# Hardware virtualization where the host offers it; QEMU falls back to TCG
+# (full emulation) when /dev/kvm is missing or not accessible.
+QEMU_ACCEL   ?= -accel kvm -accel tcg
 
 BUILD        := build
 ISODIR       := $(BUILD)/iso
@@ -82,7 +86,7 @@ all: build
 build: iso disk
 
 run: $(ISO) $(DISK)
-	$(QEMU) $(QEMU_FLAGS) -cdrom $(ISO) -serial stdio
+	$(QEMU) $(QEMU_ACCEL) $(QEMU_FLAGS) -cdrom $(ISO) -serial stdio
 
 # --- Build artifacts --------------------------------------------------------
 
@@ -341,5 +345,5 @@ help:
 	  '  make clippy        Lint the kernel' \
 	  '  make clean         Remove build artifacts' \
 	  '' \
-	  'Overrides: PROFILE=debug QEMU_MEM=1G DOOM_WAD=/path/to/doom.wad' \
+	  'Overrides: PROFILE=debug QEMU_MEM=1G QEMU_ACCEL="-accel tcg" DOOM_WAD=/path/to/doom.wad' \
 	  '           DISK_SIZE_MB=128 AUDIODEV=none MAYLANG=../maylang'
