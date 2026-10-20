@@ -423,7 +423,7 @@ fn launch_one(name: &str, bytes: &[u8], extra_handles: Vec<Handle>) -> Result<La
         image_base: image.base,
         heap_size: requirements.resources.heap_reserve,
         extra_count: 0,
-        _reserved: 0,
+        flags: 0,
     });
 
     let mut message = Message::empty(KIND_BOOTSTRAP);

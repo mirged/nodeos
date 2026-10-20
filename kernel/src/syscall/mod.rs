@@ -1000,6 +1000,9 @@ fn sys_capability_query(args: &Args) -> Result<i64, Error> {
         signals: header.signals().get().0,
         grant_depth: handle.grant().depth(),
         size: crate::obj::downcast::<Vmo>(handle.object()).map_or(0, |vmo| vmo.size()),
+        exit_code: crate::obj::downcast::<Process>(handle.object())
+            .filter(|process| process.is_dying())
+            .map_or(0, |process| process.exit_code()),
     };
     uaccess::write_struct(args.a1, &info)?;
     Ok(0)

@@ -105,5 +105,7 @@ nxfpack target/user/release/init -o build/modules/init.nxf \
 ```
 
 `nxfpack` re-parses its own output with the exact code the kernel uses before
-declaring success. A packer that emits an image the loader rejects is worse than
+declaring success. `nxfpack --verify <image.nxf>` does the same for an image
+something else wrote: the Maylang compiler emits NXF directly
+(`docs/MAYLANG.md`), with no ELF in between. A packer that emits an image the loader rejects is worse than
 one that fails, because the failure would surface at boot instead of at build.

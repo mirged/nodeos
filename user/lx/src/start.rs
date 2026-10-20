@@ -63,7 +63,7 @@ fn start(mut env: Env) -> i32 {
     while let Some(handle) = env.take_extra(0) {
         session.push(handle);
     }
-    crate::fs::init(session.first().map(|h| h.raw().0), session.get(1).map(|h| h.raw().0));
+    crate::fs::init(session.first().map(|h| h.raw().0), session.get(1).map(|h| h.raw().0), env.var("PWD"));
     core::mem::forget(session);
 
     // NUL-terminated copies of the arguments and environment, which musl and
@@ -76,7 +76,13 @@ fn start(mut env: Env) -> i32 {
         strings.push(leak_c_string(b"a.out"));
     }
     let argc = strings.len();
-    let mut environment: Vec<*mut u8> = ENVIRONMENT.iter().map(|var| leak_c_string(var.as_bytes())).collect();
+    // The launcher's environment when it sent one (the shell does), and a
+    // minimal default otherwise.
+    let mut environment: Vec<*mut u8> = if env.vars().is_empty() {
+        ENVIRONMENT.iter().map(|var| leak_c_string(var.as_bytes())).collect()
+    } else {
+        env.vars().iter().map(|var| leak_c_string(var.as_bytes())).collect()
+    };
 
     // AT_RANDOM: sixteen bytes musl takes its stack-protector canary from.
     let random = Vec::leak(alloc::vec![0u8; 16]);

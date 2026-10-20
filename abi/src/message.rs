@@ -108,9 +108,23 @@ pub struct BootstrapMessage {
     pub heap_size: u64,
     /// Number of `(name, handle)` pairs following this structure.
     pub extra_count: u32,
-    /// Padding.
-    pub _reserved: u32,
+    /// See [`bootstrap_flags`]. Zero from a launcher that predates them.
+    pub flags: u32,
 }
 
 /// Message kind of the bootstrap message.
 pub const KIND_BOOTSTRAP: u32 = 0x4E4F_4445;
+
+/// Bits of [`BootstrapMessage::flags`].
+pub mod bootstrap_flags {
+    /// A [`super::KIND_ENVIRONMENT`] message follows the bootstrap message on
+    /// the same channel. A program that does not read it loses nothing but
+    /// the variables; one that does knows the message is there, so it never
+    /// waits for one that was not sent or takes a message meant for later.
+    pub const ENVIRONMENT: u32 = 1 << 0;
+}
+
+/// Message kind of the environment message: `NAME=value` strings, each
+/// NUL-terminated. The environment is configuration the launcher chose to
+/// pass on, not authority; it names nothing the program can act on.
+pub const KIND_ENVIRONMENT: u32 = 0x454E_5649;

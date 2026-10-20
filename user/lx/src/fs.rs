@@ -34,10 +34,14 @@ static FILES: AtomicU32 = AtomicU32::new(0);
 static CWD: SpinLock<String> = SpinLock::new(String::new());
 
 /// Record the session channels. Called once, by startup.
-pub fn init(console: Option<u32>, files: Option<u32>) {
+pub fn init(console: Option<u32>, files: Option<u32>, cwd: Option<&str>) {
     CONSOLE.store(console.unwrap_or(0), Ordering::Relaxed);
     FILES.store(files.unwrap_or(0), Ordering::Relaxed);
-    CWD.lock().push('/');
+    // The launcher's working directory (the shell passes PWD), or the root.
+    match cwd {
+        Some(path) if path.starts_with('/') => CWD.lock().push_str(path),
+        _ => CWD.lock().push('/'),
+    }
     let mut table = TABLE.lock();
     for kind in [Tty::Input, Tty::Output, Tty::Error] {
         table.push(Some(Arc::new(SpinLock::new(Object::Tty(kind)))));

@@ -9,7 +9,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::global_asm;
 
-use nodeos_abi::message::{BootstrapMessage, KIND_BOOTSTRAP};
+use nodeos_abi::message::{bootstrap_flags, BootstrapMessage, KIND_BOOTSTRAP, KIND_ENVIRONMENT};
 use nodeos_abi::HandleValue;
 
 use crate::channel::Channel;
@@ -74,7 +74,19 @@ pub unsafe extern "C" fn __libnode_start(bootstrap: u32) -> ! {
                 // NUL-terminated argument after another. A launcher that sends
                 // none leaves it empty.
                 let args = parse_args(&message.payload[core::mem::size_of::<BootstrapMessage>()..]);
-                Env::from_bootstrap(info, channel, message.handles, args)
+                // The launcher says whether an environment follows, so this
+                // never waits for one, nor takes a message meant for later.
+                let vars = if info.flags & bootstrap_flags::ENVIRONMENT != 0 {
+                    match channel.receive_with(64 * 1024, 0, false) {
+                        Ok(message) if message.kind == KIND_ENVIRONMENT => parse_args(&message.payload),
+                        _ => Vec::new(),
+                    }
+                } else {
+                    Vec::new()
+                };
+                let mut env = Env::from_bootstrap(info, channel, message.handles, args);
+                env.set_vars(vars);
+                env
             }
             Ok(_) | Err(_) => Env::with_channel(channel),
         }

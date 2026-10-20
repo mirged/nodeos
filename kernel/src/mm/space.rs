@@ -301,6 +301,18 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Remove every mapping, releasing the memory objects behind them.
+    ///
+    /// A terminated process's address space can outlive it for as long as
+    /// anything holds the process object; its memory should not. The page
+    /// tables themselves stay until the space is dropped.
+    pub fn release_regions(&self) {
+        let regions = core::mem::take(&mut *self.regions.lock());
+        for region in regions.values() {
+            self.tear_down_region(region);
+        }
+    }
+
     fn tear_down_region(&self, region: &Region) {
         let mapper = self.mapper();
         let pages = (region.len / PAGE_SIZE as u64) as usize;

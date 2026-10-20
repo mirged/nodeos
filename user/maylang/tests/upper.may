@@ -1,0 +1,8 @@
+// Reads standard input to its end and prints it upper-cased, for testing
+// input redirection (`mayupper < file`).
+let text: Str = read_stdin();
+let lines: List<Str> = split(trim(text), "\n");
+print("upper: ${len(lines)} lines");
+for line: Str in lines {
+    print(to_upper(line));
+}

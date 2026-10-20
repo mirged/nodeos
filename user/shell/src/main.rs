@@ -4,10 +4,14 @@
 extern crate alloc;
 mod files;
 mod lineedit;
+mod redirect;
 mod syntax;
 use alloc::{format, string::String, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 use libnode::abi::{proto, Signals};
+use libnode::sync::SpinLock;
 use libnode::{println, Channel, Env, Message};
+use syntax::{Connector, Piece, RedirectKind, Word};
 libnode::main! {fn main(env:Env)->i32{run(env)}}
 struct Session {
     console: Channel,
@@ -17,6 +21,49 @@ struct Session {
     cwd: String,
     previous: String,
     history: Vec<String>,
+    /// Shell variables. Exported ones are passed to every program started.
+    vars: Vec<Variable>,
+    /// Exit status of the last command, `$?`: 0 is success.
+    status: i32,
+}
+struct Variable {
+    name: String,
+    value: String,
+    exported: bool,
+}
+impl Session {
+    fn var(&self, name: &str) -> Option<&str> {
+        self.vars.iter().find(|v| v.name == name).map(|v| v.value.as_str())
+    }
+    fn set_var(&mut self, name: &str, value: &str, export: bool) {
+        match self.vars.iter_mut().find(|v| v.name == name) {
+            Some(var) => {
+                var.value = String::from(value);
+                var.exported |= export;
+            }
+            None => self.vars.push(Variable { name: name.into(), value: value.into(), exported: export }),
+        }
+    }
+    /// The exported variables as `NAME=value` strings.
+    fn environment(&self) -> Vec<String> {
+        self.vars.iter().filter(|v| v.exported).map(|v| format!("{}={}", v.name, v.value)).collect()
+    }
+}
+
+/// Whether the current built-in reported a failure; its exit status.
+static FAILED: AtomicBool = AtomicBool::new(false);
+/// Output of a built-in whose output is redirected to a file.
+static CAPTURE: SpinLock<Option<Vec<u8>>> = SpinLock::new(None);
+
+/// Whether built-in output is being captured for a redirection.
+fn capturing() -> bool {
+    CAPTURE.lock().is_some()
+}
+
+/// Report a failure: always on the screen, never into a redirected file.
+fn fail(console: &Channel, text: &str) {
+    FAILED.store(true, Ordering::Relaxed);
+    console_text(console, text);
 }
 fn run(mut env: Env) -> i32 {
     let Some(console) = env.take_extra(0).map(Channel::from_handle) else {
@@ -30,7 +77,12 @@ fn run(mut env: Env) -> i32 {
         cwd: String::from("/"),
         previous: String::from("/"),
         history: Vec::new(),
+        vars: Vec::new(),
+        status: 0,
     };
+    for (name, value) in [("PATH", "/bin"), ("HOME", "/"), ("PWD", "/"), ("TERM", "nodeos"), ("SHELL", "/bin/shell.nxf")] {
+        session.set_var(name, value, true);
+    }
     write_text(
         &session.console,
         "\x1b[1mNodeOS\x1b[0m\n\x1b[2mType help to get started.  Tab completes commands.\x1b[0m\n\n",
@@ -49,7 +101,17 @@ fn run(mut env: Env) -> i32 {
         }
     }
 }
-fn write_text(console: &Channel, mut text: &str) {
+/// Write command output: to the screen, or into the capture when a
+/// redirection is collecting it.
+fn write_text(console: &Channel, text: &str) {
+    if let Some(capture) = CAPTURE.lock().as_mut() {
+        capture.extend_from_slice(text.as_bytes());
+        return;
+    }
+    console_text(console, text);
+}
+
+fn console_text(console: &Channel, mut text: &str) {
     // Console requests have finite receive buffers. Keep large grep/pager
     // output bounded without splitting UTF-8 code points between messages.
     while !text.is_empty() {
@@ -70,23 +132,202 @@ fn execute(s: &mut Session, text: &str, depth: usize) {
     let commands = match syntax::parse(text) {
         Ok(commands) => commands,
         Err(error) => {
-            write_text(&s.console, &format!("\x1b[31mSyntax: {error}.\x1b[0m\n"));
+            console_text(&s.console, &format!("\x1b[31mSyntax: {error}.\x1b[0m\n"));
             println!("shell: syntax rejected");
+            s.status = 2;
             return;
         }
     };
     let count = commands.len();
-    for args in commands {
-        if args.is_empty() {
+    for (connector, command) in commands {
+        let skip = match connector {
+            Connector::Always => false,
+            Connector::IfSuccess => s.status != 0,
+            Connector::IfFailure => s.status == 0,
+        };
+        if skip {
             continue;
         }
-        command(s, &args, depth);
-        println!("shell: command complete: {}", args[0]);
+        let name = run_command(s, &command, depth);
+        println!("shell: command complete: {name} (status {})", s.status);
     }
     if depth > 0 {
         println!("shell: source completed ({count} commands)");
     }
 }
+
+/// Substitute variables into a word. Unset variables are empty.
+fn expand(s: &Session, word: &Word) -> String {
+    let mut text = String::new();
+    for piece in word {
+        match piece {
+            Piece::Text(literal) => text.push_str(literal),
+            Piece::Var(name) if name == "?" => text.push_str(&format!("{}", s.status)),
+            Piece::Var(name) => text.push_str(s.var(name).unwrap_or("")),
+        }
+    }
+    text
+}
+
+/// A leading `NAME=value` word, split; `None` for an ordinary word.
+fn assignment(s: &Session, word: &Word) -> Option<(String, String)> {
+    let Some(Piece::Text(first)) = word.first() else { return None };
+    let (name, _) = first.split_once('=')?;
+    let mut chars = name.chars();
+    let valid = chars.next().is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric());
+    if !valid {
+        return None;
+    }
+    let value = expand(s, word);
+    Some((String::from(name), String::from(&value[name.len() + 1..])))
+}
+
+/// Run one parsed command and set `$?`. Returns its name, for the log.
+fn run_command(s: &mut Session, command: &syntax::Command, depth: usize) -> String {
+    let mut words = command.words.iter().peekable();
+    let mut assignments = Vec::new();
+    while let Some(word) = words.peek() {
+        let Some(pair) = assignment(s, word) else { break };
+        assignments.push(pair);
+        words.next();
+    }
+    let args: Vec<String> = words.map(|word| expand(s, word)).collect();
+    let redirects: Vec<(RedirectKind, String)> = command
+        .redirects
+        .iter()
+        .map(|r| (r.kind, files::resolve(&s.cwd, &expand(s, &r.target))))
+        .collect();
+    // `NAME=value` alone sets shell variables; before a program it sets them
+    // for that program only.
+    if args.is_empty() {
+        for (name, value) in &assignments {
+            s.set_var(name, value, false);
+        }
+        s.status = 0;
+        return String::from("assignment");
+    }
+    let name = args[0].clone();
+    if is_builtin(&name) {
+        s.status = run_builtin(s, &args, &redirects, depth);
+    } else {
+        s.status = run_program(s, &args, &assignments, &redirects);
+    }
+    name
+}
+
+/// Run a built-in, capturing its output for `>`/`>>`. Returns its status.
+fn run_builtin(s: &mut Session, args: &[String], redirects: &[(RedirectKind, String)], depth: usize) -> i32 {
+    if redirects.iter().any(|(kind, _)| *kind == RedirectKind::In) {
+        fail(&s.console, "Input redirection (<) works with programs; shell commands take file names.\n");
+        return 1;
+    }
+    let output = redirects.last().cloned();
+    if output.is_some() {
+        *CAPTURE.lock() = Some(Vec::new());
+    }
+    FAILED.store(false, Ordering::Relaxed);
+    command(s, args, depth);
+    let mut status = if FAILED.load(Ordering::Relaxed) { 1 } else { 0 };
+    if let Some((kind, path)) = output {
+        let captured = CAPTURE.lock().take().unwrap_or_default();
+        let Some(files) = s.files.as_ref() else {
+            fail(&s.console, "no filesystem connected\n");
+            return 1;
+        };
+        // Every target is written, as a shell does; only the last gets output.
+        for (other, target) in &redirects[..redirects.len() - 1] {
+            let _ = files::write_file(files, target, b"", *other == RedirectKind::Append);
+        }
+        if let Err(error) = files::write_file(files, &path, &captured, kind == RedirectKind::Append) {
+            show_error(&s.console, &path, error);
+            status = 1;
+        }
+    }
+    status
+}
+
+const BUILTINS: &[&str] = &[
+    "font", "help", "echo", "pwd", "cd", "clear", "history", "about", "uptime", "source", "export", "unset",
+    "set", "env", "true", "false", "ls", "cat", "write", "append", "mkdir", "rm", "rmdir", "stat", "df", "fstest",
+    "touch", "cp", "mv", "grep", "more", "head", "tail", "wc", "find",
+];
+
+fn is_builtin(name: &str) -> bool {
+    BUILTINS.contains(&name)
+}
+
+/// Start a program, wait for it and return its exit status.
+fn run_program(
+    s: &mut Session,
+    args: &[String],
+    assignments: &[(String, String)],
+    redirects: &[(RedirectKind, String)],
+) -> i32 {
+    let name = args[0].as_str();
+    let (program, arguments) = if name == "run" {
+        let Some(program) = args.get(1) else {
+            fail(&s.console, "usage: run <program> [args...]\n");
+            return 2;
+        };
+        (program.as_str(), &args[2..])
+    } else {
+        (name, &args[1..])
+    };
+    let Some(files) = s.files.as_ref() else {
+        fail(&s.console, "no filesystem connected\n");
+        return 1;
+    };
+    let suffix = if program.to_ascii_lowercase().ends_with(".nxf") { "" } else { ".nxf" };
+    let path = if program.contains('/') {
+        files::resolve(&s.cwd, program)
+    } else {
+        // /bin first, as at any shell; then the working directory, so a
+        // program just compiled here runs by name.
+        let candidates = [
+            format!("/bin/{program}{suffix}"),
+            files::resolve(&s.cwd, &format!("{program}{suffix}")),
+            files::resolve(&s.cwd, program),
+        ];
+        let found = candidates.iter().find(|path| files::exists(files, path)).cloned();
+        found.unwrap_or_else(|| candidates[0].clone())
+    };
+    let mut environment = s.environment();
+    for (key, value) in assignments {
+        environment.retain(|entry| entry.split_once('=').map(|(k, _)| k) != Some(key.as_str()));
+        environment.push(format!("{key}={value}"));
+    }
+    let environment: Vec<&str> = environment.iter().map(String::as_str).collect();
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    let launched = if redirects.is_empty() {
+        libnode::session::launch(&s.console, files, s.display.as_ref(), s.audio.as_ref(), &path, &arguments, &environment)
+            .map(|process| {
+                println!("shell: foreground {path}");
+                let _ = process.handle().wait(Signals::PROCESS_TERMINATED, 0);
+                process
+            })
+    } else {
+        redirect::run(&s.console, files, s.display.as_ref(), s.audio.as_ref(), &path, &arguments, &environment, redirects)
+    };
+    match launched {
+        Ok(process) => {
+            println!("shell: completed {path}");
+            process.handle().query().map(|info| info.exit_code as i32).unwrap_or(1)
+        }
+        Err(libnode::Error::NotFound) if name != "run" && !name.contains('/') => {
+            console_text(
+                &s.console,
+                &format!("\x1b[31mUnknown command: {program}.\x1b[0m  Type help or press Tab.\n"),
+            );
+            127
+        }
+        Err(error) => {
+            show_error(&s.console, program, error);
+            if error == libnode::Error::NotFound { 127 } else { 126 }
+        }
+    }
+}
+
 fn command(s: &mut Session, args: &[String], depth: usize) {
     let name = args[0].as_str();
     let tail = &args[1..];
@@ -97,7 +338,7 @@ fn command(s: &mut Session, args: &[String], depth: usize) {
                 Some("normal") => 1,
                 Some("large") => 2,
                 _ => {
-                    write_text(&s.console,"Usage: font small | normal | large\nNormal is the default. Earlier output stays in scrollback.\n");
+                    fail(&s.console,"Usage: font small | normal | large\nNormal is the default. Earlier output stays in scrollback.\n");
                     return;
                 }
             };
@@ -123,7 +364,7 @@ fn command(s: &mut Session, args: &[String], depth: usize) {
                         );
                     }
                 }
-                _ => write_text(&s.console, "Could not change text size.\n"),
+                _ => fail(&s.console, "Could not change text size.\n"),
             }
         }
         "help" => help(&s.console, tail.first().map(String::as_str).unwrap_or("")),
@@ -143,6 +384,9 @@ fn command(s: &mut Session, args: &[String], depth: usize) {
                     s.previous = old;
                 }
             }
+            // Programs start in the directory PWD names.
+            let cwd = s.cwd.clone();
+            s.set_var("PWD", &cwd, true);
         }
         "clear" => {
             let _ = s
@@ -163,103 +407,92 @@ fn command(s: &mut Session, args: &[String], depth: usize) {
         ),
         "source" => {
             if depth >= 8 {
-                write_text(&s.console, "source: maximum nesting is 8\n");
+                fail(&s.console, "source: maximum nesting is 8\n");
                 return;
             }
             let Some(path) = tail.first() else {
-                write_text(&s.console, "usage: source <file>\n");
+                fail(&s.console, "usage: source <file>\n");
                 return;
             };
             if let Some(files) = s.files.as_ref() {
                 match files::read_file(files, &files::resolve(&s.cwd, path), 65536) {
                     Ok(bytes) => match core::str::from_utf8(&bytes) {
                         Ok(text) => execute(s, text, depth + 1),
-                        Err(_) => write_text(&s.console, "source: file is not UTF-8 text\n"),
+                        Err(_) => fail(&s.console, "source: file is not UTF-8 text\n"),
                     },
                     Err(error) => show_error(&s.console, "source", error),
                 }
             }
         }
-        "ls" | "cat" | "write" | "append" | "mkdir" | "rm" | "stat" | "df" | "fstest" | "touch"
-        | "cp" | "grep" | "more" => {
+        "export" => {
+            if tail.is_empty() {
+                for var in s.vars.iter().filter(|v| v.exported) {
+                    write_text(&s.console, &format!("export {}={}\n", var.name, var.value));
+                }
+            }
+            for item in tail {
+                let (name, value) = match item.split_once('=') {
+                    Some((name, value)) => (name, Some(value)),
+                    None => (item.as_str(), None),
+                };
+                if !valid_name(name) {
+                    fail(&s.console, &format!("export: '{name}' is not a valid name\n"));
+                    continue;
+                }
+                let value = value.map(String::from).or_else(|| s.var(name).map(String::from)).unwrap_or_default();
+                s.set_var(name, &value, true);
+            }
+        }
+        "unset" => s.vars.retain(|v| !tail.contains(&v.name)),
+        "set" | "env" => {
+            for var in s.vars.iter().filter(|v| name == "set" || v.exported) {
+                write_text(&s.console, &format!("{}={}\n", var.name, var.value));
+            }
+        }
+        "true" => {}
+        "false" => FAILED.store(true, Ordering::Relaxed),
+        _ => {
             if let Some(files) = s.files.as_ref() {
                 if !valid_arguments(name, tail) {
-                    write_text(&s.console, &format!("Usage: {}\n", usage(name).unwrap()));
+                    fail(&s.console, &format!("Usage: {}\n", usage(name).unwrap_or(name)));
                     return;
                 }
                 if let Err(error) = files::command(&s.console, files, &s.cwd, name, tail) {
                     show_error(&s.console, name, error);
                 }
             } else {
-                write_text(&s.console, "no filesystem connected\n");
-            }
-        }
-        _ => {
-            let (program, arguments) = if name == "run" {
-                let Some(program) = tail.first() else {
-                    write_text(&s.console, "usage: run <program> [args...]\n");
-                    return;
-                };
-                (program.as_str(), &tail[1..])
-            } else {
-                (name, tail)
-            };
-            let path = if program.contains('/') {
-                files::resolve(&s.cwd, program)
-            } else {
-                format!(
-                    "/bin/{}{}",
-                    program,
-                    if program.to_ascii_lowercase().ends_with(".nxf") {
-                        ""
-                    } else {
-                        ".nxf"
-                    }
-                )
-            };
-            let Some(files) = s.files.as_ref() else {
-                write_text(&s.console, "no filesystem connected\n");
-                return;
-            };
-            let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
-            match libnode::session::launch(
-                &s.console,
-                files,
-                s.display.as_ref(),
-                s.audio.as_ref(),
-                &path,
-                &arguments,
-            ) {
-                Ok(process) => {
-                    println!("shell: foreground {path}");
-                    let _ = process.handle().wait(Signals::PROCESS_TERMINATED, 0);
-                    println!("shell: completed {path}");
-                }
-                Err(libnode::Error::NotFound) if name != "run" && !name.contains('/') => {
-                    write_text(
-                        &s.console,
-                        &format!(
-                            "\x1b[31mUnknown command: {program}.\x1b[0m  Type help or press Tab.\n"
-                        ),
-                    )
-                }
-                Err(error) => show_error(&s.console, program, error),
+                fail(&s.console, "no filesystem connected\n");
             }
         }
     }
 }
+fn valid_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
 fn usage(name: &str) -> Option<&'static str> {
     Some(match name {
-        "ls" => "ls [directory]",
+        "ls" => "ls [-l] [directory]",
         "cat" => "cat <file>",
         "more" => "more <file>",
         "grep" => "grep <text> <file>",
         "cp" => "cp [-f] <source> <destination>",
+        "mv" => "mv [-f] <source> <destination>",
+        "head" => "head [-n lines] <file>",
+        "tail" => "tail [-n lines] <file>",
+        "wc" => "wc <file>...",
+        "find" => "find [directory] [text]",
+        "rmdir" => "rmdir <directory>",
+        "export" => "export [NAME[=value]...]",
+        "unset" => "unset NAME...",
+        "set" => "set",
+        "env" => "env",
         "write" => "write <file> <text>",
         "append" => "append <file> <text>",
         "touch" => "touch <file>",
         "mkdir" => "mkdir <directory>",
-        "rm" => "rm <path>",
+        "rm" => "rm [-r] <path>",
         "stat" => "stat <path>",
         "cd" => "cd [directory | -]",
         "source" => "source <file>",
@@ -277,18 +510,16 @@ fn usage(name: &str) -> Option<&'static str> {
     })
 }
 fn valid_arguments(name: &str, args: &[String]) -> bool {
+    let flag = |f: &str| args.first().is_some_and(|a| a == f);
     match name {
-        "ls" => args.len() <= 1,
+        "ls" => args.len() <= 1 + flag("-l") as usize,
         "df" | "fstest" => args.is_empty(),
-        "cp" => {
-            args.len()
-                == if args.first().is_some_and(|s| s == "-f") {
-                    3
-                } else {
-                    2
-                }
-        }
+        "cp" | "mv" => args.len() == 2 + flag("-f") as usize,
+        "rm" => args.len() == 1 + flag("-r") as usize,
+        "head" | "tail" => args.len() == if flag("-n") { 3 } else { 1 },
         "grep" => args.len() == 2,
+        "find" => args.len() <= 2,
+        "wc" => !args.is_empty(),
         "write" | "append" => !args.is_empty(),
         _ => args.len() == 1,
     }
@@ -311,10 +542,10 @@ fn show_error(console: &Channel, context: &str, error: libnode::Error) {
 }
 fn help(console: &Channel, topic: &str) {
     let text=match topic{
-        ""=>"\x1b[1mShell commands\x1b[0m\n\n\x1b[36mNavigate & read\x1b[0m\n  pwd, cd, ls       Find your way around\n  cat, more, grep   Read, page through and search files\n\n\x1b[36mWork with files\x1b[0m\n  write, append     Write text to disk\n  cp, touch         Copy files or create an empty file\n  mkdir, rm         Create folders or remove entries\n  stat, df          File and disk information\n\n\x1b[36mYour session\x1b[0m\n  history, clear    Recall commands or clear the screen\n  font large        Make text larger (small/normal/large)\n  source, run       Run a command file or an application\n\n\x1b[2mTry: ls /bin   or   help cp\nMore help: keys, files, syntax, apps\x1b[0m\n",
+        ""=>"\x1b[1mShell commands\x1b[0m\n\n\x1b[36mNavigate & read\x1b[0m\n  pwd, cd, ls       Find your way around\n  cat, more, grep   Read, page through and search files\n\n\x1b[36mWork with files\x1b[0m\n  write, append     Write text to disk\n  cp, mv, touch     Copy, move or create files\n  mkdir, rm, rmdir  Create folders or remove entries\n  head, tail, wc    Start, end and size of a file\n  find, stat, df    Search the tree; file and disk information\n\n\x1b[36mYour session\x1b[0m\n  history, clear    Recall commands or clear the screen\n  font large        Make text larger (small/normal/large)\n  source, run       Run a command file or an application\n  export, env, set  Variables passed to programs\n\n\x1b[2mTry: ls /bin   or   help cp\nMore help: keys, files, syntax, apps\x1b[0m\n",
         "keys"=>"\x1b[1mKeyboard shortcuts\x1b[0m\n\n  Left / Right          Move the cursor\n  Ctrl+Left / Right     Move by word\n  Home / End            Start / end of line\n  Up / Down             Command history\n  Delete / Ctrl+D       Delete the next character\n  Ctrl+U / K / W        Erase left / right / previous word\n  Ctrl+C / L            Cancel the line / clear the screen\n  Tab                   Complete a command or path\n  Tab twice             Show matching completions\n  Shift+PgUp / PgDn     Browse scrollback\n  Meta+Q                Close a full-screen app\n  Meta / Scroll Lock    Switch full-screen sessions\n",
-        "files"=>"\x1b[1mFiles\x1b[0m\n\n  ls [dir]                   List directory contents\n  more <file>                Read a page at a time (Space/Enter/q)\n  grep <text> <file>          Find matching lines\n  cp [-f] <source> <dest>     Copy; -f allows replacement\n  write <file> <text>        Replace file contents\n  append <file> <text>       Add text to a file\n  touch <file>               Create a file if missing\n  mkdir <dir> / rm <path>    Create a folder / remove an entry\n  stat <path> / df          Inspect a file / disk usage\n\nPaths can be relative. Use .. for the parent folder.\nNew FAT filenames use 8.3 names, such as NOTES.TXT.\n",
-        "syntax"=>"\x1b[1mQuotes and command files\x1b[0m\n\nSingle/double quotes keep spaces in an argument.\nInside double quotes, \\n starts a new line and \\t adds a tab.\nSemicolons or newlines separate commands; # starts a comment.\nsource <file> reads UTF-8 commands (64 KiB, 8 nested files).\n\n\x1b[36mExamples\x1b[0m\n  write /NOTES.TXT \"one\\ntwo\\n\"\n  cp /NOTES.TXT /BACKUP.TXT; grep two /BACKUP.TXT\n  cd /docs; more NODEOS.MD\n",
+        "files"=>"\x1b[1mFiles\x1b[0m\n\n  ls [dir]                   List directory contents\n  more <file>                Read a page at a time (Space/Enter/q)\n  grep <text> <file>          Find matching lines\n  cp [-f] <source> <dest>     Copy; -f allows replacement\n  write <file> <text>        Replace file contents\n  append <file> <text>       Add text to a file\n  touch <file>               Create a file if missing\n  mkdir <dir> / rm <path>    Create a folder / remove an entry\n  stat <path> / df          Inspect a file / disk usage\n  ls -l [dir]                Exact sizes, one entry per line\n  mv [-f] <source> <dest>     Move a file (copy, then delete)\n  head/tail [-n N] <file>     First / last lines (10 by default)\n  wc <file>...               Lines, words and bytes\n  find [dir] [text]          Paths below dir whose name contains text\n  rmdir <dir> / rm -r <path> Remove an empty folder / a whole tree\n\nPaths can be relative. Use .. for the parent folder.\nNew FAT filenames use 8.3 names, such as NOTES.TXT.\n",
+        "syntax"=>"\x1b[1mQuotes and command files\x1b[0m\n\nSingle/double quotes keep spaces in an argument.\nInside double quotes, \\n starts a new line and \\t adds a tab.\nSemicolons or newlines separate commands; # starts a comment.\nsource <file> reads UTF-8 commands (64 KiB, 8 nested files).\n\n\x1b[36mVariables\x1b[0m\n  NAME=value sets a variable; $NAME or ${NAME} uses it.\n  export NAME passes it to programs; NAME=value prog sets it for one.\n  $? is the last exit status; env and set list variables.\n\n\x1b[36mChaining and redirection\x1b[0m\n  a && b runs b if a succeeded; a || b if it failed.\n  cmd > file replaces file with the output, >> appends to it.\n  prog < file gives a program its input lines from file.\n\n\x1b[36mExamples\x1b[0m\n  write /NOTES.TXT \"one\\ntwo\\n\"\n  cp /NOTES.TXT /BACKUP.TXT; grep two /BACKUP.TXT\n  cd /docs; more NODEOS.MD\n  ls -l /bin > /LIST.TXT && wc /LIST.TXT\n  mayc /tests/hello.may -o /h.nxf && run /h.nxf\n",
         "apps"=>"\x1b[1mApplications\x1b[0m\n\n  sysinfo             System report\n  tree                Directory tree\n  bench               Memory / scheduler benchmark\n  edit /NOTES.TXT     Text editor (Ctrl+S saves, Ctrl+Q exits)\n  cc /tests/hello.c   Compile and run C\n  doom                Play Doom, if an IWAD is installed\n\nPrograms run by name from /bin. The shell waits for them.\nMeta+Q closes the foreground full-screen application.\n",
         _=>{
             if let Some(usage)=usage(topic){write_text(console,&format!("\x1b[1m{topic}\x1b[0m\n\n  {usage}\n\n"));

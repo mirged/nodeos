@@ -1,29 +1,34 @@
-//! `edit` -- a small full-screen text editor.
+//! `edit` -- a full-screen code editor.
 //!
-//! It is a compositor client like `console` and `doom`: it holds a channel to
-//! `compositor`, a shared memory object for its window, and the filesystem
-//! channel the launcher granted it. It owns no device and no framebuffer; what
-//! appears on screen is a rectangle it draws into and then commits, and every
-//! keystroke arrives as a `WM_EVENT` on the same channel.
+//! It is a display client like `console` and `doom`: it holds a channel to the
+//! display service, a shared memory object for its surface, and the
+//! filesystem channel the launcher granted it. It owns no device; what appears
+//! on screen is a surface it draws into and commits, and every keystroke
+//! arrives as a `WM_EVENT` on the same channel.
 //!
-//! The whole program is deliberately one screenful of state: a list of lines,
-//! a cursor, a scroll offset, and a dirty bit. There is no undo, no selection
-//! and no horizontal scrolling, so nothing here needs a data structure more
-//! elaborate than a `Vec<String>` -- and the failure mode of indexing one of
-//! those out of bounds is a panic, which is why every cursor operation clamps
-//! before it reads.
+//! The text logic lives in two modules with no NodeOS dependencies, tested on
+//! the host (`make test-editor`): `buffer` (a document, its cursor, selection
+//! and undo history) and `highlight` (per-line syntax classes for Maylang, C,
+//! Lua and shell scripts). This file is the window, the keys and the files.
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
+mod buffer;
+mod highlight;
+
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libdraw::{Canvas, Rgb, GLYPH_SIZE};
+use buffer::{Buffer, Pos};
+use highlight::{Class, State};
+use libdraw::terminal_font::{TerminalFont, MARGIN};
+use libdraw::{Canvas, Rgb};
 use libnode::abi::message::MessageFlags;
-use libnode::abi::proto::{self, wm_event};
+use libnode::abi::proto::{self, wm_event, wm_mod};
 use libnode::abi::types::{MapFlags, MapWindow};
 use libnode::mem::{Mapping, Vmo};
 use libnode::{println, Channel, Env, Error, Message};
@@ -34,115 +39,104 @@ libnode::main! {
     }
 }
 
-/// A glyph cell is `GLYPH_SIZE` pixels square; every coordinate below is a
-/// multiple of this, and spelling it once keeps the casts in one place.
-const CELL: u32 = GLYPH_SIZE as u32;
+// The console's palette, extended with syntax colours.
+const BACKGROUND: Rgb = 0x0010_1216;
+const FOREGROUND: Rgb = 0x00E3_E8EE;
+const CURRENT_LINE: Rgb = 0x0018_1C22;
+const GUTTER: Rgb = 0x005C_6370;
+const GUTTER_CURRENT: Rgb = 0x00C8_CCD4;
+const SELECTION: Rgb = 0x002D_4F7C;
+const MATCH: Rgb = 0x0054_4520;
+const BRACKET: Rgb = 0x0040_4859;
+const BAR: Rgb = 0x000B_0D10;
+const TAB_INACTIVE: Rgb = 0x008A_919C;
+const STATUS: Rgb = 0x001E_2A3A;
+const NOTICE: Rgb = 0x00E5_C07B;
+const ERROR: Rgb = 0x00E0_6C75;
 
-/// Content size the editor asks for. Like the console's request, this is what
-/// would be comfortable rather than a demand -- the compositor decides.
-const WANTED_WIDTH: u32 = 640;
-/// See [`WANTED_WIDTH`].
-const WANTED_HEIGHT: u32 = 480;
+fn class_color(class: Class) -> Rgb {
+    match class {
+        Class::Normal => FOREGROUND,
+        Class::Keyword => 0x00C6_78DD,
+        Class::Type => 0x00E5_C07B,
+        Class::Constant | Class::Number => 0x00D1_9A66,
+        Class::Function => 0x0061_AFEF,
+        Class::String => 0x0098_C379,
+        Class::Escape => 0x0056_B6C2,
+        Class::Comment => 0x007F_848E,
+    }
+}
 
-/// The console's colours, so the editor looks like the rest of the system.
-const BACKGROUND: Rgb = 0x0010_1010;
-/// See [`BACKGROUND`].
-const FOREGROUND: Rgb = 0x00e0_e0e0;
-/// A muted bar behind the status line, to separate it from the text.
-const STATUS_BACKGROUND: Rgb = 0x0020_2040;
-
-/// Spaces a tab inserts. The buffer stores the spaces themselves rather than a
-/// tab character, because the font has no tab glyph and a column count that
-/// depended on the byte before it would complicate every cursor calculation.
-const TAB_WIDTH: usize = 4;
-
-/// Bytes per filesystem read. `/fs` caps a request at 32 KiB and answers with
-/// what fits, so there is no point asking for more.
-const READ_CHUNK: usize = 32 * 1024;
-/// Bytes per filesystem write, for the same reason.
-const WRITE_CHUNK: usize = 32 * 1024;
-
-/// Where a fileless edit session starts. The name is conventional; nothing
-/// creates the file until the first save.
-const DEFAULT_PATH: &str = "/UNTITLED.TXT";
+/// Bytes per filesystem request; the service caps one at 32 KiB.
+const CHUNK: usize = 32 * 1024;
+/// Largest file the editor opens.
+const MAX_FILE: usize = 4 * 1024 * 1024;
 
 fn run(mut env: Env) -> i32 {
-    // The shell hands every child its session capabilities in a fixed order:
-    // console, filesystem, compositor, audio. `take_extra(0)` pops from the
-    // front, so each call yields the next one. The editor has no use for the
-    // console or the mixer; it discards the first and never reaches the last.
+    // The session handles arrive in a fixed order: console, filesystem,
+    // display, audio. The editor uses the filesystem and the display.
     let _console = env.take_extra(0);
-    let Some(files_handle) = env.take_extra(0) else {
+    let Some(files) = env.take_extra(0).map(Channel::from_handle) else {
         println!("edit: no filesystem connection granted; exiting");
         return 1;
     };
-    let Some(wm_handle) = env.take_extra(0) else {
-        println!("edit: no compositor connection granted; exiting");
+    let Some(wm) = env.take_extra(0).map(Channel::from_handle) else {
+        println!("edit: no display connection granted; exiting");
         return 1;
     };
-    let files = Channel::from_handle(files_handle);
-    let wm = Channel::from_handle(wm_handle);
+    let cwd = env.var("PWD").filter(|p| p.starts_with('/')).map(String::from).unwrap_or_else(|| String::from("/"));
+    let mut app = App::new(files, cwd);
+    let paths: Vec<String> = env.args().iter().skip(1).filter(|p| !p.is_empty()).cloned().collect();
+    if paths.is_empty() {
+        app.tabs.push(Buffer::new(String::new(), ""));
+    }
+    for path in paths {
+        app.open(&path);
+    }
+    app.current = 0;
 
-    // `argv[0]` is the resolved program path; `argv[1]`, if any, is the file.
-    let path = match env.args().get(1) {
-        Some(path) if !path.is_empty() => path.clone(),
-        _ => String::from(DEFAULT_PATH),
+    let title = app.tabs[0].path.clone();
+    let Some(mut screen) = create_surface(&wm, if title.is_empty() { "edit" } else { &title }) else {
+        return 1;
     };
-
-    let mut editor = Editor::new(path.clone());
-    editor.lines = load(&files, &path);
-
-    let mut screen = match create_surface(&wm, &path) {
-        Some(screen) => screen,
-        None => return 1,
-    };
-
-    println!("edit: editing {} ({} lines)", path, editor.lines.len());
-    render(&mut screen, &mut editor, &wm);
+    println!("edit: editing {} ({} lines)", app.tabs[0].path, app.tabs[0].lines.len());
+    app.render(&mut screen, &wm);
 
     loop {
-        // Replies to our own `WM_COMMIT` calls are correlated and consumed by
-        // `call_with`, so anything that reaches here is an unsolicited event.
         let Ok(message) = wm.receive() else { continue };
         if message.kind != proto::WM_EVENT {
             continue;
         }
         let Some(event) = proto::decode::<proto::WmEvent>(&message.payload) else { continue };
-
         match event.kind {
             wm_event::KEY if event.pressed != 0 => {
-                on_key(&mut editor, &event, &files);
-                render(&mut screen, &mut editor, &wm);
+                if !app.key(&event) {
+                    return 0;
+                }
+                app.render(&mut screen, &wm);
             }
-            // The compositor replaced the surface: the window was maximized or
-            // restored. Its new memory object travels in the message, so the
-            // canvas is rebuilt around the new geometry and repainted. The text
-            // lives in `editor`, so unlike a terminal with no scrollback this
-            // resize loses nothing.
+            // The display replaced the surface; repaint into the new one.
             wm_event::CONFIGURE => {
                 let Some(handle) = message.handles.into_iter().next() else { continue };
                 let (width, height) = (event.width, event.height);
                 let pitch = width * 4;
                 let size = pitch as u64 * height as u64;
                 let vmo = Vmo::from_handle(handle, size);
-                let mapping = vmo.map(
+                let Ok(mapping) = vmo.map(
                     0,
                     size,
                     MapFlags::READ.or(MapFlags::WRITE).or(MapFlags::SHARED).or(MapFlags::POPULATE),
                     MapWindow::Shared,
-                );
-                let Ok(mapping) = mapping else {
+                ) else {
                     println!("edit: failed to map the resized surface");
                     continue;
                 };
                 // SAFETY: the mapping covers the whole object, whose size is
                 // exactly `pitch * height`, and nothing else here maps it.
                 unsafe { screen.replace(vmo, mapping, width, height, pitch) };
-                render(&mut screen, &mut editor, &wm);
+                app.render(&mut screen, &wm);
             }
-            wm_event::CLOSE => libnode::exit(0),
-            // Focus changes need no action, and the editor has no selection or
-            // scrollbar for the pointer to act on.
+            wm_event::CLOSE => return 0,
             _ => {}
         }
     }
@@ -152,11 +146,8 @@ fn run(mut env: Env) -> i32 {
 // The window
 // ---------------------------------------------------------------------------
 
-/// The editor's surface: the memory object, its mapping, and a canvas over it.
-///
-/// The memory object and the mapping are held only so they outlive the canvas.
-/// `Canvas` is a borrowed view with no `Drop`, so dropping either here would
-/// leave it pointing at address space that is no longer mapped.
+/// The surface: the memory object, its mapping, and a canvas over it. The
+/// object and mapping are held so they outlive the canvas, which borrows them.
 struct Screen {
     _vmo: Vmo,
     _mapping: Mapping,
@@ -165,31 +156,11 @@ struct Screen {
 }
 
 impl Screen {
-    /// Wrap a mapped surface memory object.
-    ///
     /// # Safety
-    /// `mapping` must cover at least `info.pitch * info.height` bytes of
-    /// `vmo`, and nothing else in this process may write it.
-    unsafe fn new(vmo: Vmo, mapping: Mapping, info: &proto::WmSurfaceInfo) -> Self {
-        // SAFETY: the caller guarantees the mapping covers the geometry, and
-        // the fields below keep it alive for as long as the canvas.
-        let canvas = unsafe {
-            Canvas::from_raw(mapping.base() as *mut u8, info.width, info.height, info.pitch)
-        };
-        Self { _vmo: vmo, _mapping: mapping, canvas, id: info.surface }
-    }
-
-    /// Adopt a new surface memory object, as a `CONFIGURE` event asks.
-    ///
-    /// The old mapping is unmapped before its object is released, so the frames
-    /// are never freed while still translated.
-    ///
-    /// # Safety
-    /// `mapping` must cover at least `pitch * height` bytes of `vmo`, and no
-    /// other mapping in this process may write it.
+    /// `mapping` must cover at least `pitch * height` bytes of `vmo`, and
+    /// nothing else in this process may write it.
     unsafe fn replace(&mut self, vmo: Vmo, mapping: Mapping, width: u32, height: u32, pitch: u32) {
-        // SAFETY: the caller guarantees the mapping covers the geometry, and
-        // `_mapping` below keeps it alive for as long as the canvas.
+        // SAFETY: as the caller guarantees; `_mapping` keeps it alive.
         let canvas = unsafe { Canvas::from_raw(mapping.base() as *mut u8, width, height, pitch) };
         self._mapping = mapping;
         self._vmo = vmo;
@@ -197,21 +168,14 @@ impl Screen {
     }
 }
 
-/// Ask the compositor for a window and map the memory object it replies with.
 fn create_surface(wm: &Channel, title: &str) -> Option<Screen> {
-    let request = proto::Encoded::new(proto::WmCreateSurface {
-        width: WANTED_WIDTH,
-        height: WANTED_HEIGHT,
-        flags: 0,
-        _reserved: 0,
-    });
-    // The title follows the struct as UTF-8; the compositor reads whatever is
-    // left of the payload.
+    // The display shows one full-screen surface at a time and grants the
+    // whole screen; the size asked for is only a preference.
+    let request = proto::Encoded::new(proto::WmCreateSurface { width: 1024, height: 768, flags: 0, _reserved: 0 });
     let mut payload = Vec::from(request.bytes());
     payload.extend_from_slice(title.as_bytes());
-
     let Ok(mut reply) = wm.call(Message::new(proto::WM_CREATE_SURFACE).with_payload(&payload)) else {
-        println!("edit: the compositor refused a surface; exiting");
+        println!("edit: the display refused a surface; exiting");
         return None;
     };
     if reply.flags.contains(MessageFlags::ERROR) || reply.handles.is_empty() {
@@ -219,10 +183,7 @@ fn create_surface(wm: &Channel, title: &str) -> Option<Screen> {
         return None;
     }
     let info = proto::decode::<proto::WmSurfaceInfo>(&reply.payload)?;
-
     let vmo = Vmo::from_handle(reply.handles.remove(0), info.size);
-    // Eagerly and shared: the compositor holds the other mapping of these
-    // pages and reads them whenever this process commits.
     let Ok(mapping) = vmo.map(
         0,
         info.size,
@@ -232,18 +193,13 @@ fn create_surface(wm: &Channel, title: &str) -> Option<Screen> {
         println!("edit: failed to map the surface; exiting");
         return None;
     };
-
-    // SAFETY: the mapping covers the whole object, whose size the compositor
-    // reported, and nothing else here maps it.
-    Some(unsafe { Screen::new(vmo, mapping, &info) })
+    // SAFETY: the mapping covers the object the display sized for this
+    // geometry, and nothing else here maps it.
+    let canvas = unsafe { Canvas::from_raw(mapping.base() as *mut u8, info.width, info.height, info.pitch) };
+    Some(Screen { _vmo: vmo, _mapping: mapping, canvas, id: info.surface })
 }
 
-/// Publish the whole window and wait for the compositor to acknowledge it.
-///
-/// The editor redraws everything on every change, so the damaged rectangle is
-/// always the whole surface. That would be wasteful for a frame loop, but a
-/// keystroke is rare and the round trip is what paces the client; tracking a
-/// smaller rectangle would buy nothing.
+/// Publish the whole surface and wait for the display to take it.
 fn commit(screen: &Screen, wm: &Channel) {
     let damage = proto::Encoded::new(proto::WmDamage {
         surface: screen.id,
@@ -253,467 +209,745 @@ fn commit(screen: &Screen, wm: &Channel) {
         h: screen.canvas.height(),
         _reserved: 0,
     });
-    // A small reply buffer, not the 4 KiB default: this runs once per redraw,
-    // and the runtime allocator never reclaims a block that large.
     let _ = wm.call_with(Message::new(proto::WM_COMMIT).with_payload(damage.bytes()), 64, 1);
 }
 
 // ---------------------------------------------------------------------------
-// Rendering
+// The editor
 // ---------------------------------------------------------------------------
 
-/// Repaint the whole window from `editor`.
-fn render(screen: &mut Screen, editor: &mut Editor, wm: &Channel) {
-    editor.clamp();
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromptKind {
+    Find,
+    ReplaceFind,
+    ReplaceWith,
+    Goto,
+    Open,
+    SaveAs,
+}
 
-    let canvas = &mut screen.canvas;
-    let width = canvas.width();
-    let rows = canvas.rows();
-    let cols = canvas.cols();
+struct Prompt {
+    kind: PromptKind,
+    text: String,
+}
 
-    canvas.clear(BACKGROUND);
+struct App {
+    files: Channel,
+    cwd: String,
+    tabs: Vec<Buffer>,
+    current: usize,
+    clipboard: String,
+    prompt: Option<Prompt>,
+    /// The last search, for F3 and for highlighting matches.
+    search: String,
+    /// What a replace prompt is replacing, between its two questions.
+    replacing: String,
+    message: Option<(String, bool)>,
+    font: TerminalFont,
+    help: bool,
+    /// A destructive key pressed once with unsaved changes, waiting for a
+    /// second press to confirm: Ctrl+Q or Ctrl+W.
+    armed: Option<u8>,
+    /// Text rows and columns in the last drawn layout, for paging and scrolling.
+    view_rows: usize,
+    view_cols: usize,
+}
 
-    // A surface too small to hold even one glyph has nothing sensible to draw;
-    // the overflow checks are on, so subtracting first would panic rather than
-    // wrap.
-    if rows == 0 || cols == 0 {
-        commit(screen, wm);
-        return;
-    }
-
-    // The last row is the status bar; every row above it shows a line of text.
-    let visible = rows as usize - 1;
-
-    // Scroll the view so the cursor's row is on screen. The two comparisons are
-    // deliberately separate: the first scrolls up when the cursor moved above
-    // the view, the second scrolls down when it moved below.
-    if visible > 0 {
-        if editor.row < editor.scroll {
-            editor.scroll = editor.row;
-        } else if editor.row >= editor.scroll + visible {
-            editor.scroll = editor.row + 1 - visible;
+impl App {
+    fn new(files: Channel, cwd: String) -> Self {
+        Self {
+            files,
+            cwd,
+            tabs: Vec::new(),
+            current: 0,
+            clipboard: String::new(),
+            prompt: None,
+            search: String::new(),
+            replacing: String::new(),
+            message: None,
+            font: TerminalFont::Normal,
+            help: false,
+            armed: None,
+            view_rows: 30,
+            view_cols: 80,
         }
-    } else {
-        editor.scroll = editor.row;
     }
 
-    // Draw the visible lines. `draw_text` handles the row's pixels and stops
-    // at the right edge.
-    let mut y = 0u32;
-    for line_index in editor.scroll..editor.lines.len() {
-        if y / CELL >= visible as u32 {
-            break;
+    fn tab(&mut self) -> &mut Buffer {
+        &mut self.tabs[self.current]
+    }
+
+    fn notice(&mut self, text: String) {
+        self.message = Some((text, false));
+    }
+
+    fn error(&mut self, text: String) {
+        self.message = Some((text, true));
+    }
+
+    /// Open `path` in a tab, or switch to the tab already showing it.
+    fn open(&mut self, path: &str) {
+        let path = resolve(&self.cwd, path);
+        if let Some(index) = self.tabs.iter().position(|t| t.path.eq_ignore_ascii_case(&path)) {
+            self.current = index;
+            return;
         }
-        draw_text(canvas, y, &editor.lines[line_index], FOREGROUND, BACKGROUND);
-        y += CELL;
+        match load(&self.files, &path) {
+            Ok(Some(bytes)) => {
+                let text = String::from_utf8_lossy(&bytes);
+                self.tabs.push(Buffer::new(path.clone(), &text));
+                self.current = self.tabs.len() - 1;
+                self.notice(format!("Opened {path}"));
+            }
+            Ok(None) => {
+                self.tabs.push(Buffer::new(path.clone(), ""));
+                self.current = self.tabs.len() - 1;
+                self.notice(format!("New file {path}; Ctrl+S creates it"));
+            }
+            Err(error) => self.error(format!("Cannot open {path}: {}", error.message())),
+        }
     }
 
-    // The cursor: the character under it drawn in the swapped colours, which
-    // is legible on both a blank cell and a filled one.
-    if visible > 0 && editor.row >= editor.scroll {
-        let cursor_row = editor.row - editor.scroll;
-        let x = editor.col as u32 * CELL;
-        if cursor_row < visible && x + CELL <= width {
-            let cell = editor.lines[editor.row].chars().nth(editor.col);
-            match cell {
-                Some(ch) if (ch as u32) < 0x80 => {
-                    canvas.draw_glyph_at(x, cursor_row as u32 * CELL, ch as u8, BACKGROUND, Some(FOREGROUND));
-                }
-                // Past a wide or non-ASCII character, or on the end of the
-                // line, a solid block is the honest cursor.
-                _ => canvas.fill_rect(x, cursor_row as u32 * CELL, CELL, CELL, FOREGROUND),
+    fn save(&mut self) {
+        if self.tab().path.is_empty() {
+            self.prompt = Some(Prompt { kind: PromptKind::SaveAs, text: self.cwd_prefix() });
+            return;
+        }
+        let path = self.tab().path.clone();
+        let text = self.tab().text();
+        match save(&self.files, &path, text.as_bytes()) {
+            Ok(()) => {
+                self.tab().dirty = false;
+                println!("edit: saved {} bytes to {}", text.len(), path);
+                self.notice(format!("Saved {} bytes to {path}", text.len()));
+            }
+            Err(error) => {
+                println!("edit: could not save {path} ({error:?})");
+                let hint = if error == Error::InvalidArgument { " (new names must fit 8.3)" } else { "" };
+                self.error(format!("Could not save {path}: {}{hint}", error.message()));
             }
         }
     }
 
-    // The status line, on its own bar, reports the file and cursor and reminds
-    // the user of the two shortcuts that are not obvious from the text.
-    let status_y = (rows - 1) * CELL;
-    canvas.fill_rect(0, status_y, width, CELL, STATUS_BACKGROUND);
-    let status = alloc::format!(
-        "{}{}  {}:{}  Ctrl+S save  Ctrl+Q quit",
-        editor.path,
-        if editor.dirty { "*" } else { "" },
-        editor.row + 1,
-        editor.col + 1,
-    );
-    draw_text(canvas, status_y, &status, FOREGROUND, STATUS_BACKGROUND);
-
-    commit(screen, wm);
-}
-
-/// Draw a string one character per cell, stopping at the right edge.
-///
-/// `Canvas::draw_text_at` walks bytes, but the cursor column counts characters:
-/// for the ASCII this editor writes the two agree, and for anything else this
-/// keeps them in step.
-fn draw_text(canvas: &mut Canvas, y: u32, text: &str, fg: Rgb, bg: Rgb) {
-    let width = canvas.width();
-    let mut x = 0u32;
-    for ch in text.chars() {
-        if x + CELL > width {
-            break;
-        }
-        let byte = if (ch as u32) < 0x80 { ch as u8 } else { b'?' };
-        canvas.draw_glyph_at(x, y, byte, fg, Some(bg));
-        x += CELL;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The buffer
-// ---------------------------------------------------------------------------
-
-/// The document and where the caret is in it.
-struct Editor {
-    /// Always at least one line, so `lines[row]` is a valid expression.
-    lines: Vec<String>,
-    /// Cursor row, an index into `lines`.
-    row: usize,
-    /// Cursor column, counted in characters rather than bytes.
-    col: usize,
-    /// First visible line; the view scrolls by whole lines.
-    scroll: usize,
-    dirty: bool,
-    path: String,
-}
-
-impl Editor {
-    fn new(path: String) -> Self {
-        Self { lines: alloc::vec![String::new()], row: 0, col: 0, scroll: 0, dirty: false, path }
+    fn cwd_prefix(&self) -> String {
+        if self.cwd == "/" { String::from("/") } else { format!("{}/", self.cwd) }
     }
 
-    /// Restore every invariant a cursor operation relies on.
-    fn clamp(&mut self) {
-        if self.lines.is_empty() {
-            self.lines.push(String::new());
-        }
-        if self.row >= self.lines.len() {
-            self.row = self.lines.len() - 1;
-        }
-        let len = self.lines[self.row].chars().count();
-        if self.col > len {
-            self.col = len;
+    fn find_next(&mut self, backwards: bool) {
+        let needle = self.search.clone();
+        let tab = &mut self.tabs[self.current];
+        let from = if backwards {
+            tab.selection().map(|(s, _)| s).unwrap_or(tab.cursor)
+        } else {
+            tab.selection().map(|(_, e)| e).unwrap_or(tab.cursor)
+        };
+        match tab.find(&needle, from, backwards) {
+            Some((start, end)) => {
+                tab.jump(start, false);
+                tab.jump(end, true);
+            }
+            None if !needle.is_empty() => self.error(format!("No match for \"{needle}\"")),
+            None => {}
         }
     }
 
-    /// Characters in the cursor's line.
-    fn line_len(&self) -> usize {
-        self.lines.get(self.row).map(|line| line.chars().count()).unwrap_or(0)
-    }
-
-    fn move_left(&mut self) {
-        if self.col > 0 {
-            self.col -= 1;
-        } else if self.row > 0 {
-            // Moving off the start of a line lands on the end of the one above.
-            self.row -= 1;
-            self.col = self.line_len();
+    /// Handle one key press. Returns false to quit.
+    fn key(&mut self, event: &proto::WmEvent) -> bool {
+        let ctrl = event.modifiers & wm_mod::CTRL != 0;
+        let shift = event.modifiers & wm_mod::SHIFT != 0;
+        let alt = event.modifiers & wm_mod::ALT != 0;
+        let code = event.scancode;
+        let ext = event.extended != 0;
+        let ascii = event.ascii;
+        self.message = None;
+        if self.help {
+            self.help = false;
+            return true;
         }
-    }
+        let armed = self.armed.take();
 
-    fn move_right(&mut self) {
-        if self.col < self.line_len() {
-            self.col += 1;
-        } else if self.row + 1 < self.lines.len() {
-            self.row += 1;
-            self.col = 0;
+        if self.prompt.is_some() {
+            self.prompt_key(event);
+            return true;
         }
-    }
 
-    fn move_up(&mut self) {
-        if self.row > 0 {
-            self.row -= 1;
-            self.col = self.col.min(self.line_len());
+        if ext {
+            let page = self.view_rows.max(1) as isize;
+            let tab = self.tab();
+            match code {
+                0x48 => tab.vertical(-1, shift),
+                0x50 => tab.vertical(1, shift),
+                0x4B => tab.left(shift, ctrl),
+                0x4D => tab.right(shift, ctrl),
+                0x47 if ctrl => tab.jump(Pos::new(0, 0), shift),
+                0x4F if ctrl => {
+                    let last = tab.lines.len() - 1;
+                    let len = tab.line_len(last);
+                    tab.jump(Pos::new(last, len), shift)
+                }
+                0x47 => tab.home(shift),
+                0x4F => tab.end(shift),
+                0x49 if ctrl => self.switch(-1),
+                0x51 if ctrl => self.switch(1),
+                0x49 => {
+                    tab.vertical(-page, shift);
+                    tab.top = tab.top.saturating_sub(page as usize);
+                }
+                0x51 => {
+                    tab.vertical(page, shift);
+                    tab.top += page as usize;
+                    let max = tab.lines.len().saturating_sub(1);
+                    tab.top = tab.top.min(max);
+                }
+                0x53 => tab.delete(),
+                _ => {}
+            }
+            return true;
         }
-    }
 
-    fn move_down(&mut self) {
-        if self.row + 1 < self.lines.len() {
-            self.row += 1;
-            self.col = self.col.min(self.line_len());
-        }
-    }
-
-    fn home(&mut self) {
-        self.col = 0;
-    }
-
-    fn end(&mut self) {
-        self.col = self.line_len();
-    }
-
-    /// Split the cursor's line at the cursor.
-    fn newline(&mut self) {
-        let at = char_byte_index(&self.lines[self.row], self.col);
-        let tail = self.lines[self.row].split_off(at);
-        self.lines.insert(self.row + 1, tail);
-        self.row += 1;
-        self.col = 0;
-        self.dirty = true;
-    }
-
-    /// Erase the character before the cursor, joining lines at a line start.
-    fn backspace(&mut self) {
-        if self.col > 0 {
-            let at = char_byte_index(&self.lines[self.row], self.col - 1);
-            self.lines[self.row].remove(at);
-            self.col -= 1;
-            self.dirty = true;
-        } else if self.row > 0 {
-            let current = self.lines.remove(self.row);
-            self.row -= 1;
-            self.col = self.line_len();
-            self.lines[self.row].push_str(&current);
-            self.dirty = true;
-        }
-    }
-
-    /// Erase the character under the cursor, joining lines at a line end.
-    fn delete_forward(&mut self) {
-        if self.col < self.line_len() {
-            let at = char_byte_index(&self.lines[self.row], self.col);
-            self.lines[self.row].remove(at);
-            self.dirty = true;
-        } else if self.row + 1 < self.lines.len() {
-            let next = self.lines.remove(self.row + 1);
-            self.lines[self.row].push_str(&next);
-            self.dirty = true;
-        }
-    }
-
-    fn insert_char(&mut self, ch: char) {
-        let at = char_byte_index(&self.lines[self.row], self.col);
-        self.lines[self.row].insert(at, ch);
-        self.col += 1;
-        self.dirty = true;
-    }
-
-    fn insert_tab(&mut self) {
-        for _ in 0..TAB_WIDTH {
-            self.insert_char(' ');
-        }
-    }
-}
-
-/// Byte offset of character `col` in `line`, or the line's end if it is
-/// shorter. The returned offset always lies on a character boundary, so it is
-/// safe to hand to `String::insert`, `remove` and `split_off`.
-fn char_byte_index(line: &str, col: usize) -> usize {
-    line.char_indices().nth(col).map(|(index, _)| index).unwrap_or(line.len())
-}
-
-// ---------------------------------------------------------------------------
-// Input
-// ---------------------------------------------------------------------------
-
-/// Act on one key press. The cursor is clamped by the operations themselves and
-/// again before the next render.
-fn on_key(editor: &mut Editor, event: &proto::WmEvent, files: &Channel) {
-    // The arrow cluster and its neighbours arrive `0xE0`-prefixed and carry no
-    // decoded character, so their scancodes are the only signal there is.
-    if event.extended != 0 {
-        match event.scancode {
-            0x48 => editor.move_up(),
-            0x50 => editor.move_down(),
-            0x4B => editor.move_left(),
-            0x4D => editor.move_right(),
-            0x47 => editor.home(),
-            0x4F => editor.end(),
-            0x53 => editor.delete_forward(),
+        match code {
+            0x3B => {
+                self.help = true;
+                return true;
+            }
+            0x3D => {
+                self.find_next(shift);
+                return true;
+            }
+            0x01 => {
+                self.tab().anchor = None;
+                return true;
+            }
+            0x0F if ctrl => {
+                self.switch(if shift { -1 } else { 1 });
+                return true;
+            }
             _ => {}
         }
-        return;
+
+        if alt && (b'1'..=b'9').contains(&ascii) {
+            let index = (ascii - b'1') as usize;
+            if index < self.tabs.len() {
+                self.current = index;
+            }
+            return true;
+        }
+
+        if ctrl {
+            let letter = ascii.to_ascii_lowercase();
+            match letter {
+                b's' if shift || ascii == b'S' => {
+                    let path = if self.tab().path.is_empty() { self.cwd_prefix() } else { self.tab().path.clone() };
+                    self.prompt = Some(Prompt { kind: PromptKind::SaveAs, text: path });
+                }
+                b's' | 0x13 => self.save(),
+                b'q' | 0x11 => {
+                    if self.tabs.iter().any(|t| t.dirty) && armed != Some(b'q') {
+                        self.armed = Some(b'q');
+                        self.error(String::from("Unsaved changes. Press Ctrl+Q again to quit without saving."));
+                    } else {
+                        return false;
+                    }
+                }
+                b'w' => {
+                    if self.tab().dirty && armed != Some(b'w') {
+                        self.armed = Some(b'w');
+                        self.error(String::from("Unsaved changes. Press Ctrl+W again to close without saving."));
+                    } else {
+                        self.tabs.remove(self.current);
+                        if self.tabs.is_empty() {
+                            return false;
+                        }
+                        self.current = self.current.min(self.tabs.len() - 1);
+                    }
+                }
+                b'n' => {
+                    self.tabs.push(Buffer::new(String::new(), ""));
+                    self.current = self.tabs.len() - 1;
+                }
+                b'o' => self.prompt = Some(Prompt { kind: PromptKind::Open, text: self.cwd_prefix() }),
+                b'f' => {
+                    let seed = self.tab().selected_text().filter(|t| !t.contains('\n')).unwrap_or_default();
+                    self.prompt = Some(Prompt { kind: PromptKind::Find, text: seed });
+                }
+                b'h' | b'r' => {
+                    let seed = self.tab().selected_text().filter(|t| !t.contains('\n')).unwrap_or_default();
+                    self.prompt = Some(Prompt { kind: PromptKind::ReplaceFind, text: seed });
+                }
+                b'g' => self.prompt = Some(Prompt { kind: PromptKind::Goto, text: String::new() }),
+                b'z' if shift || ascii == b'Z' => {
+                    self.tab().redo();
+                }
+                b'z' => {
+                    if !self.tab().undo() {
+                        self.notice(String::from("Nothing to undo"));
+                    }
+                }
+                b'y' => {
+                    if !self.tab().redo() {
+                        self.notice(String::from("Nothing to redo"));
+                    }
+                }
+                b'a' => self.tab().select_all(),
+                b'c' => {
+                    let text = match self.tab().selected_text() {
+                        Some(text) => text,
+                        None => {
+                            let line = self.tab().cursor.line;
+                            format!("{}\n", self.tab().lines[line])
+                        }
+                    };
+                    self.clipboard = text;
+                }
+                b'x' => {
+                    self.clipboard = match self.tab().cut() {
+                        Some(text) => text,
+                        None => self.tab().cut_line(),
+                    };
+                }
+                b'v' => {
+                    let text = self.clipboard.clone();
+                    self.tab().insert(&text);
+                }
+                b'd' => self.tab().duplicate_line(),
+                b'/' => self.tab().toggle_comment(),
+                b'=' | b'+' => self.resize(1),
+                b'-' => self.resize(-1),
+                _ => {}
+            }
+            return true;
+        }
+
+        let tab = self.tab();
+        match code {
+            0x1C => tab.newline(),
+            0x0E => tab.backspace(),
+            0x0F => tab.tab(shift),
+            _ => match ascii {
+                b'\n' => tab.newline(),
+                0x08 => tab.backspace(),
+                b'\t' => tab.tab(shift),
+                0x20..=0x7e => tab.type_char(ascii as char),
+                _ => {}
+            },
+        }
+        true
     }
 
-    // The compositor does not fold Ctrl into a control character: a Ctrl+S
-    // arrives as `'s'` with the CTRL modifier set. Accept both spellings so the
-    // editor works whether the key arrived from this compositor or a terminal
-    // that did fold it.
-    if event.modifiers & proto::wm_mod::CTRL != 0 {
-        match event.ascii {
-            b's' | 0x13 => {
-                save(editor, files);
-                return;
+    fn switch(&mut self, by: isize) {
+        let count = self.tabs.len() as isize;
+        self.current = ((self.current as isize + by).rem_euclid(count)) as usize;
+    }
+
+    fn resize(&mut self, by: i32) {
+        self.font = match (self.font, by) {
+            (TerminalFont::Small, 1) => TerminalFont::Normal,
+            (TerminalFont::Normal, 1) | (TerminalFont::Large, 1) => TerminalFont::Large,
+            (TerminalFont::Large, -1) => TerminalFont::Normal,
+            _ => TerminalFont::Small,
+        };
+    }
+
+    fn prompt_key(&mut self, event: &proto::WmEvent) {
+        let Some(mut prompt) = self.prompt.take() else { return };
+        let shift = event.modifiers & wm_mod::SHIFT != 0;
+        let ext = event.extended != 0;
+        let enter = !ext && (event.scancode == 0x1C || event.ascii == b'\n');
+        if !ext && event.scancode == 0x01 {
+            return; // Esc: the prompt is gone
+        }
+        if ext && prompt.kind == PromptKind::Find && matches!(event.scancode, 0x48 | 0x50) {
+            self.find_next(event.scancode == 0x48);
+            self.prompt = Some(prompt);
+            return;
+        }
+        if !ext && event.scancode == 0x3D && prompt.kind == PromptKind::Find {
+            self.find_next(shift);
+            self.prompt = Some(prompt);
+            return;
+        }
+        if !ext && (event.scancode == 0x0E || event.ascii == 0x08) {
+            prompt.text.pop();
+        } else if enter {
+            self.accept(prompt, shift);
+            return;
+        } else if !ext && event.modifiers & wm_mod::CTRL == 0 && (0x20..=0x7e).contains(&event.ascii) {
+            prompt.text.push(event.ascii as char);
+        }
+        if prompt.kind == PromptKind::Find {
+            // Search as you type, from where the search began.
+            self.search = prompt.text.clone();
+            let tab = &mut self.tabs[self.current];
+            let from = tab.selection().map(|(s, _)| s).unwrap_or(tab.cursor);
+            if let Some((start, end)) = tab.find(&prompt.text, from, false) {
+                tab.jump(start, false);
+                tab.jump(end, true);
             }
-            b'q' | 0x11 => libnode::exit(0),
-            _ => return,
+        }
+        self.prompt = Some(prompt);
+    }
+
+    fn accept(&mut self, prompt: Prompt, shift: bool) {
+        let text = prompt.text.trim().into();
+        match prompt.kind {
+            PromptKind::Find => {
+                self.search = text;
+                self.find_next(shift);
+                // Enter repeats the search with the prompt still open.
+                self.prompt = Some(prompt);
+            }
+            PromptKind::ReplaceFind if !text.is_empty() => {
+                self.replacing = text;
+                self.prompt = Some(Prompt { kind: PromptKind::ReplaceWith, text: String::new() });
+            }
+            PromptKind::ReplaceFind => {}
+            PromptKind::ReplaceWith => {
+                let needle = self.replacing.clone();
+                let count = self.tab().replace_all(&needle, &prompt.text);
+                self.notice(format!("Replaced {count} occurrence(s) of \"{needle}\""));
+            }
+            PromptKind::Goto => match text.parse::<usize>() {
+                Ok(line) if line > 0 => {
+                    let half = self.view_rows / 2;
+                    let tab = self.tab();
+                    let line = (line - 1).min(tab.lines.len() - 1);
+                    tab.jump(Pos::new(line, 0), false);
+                    tab.top = line.saturating_sub(half);
+                }
+                _ => self.error(format!("\"{text}\" is not a line number")),
+            },
+            PromptKind::Open if !text.is_empty() => self.open(&text),
+            PromptKind::Open => {}
+            PromptKind::SaveAs if !text.is_empty() => {
+                let path = resolve(&self.cwd, &text);
+                let tab = self.tab();
+                tab.path = path;
+                tab.lang = highlight::Lang::for_path(&tab.path);
+                self.save();
+            }
+            PromptKind::SaveAs => {}
         }
     }
 
-    // Escape, Enter and Backspace can arrive with no decoded character if the
-    // keymap did not produce one; their make codes are the reliable fallback.
-    if event.scancode == 0x01 {
-        libnode::exit(0);
-    }
-    if event.scancode == 0x1C {
-        editor.newline();
-        return;
-    }
-    if event.scancode == 0x0E {
-        editor.backspace();
-        return;
-    }
+    // -----------------------------------------------------------------------
+    // Drawing
 
-    match event.ascii {
-        b'\n' => editor.newline(),
-        b'\x08' => editor.backspace(),
-        b'\t' => editor.insert_tab(),
-        0x20..=0x7e => editor.insert_char(event.ascii as char),
-        _ => {}
+    fn render(&mut self, screen: &mut Screen, wm: &Channel) {
+        let font = self.font;
+        let canvas = &mut screen.canvas;
+        canvas.clear(BACKGROUND);
+        let (cols, rows) = font.geometry(canvas);
+        let (cols, rows) = (cols as usize, rows as usize);
+        if cols < 20 || rows < 4 {
+            commit(screen, wm);
+            return;
+        }
+        let mut painter = Painter { canvas, font };
+        let text_rows = rows - 2;
+        let tab_index = self.current;
+        let line_count = self.tabs[tab_index].lines.len();
+        let gutter = digits(line_count).max(3) + 2;
+        let text_cols = cols - gutter;
+        self.view_rows = text_rows;
+        self.view_cols = text_cols;
+
+        // Tab bar.
+        painter.fill(0, 0, cols, BAR);
+        let mut x = 0;
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let name = if tab.path.is_empty() { "untitled" } else { tab.path.rsplit('/').next().unwrap_or("") };
+            let label = format!(" {}{} ", name, if tab.dirty { "*" } else { "" });
+            let (fg, bg) = if index == tab_index { (FOREGROUND, BACKGROUND) } else { (TAB_INACTIVE, BAR) };
+            if x + label.len() > cols {
+                break;
+            }
+            painter.text(x, 0, &label, fg, bg);
+            x += label.len() + 1;
+        }
+
+        // Text.
+        let search = self.search.to_lowercase();
+        let show_matches = !search.is_empty();
+        let tab = &mut self.tabs[tab_index];
+        tab.reveal(text_rows, text_cols);
+        let selection = tab.selection();
+        let brackets = tab.matching_bracket();
+        let mut state = State::default();
+        for line in 0..tab.top.min(tab.lines.len()) {
+            highlight::classify(tab.lang, &tab.lines[line], &mut state);
+        }
+        for row in 0..text_rows {
+            let line = tab.top + row;
+            let y = row + 1;
+            let current = line == tab.cursor.line;
+            let base = if current && selection.is_none() { CURRENT_LINE } else { BACKGROUND };
+            if line >= tab.lines.len() {
+                painter.text(0, y, &format!("{:>w$}", "~", w = gutter - 2), GUTTER, BACKGROUND);
+                continue;
+            }
+            let number = format!("{:>w$}  ", line + 1, w = gutter - 2);
+            painter.text(0, y, &number, if current { GUTTER_CURRENT } else { GUTTER }, base);
+            painter.fill(gutter, y, text_cols, base);
+            let text = &tab.lines[line];
+            let classes = highlight::classify(tab.lang, text, &mut state);
+            let chars: Vec<char> = text.chars().collect();
+            let lower: Vec<char> = if show_matches { text.to_lowercase().chars().collect() } else { Vec::new() };
+            let needle: Vec<char> = search.chars().collect();
+            for col in tab.left..chars.len().min(tab.left + text_cols) {
+                let here = Pos::new(line, col);
+                let mut bg = base;
+                if show_matches && lower.len() == chars.len() {
+                    let start = col.saturating_sub(needle.len() - 1);
+                    let hit = (start..=col).any(|s| s + needle.len() <= lower.len() && lower[s..s + needle.len()] == needle[..]);
+                    if hit {
+                        bg = MATCH;
+                    }
+                }
+                if brackets.is_some_and(|(a, b)| a == here || b == here) {
+                    bg = BRACKET;
+                }
+                if selection.is_some_and(|(s, e)| s <= here && here < e) {
+                    bg = SELECTION;
+                }
+                painter.cell(gutter + col - tab.left, y, chars[col], class_color(classes[col]), bg);
+            }
+            // A selection that continues past the end of the line.
+            if selection.is_some_and(|(s, e)| s <= Pos::new(line, chars.len()) && Pos::new(line, chars.len()) < e) {
+                let col = chars.len();
+                if col >= tab.left && col < tab.left + text_cols {
+                    painter.cell(gutter + col - tab.left, y, ' ', FOREGROUND, SELECTION);
+                }
+            }
+        }
+        // The cursor: the character under it in swapped colours.
+        if tab.cursor.line >= tab.top && tab.cursor.line < tab.top + text_rows && tab.cursor.col >= tab.left {
+            let x = gutter + tab.cursor.col - tab.left;
+            if x < cols {
+                let under = tab.char_at(tab.cursor).unwrap_or(' ');
+                painter.cell(x, tab.cursor.line - tab.top + 1, under, BACKGROUND, FOREGROUND);
+            }
+        }
+
+        // Status line, or the prompt that replaces it.
+        let y = rows - 1;
+        painter.fill(0, y, cols, STATUS);
+        if let Some(prompt) = &self.prompt {
+            let label = match prompt.kind {
+                PromptKind::Find => "Find (Enter/Down next, Up previous, Esc done): ",
+                PromptKind::ReplaceFind => "Replace: ",
+                PromptKind::ReplaceWith => "Replace with: ",
+                PromptKind::Goto => "Go to line: ",
+                PromptKind::Open => "Open file: ",
+                PromptKind::SaveAs => "Save as: ",
+            };
+            let shown = format!("{label}{}", prompt.text);
+            painter.text(0, y, &shown, NOTICE, STATUS);
+            painter.cell(shown.chars().count().min(cols - 1), y, ' ', STATUS, FOREGROUND);
+        } else {
+            let tab = &self.tabs[tab_index];
+            let right = format!(
+                "Ln {}, Col {}  {}  {} lines  F1 help ",
+                tab.cursor.line + 1,
+                tab.cursor.col + 1,
+                tab.lang.name(),
+                tab.lines.len()
+            );
+            let (left, color) = match &self.message {
+                Some((text, error)) => (text.clone(), if *error { ERROR } else { NOTICE }),
+                None => (
+                    format!(
+                        " {}{}",
+                        if tab.path.is_empty() { "untitled" } else { &tab.path },
+                        if tab.dirty { " (modified)" } else { "" }
+                    ),
+                    FOREGROUND,
+                ),
+            };
+            painter.text(0, y, &left, color, STATUS);
+            if right.len() + left.chars().count() < cols {
+                painter.text(cols - right.len(), y, &right, TAB_INACTIVE, STATUS);
+            }
+        }
+
+        if self.help {
+            draw_help(&mut painter, cols, rows);
+        }
+        commit(screen, wm);
     }
 }
 
+/// Cell drawing in the terminal font's grid.
+struct Painter<'a> {
+    canvas: &'a mut Canvas,
+    font: TerminalFont,
+}
+
+impl Painter<'_> {
+    fn cell(&mut self, col: usize, row: usize, c: char, fg: Rgb, bg: Rgb) {
+        if c == ' ' {
+            let (w, h) = self.font.metrics();
+            self.canvas.fill_rect(MARGIN + col as u32 * w, MARGIN + row as u32 * h, w, h, bg);
+            return;
+        }
+        let byte = if (c as u32) < 0x80 { c as u8 } else { b'?' };
+        self.font.draw(self.canvas, col as u32, row as u32, byte, fg, bg);
+    }
+
+    fn fill(&mut self, col: usize, row: usize, cells: usize, bg: Rgb) {
+        let (w, h) = self.font.metrics();
+        self.canvas.fill_rect(MARGIN + col as u32 * w, MARGIN + row as u32 * h, cells as u32 * w, h, bg);
+    }
+
+    fn text(&mut self, col: usize, row: usize, text: &str, fg: Rgb, bg: Rgb) {
+        for (index, c) in text.chars().enumerate() {
+            self.cell(col + index, row, c, fg, bg);
+        }
+    }
+}
+
+const HELP: &[&str] = &[
+    "edit -- keys",
+    "",
+    "Ctrl+S  save           Ctrl+Shift+S  save as     Ctrl+O  open file",
+    "Ctrl+N  new tab        Ctrl+W  close tab         Ctrl+Q  quit",
+    "Ctrl+Tab / Ctrl+PgDn   next tab    Alt+1..9  go to tab",
+    "",
+    "Ctrl+Z  undo           Ctrl+Y  redo              Ctrl+A  select all",
+    "Ctrl+X  cut (line)     Ctrl+C  copy (line)       Ctrl+V  paste",
+    "Ctrl+D  duplicate line Ctrl+/  toggle comment    Tab / Shift+Tab  indent",
+    "Shift+arrows  select   Ctrl+Left/Right  by word  Ctrl+Home/End  file ends",
+    "",
+    "Ctrl+F  find (F3 next, Shift+F3 previous)        Ctrl+H  replace all",
+    "Ctrl+G  go to line     Ctrl+= / Ctrl+-  text size",
+    "",
+    "Maylang, C, Lua and shell files are coloured by their extension.",
+    "Brackets and quotes close themselves; Enter keeps the indentation.",
+    "",
+    "Press any key to return.",
+];
+
+fn draw_help(painter: &mut Painter<'_>, cols: usize, rows: usize) {
+    let width = HELP.iter().map(|l| l.len()).max().unwrap_or(0) + 4;
+    let height = HELP.len() + 2;
+    if width > cols || height > rows {
+        return;
+    }
+    let left = (cols - width) / 2;
+    let top = (rows - height) / 2;
+    for row in 0..height {
+        painter.fill(left, top + row, width, STATUS);
+    }
+    for (index, line) in HELP.iter().enumerate() {
+        let color = if index == 0 { NOTICE } else { FOREGROUND };
+        painter.text(left + 2, top + 1 + index, line, color, STATUS);
+    }
+}
+
+fn digits(mut n: usize) -> usize {
+    let mut count = 1;
+    while n >= 10 {
+        n /= 10;
+        count += 1;
+    }
+    count
+}
+
+/// An absolute path for `input`, relative to `cwd`, with `.` and `..` resolved.
+fn resolve(cwd: &str, input: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    let base = if input.starts_with('/') { "" } else { cwd };
+    for part in base.split('/').chain(input.split('/')) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
 // ---------------------------------------------------------------------------
-// Filesystem, wrapped
+// Files
 // ---------------------------------------------------------------------------
 
-/// A `channel_call` that turns an error reply into an `Err`.
-///
-/// The service reports failure in the message flags with a status in the
-/// payload; this is the one place that translation happens.
-fn fs_call(files: &Channel, request: Message, reply_capacity: usize) -> Result<Message, Error> {
-    let reply = files.call_with(request, reply_capacity, 0)?;
+fn fs_call(files: &Channel, request: Message, capacity: usize) -> Result<Message, Error> {
+    let reply = files.call_with(request, capacity, 0)?;
     if reply.flags.contains(MessageFlags::ERROR) {
         return Err(proto::decode_error(&reply.payload).unwrap_or(Error::BadState));
     }
     Ok(reply)
 }
 
-fn fs_open(files: &Channel, path: &str) -> Result<proto::FsOpenReply, Error> {
-    let reply = fs_call(files, Message::new(proto::FS_OPEN).with_payload(path.as_bytes()), 1024)?;
-    proto::decode::<proto::FsOpenReply>(&reply.payload).ok_or(Error::BadState)
-}
-
-fn fs_create(files: &Channel, path: &str) -> Result<proto::FsOpenReply, Error> {
-    let reply = fs_call(files, Message::new(proto::FS_CREATE).with_payload(path.as_bytes()), 1024)?;
+fn fs_node(files: &Channel, kind: u32, path: &str) -> Result<proto::FsOpenReply, Error> {
+    let reply = fs_call(files, Message::new(kind).with_payload(path.as_bytes()), 256)?;
     proto::decode::<proto::FsOpenReply>(&reply.payload).ok_or(Error::BadState)
 }
 
 fn fs_close(files: &Channel, node: u64) {
     let request = proto::Encoded::new(proto::FsCloseRequest { node });
-    let _ = fs_call(files, Message::new(proto::FS_CLOSE).with_payload(request.bytes()), 256);
+    let _ = fs_call(files, Message::new(proto::FS_CLOSE).with_payload(request.bytes()), 64);
 }
 
-/// Write `data` at `offset`, returning how many bytes the service took (which
-/// is capped at 32 KiB per request).
-fn fs_write(files: &Channel, node: u64, offset: u64, data: &[u8]) -> Result<usize, Error> {
-    let header = proto::Encoded::new(proto::FsWriteHeader {
-        node,
-        offset,
-        length: data.len() as u32,
-        _reserved: 0,
-    });
-    let mut payload = Vec::with_capacity(core::mem::size_of::<proto::FsWriteHeader>() + data.len());
-    payload.extend_from_slice(header.bytes());
-    payload.extend_from_slice(data);
-    let reply = fs_call(files, Message::new(proto::FS_WRITE).with_payload(&payload), 256)?;
-    Ok(proto::decode::<proto::FsWriteHeader>(&reply.payload).map(|h| h.length as usize).unwrap_or(0))
-}
-
-/// Read the whole file, one service-capped chunk at a time. A file that cannot
-/// be opened (or read) yields the empty document rather than an error: the
-/// editor is a place to type, and a missing file is a normal way to start.
-fn load(files: &Channel, path: &str) -> Vec<String> {
-    let node = match fs_open(files, path) {
+/// The file's bytes, or `None` if it does not exist yet.
+fn load(files: &Channel, path: &str) -> Result<Option<Vec<u8>>, Error> {
+    let node = match fs_node(files, proto::FS_OPEN, path) {
         Ok(node) => node,
-        // Not there yet: start empty, and saving will create it.
-        Err(_) => return alloc::vec![String::new()],
+        Err(Error::NotFound) => return Ok(None),
+        Err(error) => return Err(error),
     };
-
-    let mut bytes = Vec::new();
-    let mut offset = 0u64;
-    loop {
-        let request = proto::Encoded::new(proto::FsReadRequest {
-            node: node.node,
-            offset,
-            length: READ_CHUNK as u32,
-            _reserved: 0,
-        });
-        // The reply carries the bytes inline, so its buffer is sized for a
-        // whole chunk plus its (absent) header.
-        let reply = match fs_call(files, Message::new(proto::FS_READ).with_payload(request.bytes()), READ_CHUNK + 64)
-        {
-            Ok(reply) => reply,
-            Err(_) => break,
-        };
-        if reply.payload.is_empty() {
-            break;
+    let result = (|| {
+        if node.kind != proto::fs_kind::FILE {
+            return Err(Error::InvalidArgument);
         }
-        offset += reply.payload.len() as u64;
-        bytes.extend_from_slice(&reply.payload);
-    }
-    fs_close(files, node.node);
-
-    split_lines(&bytes)
-}
-
-/// Split file bytes into lines, tolerating both endings.
-///
-/// A trailing newline leaves a final empty line, which is the line the cursor
-/// rests on at the end of a file -- and joining the lines with `\n` on save
-/// turns that empty element back into the trailing newline, so a round trip is
-/// byte-for-byte.
-fn split_lines(bytes: &[u8]) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    for raw in bytes.split(|byte| *byte == b'\n') {
-        // Files edited on another system may carry CRLF; the carriage return is
-        // not part of a NodeOS line.
-        let raw = if raw.last() == Some(&b'\r') { &raw[..raw.len() - 1] } else { raw };
-        lines.push(String::from_utf8_lossy(raw).into_owned());
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
-}
-
-/// Write the document back to its path, truncating whatever was there.
-///
-/// `FS_CREATE` truncates an existing file and creates a missing one, so a save
-/// never needs to know which case it is in.
-fn save(editor: &mut Editor, files: &Channel) {
-    let node = match fs_create(files, &editor.path) {
-        Ok(node) => node,
-        Err(error) => {
-            println!("edit: could not save {} ({error:?})", editor.path);
-            return;
+        if node.size as usize > MAX_FILE {
+            return Err(Error::LimitExceeded);
         }
-    };
-
-    let content = join_lines(&editor.lines);
-    let mut offset = 0u64;
-    let mut total = 0usize;
-    while (offset as usize) < content.len() {
-        let end = (offset as usize + WRITE_CHUNK).min(content.len());
-        match fs_write(files, node.node, offset, &content[offset as usize..end]) {
-            // A short write is not an error; the loop continues from where the
-            // service stopped. A zero-length one is, and would spin forever.
-            Ok(0) => break,
-            Ok(written) => {
-                offset += written as u64;
-                total += written;
-            }
-            Err(error) => {
-                println!("edit: write to {} failed ({error:?})", editor.path);
+        let mut bytes = Vec::with_capacity(node.size as usize);
+        while (bytes.len() as u64) < node.size {
+            let request = proto::Encoded::new(proto::FsReadRequest {
+                node: node.node,
+                offset: bytes.len() as u64,
+                length: CHUNK as u32,
+                _reserved: 0,
+            });
+            let reply = fs_call(files, Message::new(proto::FS_READ).with_payload(request.bytes()), CHUNK + 64)?;
+            if reply.payload.is_empty() {
                 break;
             }
+            bytes.extend_from_slice(&reply.payload);
         }
-    }
+        Ok(Some(bytes))
+    })();
     fs_close(files, node.node);
-
-    editor.dirty = false;
-    println!("edit: saved {} bytes to {}", total, editor.path);
+    result
 }
 
-/// The document as it should be written: lines joined by `\n`.
-fn join_lines(lines: &[String]) -> Vec<u8> {
-    let mut content = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
-        if index != 0 {
-            content.push(b'\n');
+/// Replace the file with `data`. `FS_CREATE` truncates an existing file.
+fn save(files: &Channel, path: &str, data: &[u8]) -> Result<(), Error> {
+    let node = fs_node(files, proto::FS_CREATE, path)?;
+    let result = (|| {
+        let mut offset = 0usize;
+        while offset < data.len() {
+            let chunk = &data[offset..(offset + CHUNK).min(data.len())];
+            let header = proto::Encoded::new(proto::FsWriteHeader {
+                node: node.node,
+                offset: offset as u64,
+                length: chunk.len() as u32,
+                _reserved: 0,
+            });
+            let mut payload = Vec::from(header.bytes());
+            payload.extend_from_slice(chunk);
+            let reply = fs_call(files, Message::new(proto::FS_WRITE).with_payload(&payload), 256)?;
+            let written = proto::decode::<proto::FsWriteHeader>(&reply.payload).map(|h| h.length as usize).unwrap_or(0);
+            if written == 0 {
+                return Err(Error::NoSpace);
+            }
+            offset += written;
         }
-        content.extend_from_slice(line.as_bytes());
-    }
-    content
+        Ok(())
+    })();
+    fs_close(files, node.node);
+    result
 }

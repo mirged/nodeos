@@ -46,6 +46,9 @@ struct Options {
 }
 
 fn run() -> Result<(), String> {
+    if let Some(path) = verify_request() {
+        return verify(&path);
+    }
     let options = parse_args()?;
     let bytes = std::fs::read(&options.input).map_err(|e| format!("cannot read {}: {e}", options.input.display()))?;
     let elf = elf::Elf::parse(&bytes)?;
@@ -73,6 +76,44 @@ fn run() -> Result<(), String> {
         parsed.header().segment_count,
         parsed.header().cap_count
     );
+    Ok(())
+}
+
+/// `nxfpack --verify <image.nxf>`: check an image that something other than
+/// nxfpack wrote (mayc emits NXF directly) with the loader's own parser.
+fn verify_request() -> Option<PathBuf> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.as_slice() {
+        [flag, path] if flag == "--verify" => Some(PathBuf::from(path)),
+        _ => None,
+    }
+}
+
+fn verify(path: &PathBuf) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let image = nxf::Image::parse(&bytes).map_err(|e| format!("{}: {e:?}", path.display()))?;
+    image.verify_checksum().map_err(|e| format!("{}: {e:?}", path.display()))?;
+    let header = image.header();
+    println!(
+        "nxfpack: {} is valid: name {:?}, entry {:#x}, base {:#x}, image {} KiB, checksum {:#010x}",
+        path.display(),
+        image.name(),
+        header.entry,
+        header.image_base,
+        header.image_size / 1024,
+        header.checksum
+    );
+    for segment in image.segments() {
+        println!(
+            "  segment kind {} flags {:#x} vaddr {:#x} size {:#x} file {:#x}",
+            segment.kind, segment.flags, segment.virt_addr, segment.mem_size, segment.file_offset
+        );
+    }
+    for cap in image.capabilities() {
+        println!("  capability class {} flags {}", cap.class, cap.flags);
+    }
+    let resources = image.resources();
+    println!("  stack {} KiB, max memory {} MiB", resources.stack_size / 1024, resources.max_memory_bytes >> 20);
     Ok(())
 }
 
@@ -205,6 +246,7 @@ nxfpack -- package a linked ELF as a NodeOS NXF image
 
 USAGE:
     nxfpack <input.elf> [-o <output.nxf>] [options]
+    nxfpack --verify <image.nxf>
 
 OPTIONS:
     --name <name>            image name (default: input file stem)

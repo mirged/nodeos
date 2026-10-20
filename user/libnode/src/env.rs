@@ -19,12 +19,19 @@ pub struct Env {
     info: BootstrapMessage,
     extras: Vec<Handle>,
     args: Vec<alloc::string::String>,
+    vars: Vec<alloc::string::String>,
 }
 
 impl Env {
     /// An environment with nothing in it.
     pub fn empty() -> Self {
-        Self { bootstrap: None, info: BootstrapMessage::default(), extras: Vec::new(), args: Vec::new() }
+        Self {
+            bootstrap: None,
+            info: BootstrapMessage::default(),
+            extras: Vec::new(),
+            args: Vec::new(),
+            vars: Vec::new(),
+        }
     }
 
     /// An environment with only a bootstrap channel.
@@ -34,6 +41,7 @@ impl Env {
             info: BootstrapMessage::default(),
             extras: Vec::new(),
             args: Vec::new(),
+            vars: Vec::new(),
         }
     }
 
@@ -44,7 +52,7 @@ impl Env {
         extras: Vec<Handle>,
         args: Vec<alloc::string::String>,
     ) -> Self {
-        Self { bootstrap: Some(channel), info, extras, args }
+        Self { bootstrap: Some(channel), info, extras, args, vars: Vec::new() }
     }
 
     /// Resize the heap to whatever the launcher asked for, now that the
@@ -110,5 +118,23 @@ impl Env {
     /// program was started without one.
     pub fn args(&self) -> &[alloc::string::String] {
         &self.args
+    }
+
+    /// The environment the launcher passed, as `NAME=value` strings. Empty
+    /// when it passed none.
+    pub fn vars(&self) -> &[alloc::string::String] {
+        &self.vars
+    }
+
+    /// The value of one environment variable.
+    pub fn var(&self, name: &str) -> Option<&str> {
+        self.vars.iter().find_map(|entry| {
+            let (key, value) = entry.split_once('=')?;
+            (key == name).then_some(value)
+        })
+    }
+
+    pub(crate) fn set_vars(&mut self, vars: Vec<alloc::string::String>) {
+        self.vars = vars;
     }
 }

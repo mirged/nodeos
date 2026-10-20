@@ -19,7 +19,7 @@ use libnode::{Channel, Message};
 const COMMANDS: &[&str] = &[
     "help", "pwd", "cd", "ls", "cat", "touch", "write", "append", "mkdir", "rm", "stat", "df",
     "fstest", "run", "echo", "clear", "about", "history", "source", "cp", "grep", "more", "uptime",
-    "font",
+    "font", "mv", "head", "tail", "wc", "find", "rmdir", "export", "unset", "set", "env", "true", "false",
 ];
 
 /// Read and edit one line, return it without the newline. Pushes non-empty

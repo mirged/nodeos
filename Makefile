@@ -16,16 +16,24 @@
 #   DOOM_WAD=/path...  package a different IWAD as /DOOM.WAD
 #   DISK_SIZE_MB=128   larger filesystem image
 #   AUDIODEV=none      keep the host quiet
+#   QEMU_ACCEL="-accel tcg"  run without KVM
 #
 # Linux programs (docs/MUSL.md) are built separately, because building them
 # fetches musl and Lua once: `make lx-apps` puts them in build/lx, and from
 # then on `make` copies them onto the disk as /bin/hello.nxf and /bin/lua.nxf.
+#
+# Maylang (docs/MAYLANG.md) comes from a sibling checkout the same way:
+# `make maylang` builds the compiler for NodeOS into build/maylang, and from
+# then on `make` puts /bin/mayc.nxf, its runtime and /stdlib on the disk.
 
 PROFILE      ?= release
 QEMU         ?= qemu-system-x86_64
 QEMU_MEM     ?= 512M
 QEMU_CPU     ?= qemu64,+pdpe1gb
 QEMU_SMP     ?= 1
+# Hardware virtualization where the host offers it; QEMU falls back to TCG
+# (full emulation) when /dev/kvm is missing or not accessible.
+QEMU_ACCEL   ?= -accel kvm -accel tcg
 
 BUILD        := build
 ISODIR       := $(BUILD)/iso
@@ -55,6 +63,10 @@ SYSROOT      := $(BUILD)/sysroot
 LX_DIR       := $(BUILD)/lx
 LIBLX        := $(LX_DIR)/liblx.a
 
+# Maylang: a checkout whose compiler targets x86_64-nodeos.
+MAYLANG      ?= ../maylang
+MAYLANG_DIR  := $(BUILD)/maylang
+
 # `-boot d` matters: the FAT image `make disk` builds has a boot signature of
 # its own, and the BIOS would boot it instead of the CD.
 QEMU_FLAGS   := -machine q35 -cpu $(QEMU_CPU) -smp $(QEMU_SMP) -m $(QEMU_MEM) \
@@ -63,8 +75,9 @@ QEMU_FLAGS   := -machine q35 -cpu $(QEMU_CPU) -smp $(QEMU_SMP) -m $(QEMU_MEM) \
                 -audiodev $(AUDIODEV_ARGS),id=snd0 -device AC97,audiodev=snd0 \
                 -drive file=$(DISK),if=virtio,format=raw
 
-.PHONY: all build kernel tools user modules iso disk run debug sysroot lx lx-apps \
+.PHONY: all build kernel tools user modules iso disk run debug sysroot lx lx-apps maylang \
         test test-fs test-apps test-cc test-edit test-audio test-shell test-shell-parser test-fat-read test-terminal test-doom-libc test-lua \
+        test-maylang test-maylang-selfhost test-shell-features test-editor \
         fmt clippy clean help
 
 # --- What you actually run --------------------------------------------------
@@ -73,7 +86,7 @@ all: build
 build: iso disk
 
 run: $(ISO) $(DISK)
-	$(QEMU) $(QEMU_FLAGS) -cdrom $(ISO) -serial stdio
+	$(QEMU) $(QEMU_ACCEL) $(QEMU_FLAGS) -cdrom $(ISO) -serial stdio
 
 # --- Build artifacts --------------------------------------------------------
 
@@ -149,6 +162,13 @@ lx: user
 lx-apps: sysroot lx tools
 	scripts/build-lx-apps.sh $(NXFPACK)
 
+# --- Maylang ------------------------------------------------------------------
+
+# The Maylang compiler built for NodeOS, its runtime, the standard library, the
+# compiler's own source and test programs, staged in build/maylang.
+maylang: tools
+	scripts/build-maylang.sh build $(NXFPACK) $(MAYLANG)
+
 # The interactive ISO: every module, and a GRUB menu whose default entry boots
 # the full-screen shell.
 iso: $(ISO)
@@ -194,6 +214,7 @@ $(DISK): modules README.md
 	  mcopy -i $(DISK) $(LX_DIR)/*.nxf ::/bin/; \
 	  echo "disk: packaged Linux programs: $$(cd $(LX_DIR) && echo *.nxf)"; \
 	fi
+	@if [ -f $(MAYLANG_DIR)/bin/mayc.nxf ]; then scripts/build-maylang.sh install $(DISK); fi
 	@if [ -f "$(DOOM_WAD)" ]; then \
 	  mcopy -i $(DISK) "$(DOOM_WAD)" ::/DOOM.WAD; \
 	  echo "disk: packaged $(DOOM_WAD) as /DOOM.WAD"; \
@@ -233,6 +254,18 @@ test-lua: lx-apps $(ISO) $(DISK)
 	mcopy -o -i $(DISK) $(LX_DIR)/*.nxf ::/bin/
 	@scripts/run-lua-test.sh
 
+# Maylang: a cross-compiled program, then mayc compiling and running programs
+# on NodeOS. Builds the compiler first, which bootstraps the Maylang checkout.
+test-maylang: maylang $(ISO) $(DISK)
+	scripts/build-maylang.sh install $(DISK)
+	@scripts/run-maylang-test.sh
+
+# The same, then mayc rebuilding itself on NodeOS from /src/mayc. The result
+# must be byte-identical to the compiler cross-built on the host.
+test-maylang-selfhost: maylang $(ISO) $(DISK)
+	scripts/build-maylang.sh install $(DISK)
+	@SELFHOST=1 scripts/run-maylang-test.sh
+
 # The text editor: type, save, and read the file back with mtools.
 test-edit: $(ISO) $(DISK)
 	@scripts/run-edit-test.sh
@@ -245,6 +278,18 @@ test-audio: $(ISO) $(DISK)
 # Shell workflows and fullscreen foreground applications, driven through QEMU.
 test-shell: $(ISO) $(DISK)
 	@python3 scripts/shell-test.py
+
+# The shell's variables, chaining, redirection and file commands, checked by
+# reading the disk back. Uses the Maylang test programs when they are staged.
+test-shell-features: maylang $(ISO) $(DISK)
+	scripts/build-maylang.sh install $(DISK)
+	@scripts/run-shell-features-test.sh
+
+# The editor's buffer, undo and syntax highlighting, on the host.
+test-editor:
+	@mkdir -p $(BUILD)
+	rustc --edition=2021 --test user/edit/src/units.rs -o $(BUILD)/editor-test
+	@$(BUILD)/editor-test
 
 test-shell-parser:
 	@mkdir -p $(BUILD)
@@ -298,10 +343,15 @@ help:
 	  '  make test-cc       Compile and run a C program with cc' \
 	  '  make test-lua      Run Lua 5.4 and a C program built against musl' \
 	  '  make lx-apps       Build the Linux programs (musl + liblx) into build/lx' \
+	  '  make maylang       Build the Maylang compiler for NodeOS into build/maylang' \
+	  '  make test-maylang  Run Maylang programs and the compiler on NodeOS' \
+	  '  make test-maylang-selfhost  Also rebuild the compiler on NodeOS itself' \
 	  '  make test-edit     Edit and save a file with the editor' \
 	  '  make test-audio    Check sound using QEMU'"'"'s wav backend' \
 	  '  make test-shell    Check shell workflows and fullscreen apps' \
-	  '  make test-shell-parser  Check quotes, escapes and scripts' \
+	  '  make test-shell-parser  Check quotes, escapes, variables and operators' \
+	  '  make test-shell-features  Check variables, &&/||, redirection, file commands' \
+	  '  make test-editor   Check the editor buffer and highlighting on the host' \
 	  '  make test-fat-read Check batched and fragmented disk reads' \
 	  '  make test-terminal Check cursor and bounded scrollback state' \
 	  '  make test-doom-libc  Run the Doom mini-libc host test' \
@@ -309,5 +359,5 @@ help:
 	  '  make clippy        Lint the kernel' \
 	  '  make clean         Remove build artifacts' \
 	  '' \
-	  'Overrides: PROFILE=debug QEMU_MEM=1G DOOM_WAD=/path/to/doom.wad' \
-	  '           DISK_SIZE_MB=128 AUDIODEV=none'
+	  'Overrides: PROFILE=debug QEMU_MEM=1G QEMU_ACCEL="-accel tcg" DOOM_WAD=/path/to/doom.wad' \
+	  '           DISK_SIZE_MB=128 AUDIODEV=none MAYLANG=../maylang'
