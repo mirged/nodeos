@@ -1,6 +1,6 @@
 //! Launch disk applications with session channels and a private display connection.
 
-use crate::abi::message::{BootstrapMessage, MessageFlags, KIND_BOOTSTRAP};
+use crate::abi::message::{bootstrap_flags, BootstrapMessage, MessageFlags, KIND_BOOTSTRAP, KIND_ENVIRONMENT};
 use crate::abi::proto;
 use crate::abi::{CapClass, Rights};
 use crate::mem::Vmo;
@@ -16,9 +16,10 @@ fn call(channel: &Channel, request: Message, capacity: usize) -> Result<Message,
     Ok(reply)
 }
 
-/// Start an NXF from `path`, passing arguments and the caller's session.
-/// Each child gets a private display connection so its input cannot be
-/// consumed by another application. Files and audio retain the session policy.
+/// Start an NXF from `path`, passing arguments, `NAME=value` environment
+/// strings and the caller's session. Each child gets a private display
+/// connection so its input cannot be consumed by another application. Files
+/// and audio retain the session policy.
 pub fn launch(
     console: &Channel,
     files: &Channel,
@@ -26,6 +27,7 @@ pub fn launch(
     audio: Option<&Channel>,
     path: &str,
     args: &[&str],
+    environment: &[&str],
 ) -> Result<Process, Error> {
     let mut bootstrap_size = core::mem::size_of::<BootstrapMessage>() + path.len() + 1;
     for arg in args {
@@ -115,7 +117,7 @@ pub fn launch(
         image_base: 0,
         heap_size: 16 * 1024 * 1024,
         extra_count: sources.iter().flatten().count() as u32,
-        _reserved: 0,
+        flags: if environment.is_empty() { 0 } else { bootstrap_flags::ENVIRONMENT },
     });
     let mut payload = Vec::from(info.bytes());
     for arg in core::iter::once(path).chain(args.iter().copied()) {
@@ -128,6 +130,17 @@ pub fn launch(
     }
     let (parent, child) = Channel::create()?;
     parent.send(message)?;
+    if !environment.is_empty() {
+        let mut vars = Vec::new();
+        for var in environment {
+            vars.extend_from_slice(var.as_bytes());
+            vars.push(0);
+        }
+        if vars.len() > crate::channel::DEFAULT_RECEIVE_CAPACITY * 16 {
+            return Err(Error::LimitExceeded);
+        }
+        parent.send(Message::new(KIND_ENVIRONMENT).with_payload(&vars))?;
+    }
     process.start(loaded.entry, loaded.stack, child.into_handle())?;
     Ok(process)
 }
