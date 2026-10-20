@@ -77,7 +77,7 @@ QEMU_FLAGS   := -machine q35 -cpu $(QEMU_CPU) -smp $(QEMU_SMP) -m $(QEMU_MEM) \
 
 .PHONY: all build kernel tools user modules iso disk run debug sysroot lx lx-apps maylang \
         test test-fs test-apps test-cc test-edit test-audio test-shell test-shell-parser test-fat-read test-terminal test-doom-libc test-lua \
-        test-maylang test-maylang-selfhost \
+        test-maylang test-maylang-selfhost test-shell-features test-editor \
         fmt clippy clean help
 
 # --- What you actually run --------------------------------------------------
@@ -279,6 +279,18 @@ test-audio: $(ISO) $(DISK)
 test-shell: $(ISO) $(DISK)
 	@python3 scripts/shell-test.py
 
+# The shell's variables, chaining, redirection and file commands, checked by
+# reading the disk back. Uses the Maylang test programs when they are staged.
+test-shell-features: maylang $(ISO) $(DISK)
+	scripts/build-maylang.sh install $(DISK)
+	@scripts/run-shell-features-test.sh
+
+# The editor's buffer, undo and syntax highlighting, on the host.
+test-editor:
+	@mkdir -p $(BUILD)
+	rustc --edition=2021 --test user/edit/src/units.rs -o $(BUILD)/editor-test
+	@$(BUILD)/editor-test
+
 test-shell-parser:
 	@mkdir -p $(BUILD)
 	rustc --edition=2021 --test user/shell/src/syntax.rs -o $(BUILD)/shell-parser-test
@@ -337,7 +349,9 @@ help:
 	  '  make test-edit     Edit and save a file with the editor' \
 	  '  make test-audio    Check sound using QEMU'"'"'s wav backend' \
 	  '  make test-shell    Check shell workflows and fullscreen apps' \
-	  '  make test-shell-parser  Check quotes, escapes and scripts' \
+	  '  make test-shell-parser  Check quotes, escapes, variables and operators' \
+	  '  make test-shell-features  Check variables, &&/||, redirection, file commands' \
+	  '  make test-editor   Check the editor buffer and highlighting on the host' \
 	  '  make test-fat-read Check batched and fragmented disk reads' \
 	  '  make test-terminal Check cursor and bounded scrollback state' \
 	  '  make test-doom-libc  Run the Doom mini-libc host test' \

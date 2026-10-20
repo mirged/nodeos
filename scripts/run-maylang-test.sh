@@ -6,6 +6,7 @@
 #   2. mayc on NodeOS compiling /tests/hello.may, then the result run;
 #   3. mayc on NodeOS compiling the smoke test, then the result run, which
 #      must print what the cross-compiled copy printed;
+#   then ten compiles in a row, which fail if exited programs keep memory;
 #   4. with SELFHOST=1, mayc rebuilding itself from /src/mayc on NodeOS, the
 #      new compiler compiling hello, and the compiler it built compared byte
 #      for byte with the one cross-built on the host.
@@ -161,6 +162,20 @@ if (( $(plain_log | grep -c "may: | smoke:") == 2 * smoke_lines )); then
 else
     echo "run-maylang-test: FAIL -- the smoke test built on NodeOS printed different output" >&2
     fail=1
+fi
+
+# Repeated compiles: each touches about 100 MiB, which the kernel must give
+# back when the compiler exits (it once kept it, and the tenth run in 1 GiB
+# faulted).
+for (( round = 1; round <= 10; round++ )); do
+    type_line "mayc /tests/hello.may -o /again.nxf"
+    wait_for_exit "mayc, compile ${round} of 10" 600
+done
+if plain_log | grep -q "fatal exception"; then
+    echo "run-maylang-test: FAIL -- a repeated compile faulted: memory was not released" >&2
+    fail=1
+else
+    echo "run-maylang-test: OK   ten compiles in one boot: exited programs release their memory"
 fi
 
 # 4. The compiler rebuilding itself.

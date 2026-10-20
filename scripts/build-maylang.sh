@@ -14,6 +14,7 @@
 #   /stdlib/               the standard library, found by walking up from mayc
 #   /src/mayc/             the compiler's own source, so it can rebuild itself
 #   /bin/maysmoke.nxf      user/maylang/tests/smoke.may, cross-compiled
+#   /bin/mayupper.nxf      user/maylang/tests/upper.may, which reads stdin
 #   /tests/*.may           programs for mayc to compile on NodeOS
 #
 # mayc emits NXF directly (--target x86_64-nodeos); nxfpack only checks each
@@ -37,7 +38,8 @@ build() {
     # builds on NodeOS, so the two can be compared byte for byte.
     "$mayc" --target x86_64-nodeos "$maylang/compiler/mayc/main.may" -o "$out/mayc2.nxf"
     "$mayc" --target x86_64-nodeos "$root/user/maylang/tests/smoke.may" -o "$out/bin/maysmoke.nxf"
-    for image in "$out/bin/mayc.nxf" "$out/mayc2.nxf" "$out/bin/maysmoke.nxf"; do
+    "$mayc" --target x86_64-nodeos "$root/user/maylang/tests/upper.may" -o "$out/bin/mayupper.nxf"
+    for image in "$out/bin/mayc.nxf" "$out/mayc2.nxf" "$out/bin/maysmoke.nxf" "$out/bin/mayupper.nxf"; do
         "$nxfpack" --verify "$image" | head -1
     done
 

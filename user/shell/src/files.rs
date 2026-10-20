@@ -13,6 +13,8 @@
 //! mtools, which is what makes it a test of the *filesystem* rather than a
 //! test of the service agreeing with itself.
 
+use alloc::collections::VecDeque;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -38,8 +40,8 @@ pub fn change_dir(console: &Channel, files: &Channel, cwd: &mut String, rest: &s
     ) {
         Ok(reply) => match proto::decode::<proto::FsStat>(&reply.payload) {
             Some(stat) if stat.kind == fs_kind::DIRECTORY => *cwd = path,
-            Some(_) => write_text(console, "cd: not a directory\n"),
-            None => write_text(console, "cd: malformed reply\n"),
+            Some(_) => crate::fail(console, "cd: not a directory\n"),
+            None => crate::fail(console, "cd: malformed reply\n"),
         },
         Err(error) => report(console, &path, error),
     }
@@ -73,6 +75,45 @@ pub fn resolve(cwd: &str, input: &str) -> String {
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
+
+/// The entries of a directory as (name, is directory, size), from one FS_LIST.
+fn entries(files: &Channel, path: &str) -> Result<Vec<(String, bool, u64)>, Error> {
+    let reply = call(files, Message::new(proto::FS_LIST).with_payload(path.as_bytes()))?;
+    Ok(reply
+        .payload
+        .split(|b| *b == 0)
+        .filter_map(|record| {
+            let text = core::str::from_utf8(record).ok()?;
+            let mut fields = text.split('\t');
+            let name = fields.next()?;
+            if name.is_empty() {
+                return None;
+            }
+            Some((
+                String::from(name),
+                fields.next() == Some("d"),
+                fields.next().unwrap_or("0").parse().unwrap_or(0),
+            ))
+        })
+        .collect())
+}
+
+/// `ls -l`: one entry per line, kind and exact size first, for reading and
+/// for redirecting into a file.
+fn list_long(console: &Channel, files: &Channel, path: &str) {
+    let mut found = match entries(files, path) {
+        Ok(found) => found,
+        Err(error) => return report(console, path, error),
+    };
+    found.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    for (name, dir, size) in &found {
+        if *dir {
+            write_text(console, &format!("d {:>10}  {}/\n", "-", name));
+        } else {
+            write_text(console, &format!("f {:>10}  {}\n", size, name));
+        }
+    }
+}
 
 fn list(console: &Channel, files: &Channel, path: &str) {
     let reply = match call(
@@ -394,7 +435,7 @@ fn find_name(payload: &[u8], name: &str) -> bool {
 /// The service reports failure in the message flags with a status in the
 /// payload, which is the right thing on the wire and the wrong thing to write
 /// at nine call sites.
-fn call(files: &Channel, request: Message) -> Result<Message, Error> {
+pub(crate) fn call(files: &Channel, request: Message) -> Result<Message, Error> {
     let reply = files.call_with(request, 8192, 0)?;
     if reply.flags.contains(MessageFlags::ERROR) {
         return Err(proto::decode_error(&reply.payload).unwrap_or(Error::BadState));
@@ -402,7 +443,7 @@ fn call(files: &Channel, request: Message) -> Result<Message, Error> {
     Ok(reply)
 }
 
-fn open(files: &Channel, path: &str) -> Result<proto::FsOpenReply, Error> {
+pub(crate) fn open(files: &Channel, path: &str) -> Result<proto::FsOpenReply, Error> {
     let reply = call(
         files,
         Message::new(proto::FS_OPEN).with_payload(path.as_bytes()),
@@ -410,7 +451,7 @@ fn open(files: &Channel, path: &str) -> Result<proto::FsOpenReply, Error> {
     proto::decode::<proto::FsOpenReply>(&reply.payload).ok_or(Error::BadState)
 }
 
-fn create(files: &Channel, path: &str) -> Result<proto::FsOpenReply, Error> {
+pub(crate) fn create(files: &Channel, path: &str) -> Result<proto::FsOpenReply, Error> {
     let reply = call(
         files,
         Message::new(proto::FS_CREATE).with_payload(path.as_bytes()),
@@ -418,7 +459,7 @@ fn create(files: &Channel, path: &str) -> Result<proto::FsOpenReply, Error> {
     proto::decode::<proto::FsOpenReply>(&reply.payload).ok_or(Error::BadState)
 }
 
-fn close(files: &Channel, node: u64) {
+pub(crate) fn close(files: &Channel, node: u64) {
     let request = proto::Encoded::new(proto::FsCloseRequest { node });
     let _ = call(
         files,
@@ -426,7 +467,7 @@ fn close(files: &Channel, node: u64) {
     );
 }
 
-fn write_at(files: &Channel, node: u64, offset: u64, data: &[u8]) -> Result<usize, Error> {
+pub(crate) fn write_at(files: &Channel, node: u64, offset: u64, data: &[u8]) -> Result<usize, Error> {
     let header = proto::Encoded::new(proto::FsWriteHeader {
         node,
         offset,
@@ -480,11 +521,143 @@ pub fn command(
             .ok_or(Error::InvalidArgument)
     };
     match name {
-        "ls" => list(
-            console,
-            files,
-            &resolve(cwd, args.first().map(String::as_str).unwrap_or(".")),
-        ),
+        "ls" => {
+            let long = args.first().is_some_and(|a| a == "-l");
+            let target = resolve(cwd, args.get(long as usize).map(String::as_str).unwrap_or("."));
+            if long {
+                list_long(console, files, &target)
+            } else {
+                list(console, files, &target)
+            }
+        }
+        "rm" if args.first().is_some_and(|a| a == "-r") => {
+            let target = path(1)?;
+            if target == "/" {
+                return Err(Error::InvalidArgument);
+            }
+            remove_tree(files, &target, 0)?;
+        }
+        "rmdir" => {
+            let target = path(0)?;
+            let reply = call(files, Message::new(proto::FS_STAT).with_payload(target.as_bytes()))?;
+            let stat = proto::decode::<proto::FsStat>(&reply.payload).ok_or(Error::BadState)?;
+            if stat.kind != fs_kind::DIRECTORY {
+                crate::fail(console, &format!("rmdir: {target} is not a directory\n"));
+                return Ok(());
+            }
+            if stat.entries != 0 {
+                crate::fail(console, &format!("rmdir: {target} is not empty; use rm -r\n"));
+                return Ok(());
+            }
+            call(files, Message::new(proto::FS_UNLINK).with_payload(target.as_bytes()))?;
+        }
+        "mv" => {
+            let force = args.first().is_some_and(|s| s == "-f");
+            let at = force as usize;
+            let source = path(at)?;
+            let mut destination = path(at + 1)?;
+            // Into a directory, as cp and mv do everywhere else.
+            if let Ok(reply) = call(files, Message::new(proto::FS_STAT).with_payload(destination.as_bytes())) {
+                if proto::decode::<proto::FsStat>(&reply.payload).is_some_and(|s| s.kind == fs_kind::DIRECTORY) {
+                    let name = source.rsplit('/').next().unwrap_or("");
+                    destination = resolve(&destination, name);
+                }
+            }
+            // The filesystem has no rename, so a move is a copy and a delete,
+            // which works for files only.
+            let node = open(files, &source)?;
+            close(files, node.node);
+            if node.kind != fs_kind::FILE {
+                crate::fail(console, "mv: only files can be moved; the filesystem has no rename\n");
+                return Ok(());
+            }
+            copy_file(files, &source, &destination, force)?;
+            call(files, Message::new(proto::FS_UNLINK).with_payload(source.as_bytes()))?;
+        }
+        "head" | "tail" => {
+            let (count, at) = match args.first().map(String::as_str) {
+                Some("-n") => (
+                    args.get(1).and_then(|n| n.parse::<usize>().ok()).ok_or(Error::InvalidArgument)?,
+                    2,
+                ),
+                _ => (10, 0),
+            };
+            let target = path(at)?;
+            let mut kept: VecDeque<Vec<u8>> = VecDeque::new();
+            let mut line = Vec::new();
+            let shown = core::cell::Cell::new(0usize);
+            let head = name == "head";
+            let take = |line: &mut Vec<u8>, kept: &mut VecDeque<Vec<u8>>| {
+                if head {
+                    if shown.get() < count {
+                        write_text(console, &format!("{}\n", String::from_utf8_lossy(line)));
+                        shown.set(shown.get() + 1);
+                    }
+                } else {
+                    kept.push_back(core::mem::take(line));
+                    if kept.len() > count {
+                        kept.pop_front();
+                    }
+                }
+                line.clear();
+            };
+            scan_file(files, &target, |bytes| {
+                for byte in bytes {
+                    if *byte == b'\n' {
+                        take(&mut line, &mut kept);
+                    } else if line.len() < 32768 {
+                        line.push(*byte);
+                    }
+                }
+                Ok(!head || shown.get() < count)
+            })?;
+            if !line.is_empty() {
+                take(&mut line, &mut kept);
+            }
+            for line in kept {
+                write_text(console, &format!("{}\n", String::from_utf8_lossy(&line)));
+            }
+        }
+        "wc" => {
+            let mut totals = (0u64, 0u64, 0u64);
+            for (index, _) in args.iter().enumerate() {
+                let target = path(index)?;
+                let (mut lines, mut words, mut bytes, mut in_word) = (0u64, 0u64, 0u64, false);
+                scan_file(files, &target, |chunk| {
+                    for byte in chunk {
+                        bytes += 1;
+                        if *byte == b'\n' {
+                            lines += 1;
+                        }
+                        if byte.is_ascii_whitespace() {
+                            in_word = false;
+                        } else if !in_word {
+                            in_word = true;
+                            words += 1;
+                        }
+                    }
+                    Ok(true)
+                })?;
+                write_text(console, &format!("{lines:>8} {words:>8} {bytes:>10}  {target}\n"));
+                totals = (totals.0 + lines, totals.1 + words, totals.2 + bytes);
+            }
+            if args.len() > 1 {
+                write_text(console, &format!("{:>8} {:>8} {:>10}  total\n", totals.0, totals.1, totals.2));
+            }
+        }
+        "find" => {
+            let root = resolve(cwd, args.first().map(String::as_str).unwrap_or("."));
+            let needle = args.get(1).map(|text| text.to_ascii_lowercase());
+            let mut found = 0;
+            walk(files, &root, 0, &mut |path, _dir| {
+                let name = path.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+                if needle.as_ref().is_none_or(|needle| name.contains(needle.as_str())) {
+                    write_text(console, &format!("{path}\n"));
+                    found += 1;
+                }
+            })?;
+            println!("shell: find listed {found} path(s)");
+        }
         "cat" => cat(console, files, &path(0)?),
         "stat" => stat(console, files, &path(0)?),
         "df" => df(console, files),
@@ -579,6 +752,8 @@ pub fn command(
             }
             println!("shell: grep matched {matched} line(s)");
         }
+        // Output going to a file has no pages to wait between.
+        "more" if crate::capturing() => cat(console, files, &path(0)?),
         "more" => {
             let p = path(0)?;
             let reply = console.call_with(Message::new(proto::CONSOLE_GET_INFO), 128, 0)?;
@@ -671,7 +846,7 @@ pub fn read_file(files: &Channel, path: &str, limit: usize) -> Result<Vec<u8>, E
     close(files, node.node);
     result
 }
-fn read_chunk(files: &Channel, node: u64, offset: u64) -> Result<Vec<u8>, Error> {
+pub(crate) fn read_chunk(files: &Channel, node: u64, offset: u64) -> Result<Vec<u8>, Error> {
     let header = proto::Encoded::new(proto::FsReadRequest {
         node,
         offset,
@@ -714,6 +889,75 @@ fn scan_file(
     close(files, node.node);
     result
 }
+/// Visit every path below `path`, parents before their contents.
+fn walk(files: &Channel, path: &str, depth: usize, visit: &mut dyn FnMut(&str, bool)) -> Result<(), Error> {
+    if depth > 32 {
+        return Err(Error::LimitExceeded);
+    }
+    let mut found = entries(files, path)?;
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, dir, _) in found {
+        let child = resolve(path, &name);
+        visit(&child, dir);
+        if dir {
+            walk(files, &child, depth + 1, visit)?;
+        }
+    }
+    Ok(())
+}
+
+/// Delete a file, or a directory and everything in it, deepest first.
+fn remove_tree(files: &Channel, path: &str, depth: usize) -> Result<(), Error> {
+    if depth > 32 {
+        return Err(Error::LimitExceeded);
+    }
+    let reply = call(files, Message::new(proto::FS_STAT).with_payload(path.as_bytes()))?;
+    let stat = proto::decode::<proto::FsStat>(&reply.payload).ok_or(Error::BadState)?;
+    if stat.kind == fs_kind::DIRECTORY {
+        for (name, _, _) in entries(files, path)? {
+            remove_tree(files, &resolve(path, &name), depth + 1)?;
+        }
+    }
+    call(files, Message::new(proto::FS_UNLINK).with_payload(path.as_bytes()))?;
+    Ok(())
+}
+
+/// Whether `path` names a file.
+pub fn exists(files: &Channel, path: &str) -> bool {
+    call(files, Message::new(proto::FS_STAT).with_payload(path.as_bytes()))
+        .ok()
+        .and_then(|reply| proto::decode::<proto::FsStat>(&reply.payload))
+        .is_some_and(|stat| stat.kind == fs_kind::FILE)
+}
+
+/// Write `data` to `path`: replacing the file, or after its end with `append`.
+pub fn write_file(files: &Channel, path: &str, data: &[u8], append: bool) -> Result<(), Error> {
+    let node = if append {
+        match open(files, path) {
+            Ok(node) => node,
+            Err(Error::NotFound) => create(files, path)?,
+            Err(error) => return Err(error),
+        }
+    } else {
+        create(files, path)?
+    };
+    let result = (|| {
+        if node.kind != fs_kind::FILE {
+            return Err(Error::InvalidArgument);
+        }
+        let mut offset = if append { node.size } else { 0 };
+        for chunk in data.chunks(32768) {
+            if write_at(files, node.node, offset, chunk)? != chunk.len() {
+                return Err(Error::BadState);
+            }
+            offset += chunk.len() as u64;
+        }
+        Ok(())
+    })();
+    close(files, node.node);
+    result
+}
+
 fn copy_file(files: &Channel, source: &str, destination: &str, force: bool) -> Result<(), Error> {
     if source.eq_ignore_ascii_case(destination) {
         return Err(Error::InvalidArgument);
