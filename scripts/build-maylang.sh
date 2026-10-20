@@ -57,14 +57,17 @@ build() {
 
 # Copy the staged tree onto the disk, creating directories as needed. Names
 # keep their case; the filesystem reads long names, and these are only read.
+# mtools asks on the terminal what to do about a name that already exists, so
+# only missing directories are created, and stdin is never the terminal: a
+# question nobody sees would stop `make` for good.
 install() {
     disk=$1
     [ -d "$out/bin" ] || { echo "build-maylang: nothing staged; run 'make maylang'" >&2; exit 1; }
     (cd "$out" && find bin stdlib src tests -type d) | while read -r dir; do
-        mmd -i "$disk" "::/$dir" 2>/dev/null || true
+        mdir -b -i "$disk" "::/$dir" >/dev/null 2>&1 </dev/null || mmd -i "$disk" "::/$dir" </dev/null
     done
     (cd "$out" && find bin stdlib src tests -type f) | while read -r file; do
-        mcopy -o -i "$disk" "$out/$file" "::/$file"
+        mcopy -o -i "$disk" "$out/$file" "::/$file" </dev/null
     done
     echo "disk: packaged Maylang: /bin/mayc.nxf, its runtime, /stdlib and /src/mayc"
 }
