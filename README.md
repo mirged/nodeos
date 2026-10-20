@@ -47,6 +47,7 @@ and the whole thing runs in QEMU today.
 | Text console, cursor, 512-line scrollback and command shell | working |
 | Doom as an explicitly launched full-screen program (`docs/DOOM.md`) | working |
 | Linux programs: musl over an in-process Linux personality (`docs/MUSL.md`) | working: Lua 5.4 |
+| Maylang programs, and the Maylang compiler running here (`docs/MAYLANG.md`) | working: self-hosting |
 | Userspace services (ramfs, devmgr) | in progress |
 
 ## Quick start
@@ -70,6 +71,7 @@ make test-apps    # run the console apps from the shell
 make test-cc      # compile and run a C program
 make test-edit    # edit and save a file
 make test-lua     # build Lua 5.4 against musl and run it
+make test-maylang # run Maylang programs and the Maylang compiler
 make test-audio   # check sound using QEMU's wav backend
 make test-shell   # scripts, editing, paging, foreground apps, Doom return
 make test-shell-parser # quotes, escapes and command-file syntax
@@ -226,6 +228,27 @@ channel, and `mmap` is memory objects. `scripts/lx-cc` is the compiler driver,
 for use as `$(CC)`. [`docs/MUSL.md`](docs/MUSL.md) has the design, what works,
 and what is still to do: threads, `fork`/`exec` and signals.
 
+## Maylang
+
+[Maylang](https://github.com/mirged/maylang) targets NodeOS directly
+(`--target x86_64-nodeos`), and its compiler runs here. `make maylang` builds
+it from a sibling checkout (`MAYLANG=../maylang`), and the next `make` puts it
+on the disk with its runtime, the standard library and its own source:
+
+```
+/> mayc /tests/hello.may -o /hello.nxf
+/> run /hello.nxf
+Hello, Maylang!
+/> mayc /src/mayc/main.may -o /bin/mayc2.nxf
+```
+
+The last line is the compiler rebuilding itself; the result is byte-identical
+to the compiler cross-built on Linux (`make test-maylang-selfhost`; use
+`QEMU_MEM=1G` to do it interactively). Maylang programs need no libc: `mayc`
+writes NXF itself, and a personality compiled into each program answers the
+runtime's Linux-numbered syscalls with NodeOS syscalls and the console and
+filesystem protocols. [`docs/MAYLANG.md`](docs/MAYLANG.md) has the details.
+
 ## The C compiler
 
 The compiler is a real one -- tokenizer, recursive-descent parser, type-aware
@@ -260,6 +283,8 @@ docs/       design documents
 * [`docs/MUSL.md`](docs/MUSL.md) -- the plan for running ordinary Linux
   programs: musl over an in-process Linux personality, and what the kernel
   needs for it.
+* [`docs/MAYLANG.md`](docs/MAYLANG.md) -- Maylang programs and the Maylang
+  compiler on NodeOS.
 
 ## Licence
 

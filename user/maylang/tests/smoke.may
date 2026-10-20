@@ -1,0 +1,66 @@
+// A Maylang program exercising the parts of the full runtime that reach the
+// operating system, run by `make test-maylang`. Each check prints one line;
+// the test script compares them with what it expects.
+
+struct Point { x: Int, y: Int }
+
+fun distance(p: Point) -> Float {
+    return sqrt(to_float(p.x * p.x + p.y * p.y));
+}
+
+print("smoke: hello from Maylang on NodeOS");
+
+let argv: List<Str> = args();
+// Started again by the exec check below: report and exit with a status.
+if (len(argv) > 1 and argv[1] == "child") {
+    print("smoke: child running");
+    exit(7);
+}
+print("smoke: args ${len(argv)} ${argv[len(argv) - 1]}");
+
+let words: Map<Str, Int> = {};
+for word: Str in split("red fish blue fish red fish", " ") {
+    words[word] = (words[word] ?? 0) + 1;
+}
+print("smoke: map fish=${words["fish"] ?? 0} red=${words["red"] ?? 0} keys=${len(keys(words))}");
+
+let scale: (Int) -> Int = fun(value: Int) -> Int { return value * 3; };
+print("smoke: closure ${join(map([1, 2, 3], fun(v: Int) -> Str { return str(scale(v)); }), ",")}");
+
+print("smoke: float ${distance(Point(3, 4))} ${floor(2.75)} ${sqrt(2.0)}");
+
+let caught: Str = may { fail("boom"); "unreachable" } otherwise { "caught ${err.message}" };
+print("smoke: fault ${caught}");
+
+let big: List<Int> = [];
+mut total: Int = 0;
+for i: Int in 0..200000 { push(big, i); total += i; }
+print("smoke: gc ${len(big)} ${total}");
+
+write_file("SMOKE.TXT", "line one\nline two\n");
+let text: Str = read_file("SMOKE.TXT");
+print("smoke: file ${len(split(trim(text), "\n"))} lines, exists=${file_exists("SMOKE.TXT")}");
+
+may { mkdir("SMOKEDIR"); } otherwise { }
+write_file("SMOKEDIR/A.TXT", "a");
+write_file("SMOKEDIR/B.TXT", "bb");
+print("smoke: dir ${join(sort(read_dir("SMOKEDIR")), " ")}");
+
+let missing: Str = may { read_file("/no/such/file"); "read" } otherwise { "missing" };
+print("smoke: ${missing}");
+
+let order: List<Str> = [];
+spawn(fun() -> Nil { push(order, "a1"); yield(); push(order, "a2"); return; });
+spawn(fun() -> Nil { push(order, "b1"); yield(); push(order, "b2"); return; });
+run();
+print("smoke: fibers ${join(order, " ")}");
+
+let start: Int = time();
+sleep(20);
+print("smoke: clock ok=${time() >= start}");
+
+print("smoke: env PATH=${env("PATH") ?? "none"}");
+
+let pid: Int = exec([argv[0], "child"]);
+print("smoke: exec status ${wait(pid)}");
+print("smoke: done");

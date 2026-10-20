@@ -22,7 +22,8 @@ REPL at the console. `make test-lua` builds it and checks it in QEMU.
 | Raw-syscall check on every linked program | `scripts/build-lx-apps.sh` | done |
 | Shell: a program runs in the foreground, so it owns the console until it exits | `user/shell/src/main.rs` | done (in the shell itself) |
 | K2 futex, threads | | not started: `clone` returns `ENOSYS` |
-| K3-K7: process lifecycle, `fork`/`exec`, signals | | not started |
+| K3: a parent reads a child's exit code (`HandleInfo::exit_code`) | `kernel/src/syscall/mod.rs` | done; `process_kill` not started |
+| K4-K7: `fork`/`exec`, signals | | not started |
 | K8: wall clock and entropy | | not started: realtime starts at the epoch at boot, `getrandom` is xorshift |
 
 What liblx answers today: `read`, `write`, `readv`, `writev`, `pread64` and
@@ -200,9 +201,9 @@ shared memory object works across processes; Zircon keys it the same way.
 sleeps properly is a good excuse to make `Timer` a real object.
 
 **K3. Process lifecycle (phase 3).** The kernel records `exit_code` in
-`task/process.rs`, but only `launch.rs` reads it, so a parent cannot learn how
-its child exited. Add `process_info(handle) -> {exit_code, state}` (or an
-`exit_code` field in `HandleInfo`). Also add `process_kill(handle)`, which
+`task/process.rs`. A parent now reads it after `PROCESS_TERMINATED` through
+`capability_query`, whose `HandleInfo` has an `exit_code` field (added for
+Maylang's `wait`, `docs/MAYLANG.md`). Still to add: `process_kill(handle)`, which
 needs `MANAGE_PROCESS` and is what `SIGKILL` becomes. There is currently no way
 to end another process at all.
 
