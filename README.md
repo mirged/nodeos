@@ -183,6 +183,9 @@ docs/       design documents
   kernel bug that building it uncovered.
 * [`docs/DOOM.md`](docs/DOOM.md) -- what porting Doom exercised, and the one
   gap it found.
+* [`docs/MUSL.md`](docs/MUSL.md) -- the plan for running ordinary Linux
+  programs: musl over an in-process Linux personality, and what the kernel
+  needs for it.
 
 ## Licence
 
