@@ -20,9 +20,9 @@
 //! ```
 //!
 //! A file is a *chain*: its directory entry names a first cluster, and the
-//! allocation table says which cluster follows each one. So a seek is a walk,
-//! which is why [`Fat::read`] starts from the first cluster every time rather
-//! than caching a position -- correct, and honest about the cost.
+//! allocation table says which cluster follows each one. Reads retain an index
+//! of the last file's chain and merge adjacent clusters into disk requests.
+//! Sequential loading therefore walks each link once, rather than once per sector.
 //!
 //! On FAT32 the root directory is an ordinary chain like any other; on FAT16
 //! it is a fixed region before the data, with a fixed number of slots. That
@@ -47,7 +47,7 @@ use alloc::vec::Vec;
 
 use libnode::Error;
 
-use crate::virtio::{VirtioBlk, SECTOR_SIZE};
+use crate::virtio::{VirtioBlk, MAX_TRANSFER, SECTOR_SIZE};
 
 /// Attribute bit: read-only.
 const ATTR_READ_ONLY: u8 = 0x01;
@@ -164,6 +164,8 @@ pub struct Fat {
     fat_cache: Option<(u64, Vec<u8>)>,
     /// Whether the cached sector has been modified and not yet written back.
     fat_dirty: bool,
+    /// Lazily indexed read chain, invalidated whenever allocation changes.
+    read_chain: Option<(u32, Vec<u32>)>,
 }
 
 impl Fat {
@@ -227,7 +229,11 @@ impl Fat {
         // A FAT32 root directory lives in a real cluster chain, and clusters
         // below 2 are not valid. A zero here would make `cluster_sector`
         // subtract two from zero the first time the root fills up.
-        let root_cluster = if flavour == Flavour::Fat32 { u32(&boot, 0x2C) } else { 0 };
+        let root_cluster = if flavour == Flavour::Fat32 {
+            u32(&boot, 0x2C)
+        } else {
+            0
+        };
         if flavour == Flavour::Fat32 && root_cluster < 2 {
             return Err(Error::BadState);
         }
@@ -247,6 +253,7 @@ impl Fat {
             clusters,
             fat_cache: None,
             fat_dirty: false,
+            read_chain: None,
         })
     }
 
@@ -269,13 +276,21 @@ impl Fat {
             }
         }
         let total = self.clusters as u64 * self.cluster_bytes() as u64;
-        Ok((total, free * self.cluster_bytes() as u64, self.disk.requests()))
+        Ok((
+            total,
+            free * self.cluster_bytes() as u64,
+            self.disk.requests(),
+        ))
     }
 
     /// The root directory, as an entry.
     pub fn root(&self) -> Entry {
         Entry {
-            cluster: if self.flavour == Flavour::Fat32 { self.root_cluster } else { 0 },
+            cluster: if self.flavour == Flavour::Fat32 {
+                self.root_cluster
+            } else {
+                0
+            },
             size: 0,
             attr: ATTR_DIRECTORY,
             record_sector: 0,
@@ -295,12 +310,19 @@ impl Fat {
             Flavour::Fat32 => 4u64,
         };
         let offset = cluster as u64 * width;
-        (self.fat_start + offset / self.bytes_per_sector as u64, (offset % self.bytes_per_sector as u64) as usize)
+        (
+            self.fat_start + offset / self.bytes_per_sector as u64,
+            (offset % self.bytes_per_sector as u64) as usize,
+        )
     }
 
     /// Load a table sector into the cache, writing back a dirty one first.
     fn fat_sector(&mut self, sector: u64) -> Result<&mut Vec<u8>, Error> {
-        if self.fat_cache.as_ref().is_some_and(|(cached, _)| *cached == sector) {
+        if self
+            .fat_cache
+            .as_ref()
+            .is_some_and(|(cached, _)| *cached == sector)
+        {
             return Ok(&mut self.fat_cache.as_mut().expect("just checked").1);
         }
         self.flush_fat()?;
@@ -324,7 +346,8 @@ impl Fat {
         // by picking one, and which one is not this filesystem's decision to
         // leave to chance.
         for copy in 0..self.fat_copies as u64 {
-            self.disk.write(sector + copy * self.fat_sectors as u64, &bytes)?;
+            self.disk
+                .write(sector + copy * self.fat_sectors as u64, &bytes)?;
         }
         self.fat_cache = Some((sector, bytes));
         self.fat_dirty = false;
@@ -360,6 +383,7 @@ impl Fat {
 
     /// Point `cluster`'s chain entry at `value`.
     fn chain_set(&mut self, cluster: u32, value: u32) -> Result<(), Error> {
+        self.read_chain = None;
         if cluster < 2 || cluster >= self.clusters + 2 {
             return Err(Error::InvalidArgument);
         }
@@ -368,12 +392,20 @@ impl Fat {
         let bytes = self.fat_sector(sector)?;
         match flavour {
             Flavour::Fat16 => {
-                let value = if value >= CLUSTER_END { 0xFFFF } else { value as u16 };
+                let value = if value >= CLUSTER_END {
+                    0xFFFF
+                } else {
+                    value as u16
+                };
                 bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
             }
             Flavour::Fat32 => {
                 let existing = u32(bytes, offset) & 0xF000_0000;
-                let value = if value >= CLUSTER_END { 0x0FFF_FFFF } else { value & 0x0FFF_FFFF };
+                let value = if value >= CLUSTER_END {
+                    0x0FFF_FFFF
+                } else {
+                    value & 0x0FFF_FFFF
+                };
                 bytes[offset..offset + 4].copy_from_slice(&(existing | value).to_le_bytes());
             }
         }
@@ -450,9 +482,9 @@ impl Fat {
     /// that borrow could not also read a sector.
     fn dir_sectors(&mut self, dir: Dir) -> Result<Vec<u64>, Error> {
         match dir {
-            Dir::FixedRoot => {
-                Ok((0..self.root_sectors as u64).map(|index| self.root_start + index).collect())
-            }
+            Dir::FixedRoot => Ok((0..self.root_sectors as u64)
+                .map(|index| self.root_start + index)
+                .collect()),
             Dir::Chain(start) => {
                 let mut sectors = Vec::new();
                 let mut cluster = start;
@@ -526,7 +558,11 @@ impl Fat {
                     short_name(record)
                 };
                 long.clear();
-                out.push(Listing { name, attr, size: u32(&bytes, offset + 0x1C) });
+                out.push(Listing {
+                    name,
+                    attr,
+                    size: u32(&bytes, offset + 0x1C),
+                });
             }
         }
         Ok(out)
@@ -583,7 +619,8 @@ impl Fat {
                 // than strict.
                 if equal_ignoring_case(&full, name) || equal_ignoring_case(&short, name) {
                     return Ok(Entry {
-                        cluster: (u16(&bytes, offset + 0x14) as u32) << 16 | u16(&bytes, offset + 0x1A) as u32,
+                        cluster: (u16(&bytes, offset + 0x14) as u32) << 16
+                            | u16(&bytes, offset + 0x1A) as u32,
                         size: u32(&bytes, offset + 0x1C),
                         attr,
                         record_sector: sector,
@@ -598,7 +635,10 @@ impl Fat {
     /// Resolve a whole path from the root.
     pub fn lookup(&mut self, path: &str) -> Result<Entry, Error> {
         let mut entry = self.root();
-        for component in path.split('/').filter(|part| !part.is_empty() && *part != ".") {
+        for component in path
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+        {
             if !entry.is_dir() {
                 return Err(Error::NotFound);
             }
@@ -631,30 +671,69 @@ impl Fat {
 
     /// Read up to `length` bytes of `entry` from `offset`.
     pub fn read(&mut self, entry: &Entry, offset: u64, length: usize) -> Result<Vec<u8>, Error> {
-        if entry.cluster < 2 {
+        if length == 0 || entry.cluster < 2 {
             return Ok(Vec::new());
         }
-        let end = if entry.is_dir() { u64::MAX } else { entry.size as u64 };
+        let end = if entry.is_dir() {
+            u64::MAX
+        } else {
+            entry.size as u64
+        };
         if offset >= end {
             return Ok(Vec::new());
         }
         let length = length.min((end - offset) as usize);
         let cluster_bytes = self.cluster_bytes() as u64;
 
+        // Index only as far as this request needs. Retaining the prefix also
+        // makes backward/random reads cheap without assuming contiguous files.
+        let last = ((offset + length as u64).saturating_sub(1) / cluster_bytes) as usize;
+        if last >= self.clusters as usize {
+            return Err(Error::BadState);
+        }
+        if !self
+            .read_chain
+            .as_ref()
+            .is_some_and(|(start, _)| *start == entry.cluster)
+        {
+            self.read_chain = Some((entry.cluster, vec![entry.cluster]));
+        }
+        while self.read_chain.as_ref().unwrap().1.len() <= last {
+            let previous = *self.read_chain.as_ref().unwrap().1.last().unwrap();
+            let next = self.chain_next(previous)?;
+            if next < 2 || next >= self.clusters + 2 || next >= CLUSTER_END {
+                return Err(Error::BadState);
+            }
+            self.read_chain.as_mut().unwrap().1.push(next);
+        }
+
         let mut out = Vec::new();
         out.try_reserve_exact(length).map_err(|_| Error::NoMemory)?;
-        let mut position = offset;
+        let mut scratch =
+            vec![0u8; MAX_TRANSFER.min(length + SECTOR_SIZE * 2) / SECTOR_SIZE * SECTOR_SIZE];
         while out.len() < length {
-            let cluster = self.seek_cluster(entry.cluster, (position / cluster_bytes) as u32, false)?;
+            let position = offset + out.len() as u64;
+            let index = (position / cluster_bytes) as usize;
             let within = position % cluster_bytes;
-            let sector = self.cluster_sector(cluster) + within / self.bytes_per_sector as u64;
-            let sector_offset = (within % self.bytes_per_sector as u64) as usize;
-
-            let mut bytes = vec![0u8; SECTOR_SIZE];
-            self.disk.read(sector, &mut bytes)?;
-            let take = (SECTOR_SIZE - sector_offset).min(length - out.len());
-            out.extend_from_slice(&bytes[sector_offset..sector_offset + take]);
-            position += take as u64;
+            let chain = &self.read_chain.as_ref().unwrap().1;
+            let cluster = chain[index];
+            let mut contiguous = cluster_bytes - within;
+            let mut next = index + 1;
+            while next <= last && contiguous < MAX_TRANSFER as u64 {
+                if chain[next] != chain[next - 1] + 1 {
+                    break;
+                }
+                contiguous += cluster_bytes;
+                next += 1;
+            }
+            let sector = self.cluster_sector(cluster) + within / SECTOR_SIZE as u64;
+            let skip = (within % SECTOR_SIZE as u64) as usize;
+            let take = (length - out.len())
+                .min(contiguous as usize)
+                .min(scratch.len() - skip);
+            let transfer = (skip + take).div_ceil(SECTOR_SIZE) * SECTOR_SIZE;
+            self.disk.read(sector, &mut scratch[..transfer])?;
+            out.extend_from_slice(&scratch[skip..skip + take]);
         }
         Ok(out)
     }
@@ -676,7 +755,9 @@ impl Fat {
         // silently truncated: `end as u32` used to wrap, so a write at
         // `2^32 * cluster_bytes` would land back at the start of the file and
         // corrupt it.
-        let end = offset.checked_add(data.len() as u64).ok_or(Error::InvalidArgument)?;
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or(Error::InvalidArgument)?;
         if end > u32::MAX as u64 {
             return Err(Error::InvalidArgument);
         }
@@ -692,7 +773,8 @@ impl Fat {
         let mut written = 0usize;
         while written < data.len() {
             let position = offset + written as u64;
-            let cluster = self.seek_cluster(entry.cluster, (position / cluster_bytes) as u32, true)?;
+            let cluster =
+                self.seek_cluster(entry.cluster, (position / cluster_bytes) as u32, true)?;
             let within = position % cluster_bytes;
             let sector = self.cluster_sector(cluster) + within / self.bytes_per_sector as u64;
             let sector_offset = (within % self.bytes_per_sector as u64) as usize;
@@ -705,7 +787,8 @@ impl Fat {
             if take != SECTOR_SIZE {
                 self.disk.read(sector, &mut bytes)?;
             }
-            bytes[sector_offset..sector_offset + take].copy_from_slice(&data[written..written + take]);
+            bytes[sector_offset..sector_offset + take]
+                .copy_from_slice(&data[written..written + take]);
             self.disk.write(sector, &bytes)?;
             written += take;
         }
@@ -749,7 +832,8 @@ impl Fat {
             entry.cluster = 0;
         } else {
             let cluster_bytes = self.cluster_bytes() as u64;
-            let last = self.seek_cluster(entry.cluster, ((length - 1) / cluster_bytes) as u32, false)?;
+            let last =
+                self.seek_cluster(entry.cluster, ((length - 1) / cluster_bytes) as u32, false)?;
             let tail = self.chain_next(last)?;
             self.chain_set(last, CLUSTER_END)?;
             if tail >= 2 && tail < CLUSTER_END {
@@ -787,7 +871,8 @@ impl Fat {
         let mut bytes = vec![0u8; SECTOR_SIZE];
         self.disk.read(entry.record_sector, &mut bytes)?;
         let at = entry.record_offset;
-        bytes[at + 0x14..at + 0x16].copy_from_slice(&(((entry.cluster >> 16) as u16).to_le_bytes()));
+        bytes[at + 0x14..at + 0x16]
+            .copy_from_slice(&(((entry.cluster >> 16) as u16).to_le_bytes()));
         bytes[at + 0x1A..at + 0x1C].copy_from_slice(&((entry.cluster as u16).to_le_bytes()));
         bytes[at + 0x1C..at + 0x20].copy_from_slice(&entry.size.to_le_bytes());
         self.disk.write(entry.record_sector, &bytes)
@@ -812,7 +897,9 @@ impl Fat {
         // Full. A FAT16 root cannot grow -- its size was fixed when the volume
         // was formatted -- and saying so is better than a confusing NoSpace
         // from somewhere deeper.
-        let Dir::Chain(start) = dir else { return Err(Error::NoSpace) };
+        let Dir::Chain(start) = dir else {
+            return Err(Error::NoSpace);
+        };
         let last = sectors.len() as u32 / self.sectors_per_cluster;
         let cluster = self.seek_cluster(start, last, true)?;
         Ok((self.cluster_sector(cluster), 0))
@@ -871,7 +958,11 @@ impl Fat {
     fn write_dot_entries(&mut self, cluster: u32, parent: &Entry) -> Result<(), Error> {
         let sector = self.cluster_sector(cluster);
         let mut bytes = vec![0u8; SECTOR_SIZE];
-        let parent_cluster = if parent.record_sector == 0 { 0 } else { parent.cluster };
+        let parent_cluster = if parent.record_sector == 0 {
+            0
+        } else {
+            parent.cluster
+        };
 
         for (index, (name, target)) in [(b".          ", cluster), (b"..         ", parent_cluster)]
             .iter()
@@ -959,7 +1050,9 @@ fn long_name_part(record: &[u8]) -> String {
 /// The 8.3 name in a directory record, as `NAME.EXT`.
 fn short_name(record: &[u8]) -> String {
     let base = core::str::from_utf8(&record[..8]).unwrap_or("").trim_end();
-    let extension = core::str::from_utf8(&record[8..11]).unwrap_or("").trim_end();
+    let extension = core::str::from_utf8(&record[8..11])
+        .unwrap_or("")
+        .trim_end();
     let mut out = String::from(base);
     if !extension.is_empty() {
         out.push('.');
@@ -1009,7 +1102,11 @@ fn valid_short_char(byte: u8) -> bool {
 }
 
 fn equal_ignoring_case(left: &str, right: &str) -> bool {
-    left.len() == right.len() && left.bytes().zip(right.bytes()).all(|(a, b)| a.eq_ignore_ascii_case(&b))
+    left.len() == right.len()
+        && left
+            .bytes()
+            .zip(right.bytes())
+            .all(|(a, b)| a.eq_ignore_ascii_case(&b))
 }
 
 fn u16(bytes: &[u8], offset: usize) -> u16 {
@@ -1017,5 +1114,10 @@ fn u16(bytes: &[u8], offset: usize) -> u16 {
 }
 
 fn u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]])
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
 }

@@ -62,7 +62,7 @@ fn run(mut env: Env) -> i32 {
     // filesystem (for the IWAD), compositor, then the mixer. `take_extra(0)`
     // pops from the front, so the order here matches the order the shell
     // pushed them.
-    let _console = env.take_extra(0);
+    let console = env.take_extra(0).map(Channel::from_handle);
     let Some(files_handle) = env.take_extra(0) else {
         println!("doom: no filesystem connection granted; exiting");
         return 1;
@@ -74,6 +74,32 @@ fn run(mut env: Env) -> i32 {
     let files = Channel::from_handle(files_handle);
     let wm = Channel::from_handle(wm_handle);
 
+    // --- the IWAD --------------------------------------------------------
+    // Read the whole file into a memory object and map it read-only. The mini-
+    // libc's `fopen` resolves `doom.wad` to this range, so the game reads the
+    // WAD in place and never copies it onto its heap.
+    if let Some(console) = console.as_ref() {
+        let _ = console.call_with(
+            Message::new(proto::CONSOLE_WRITE_TEXT).with_payload(b"Loading Doom...\n"),
+            64,
+            0,
+        );
+    }
+    let started = libnode::clock_ns();
+    let Some((wad, wad_size)) = load_iwad(&files) else {
+        println!("doom: could not read {IWAD_PATH:?} from the filesystem; exiting");
+        return 1;
+    };
+    let Ok(wad_mapping) = wad.map(0, wad_size, MapFlags::READ, MapWindow::MappedFile) else {
+        println!("doom: failed to map the IWAD; exiting");
+        return 1;
+    };
+    println!(
+        "doom: IWAD mapped, {} KiB in {} ms",
+        wad_size / 1024,
+        (libnode::clock_ns() - started) / 1_000_000
+    );
+
     // --- the window ------------------------------------------------------
     let request = proto::Encoded::new(proto::WmCreateSurface {
         width: WANTED_WIDTH,
@@ -84,12 +110,16 @@ fn run(mut env: Env) -> i32 {
     let mut payload = alloc::vec::Vec::from(request.bytes());
     payload.extend_from_slice(b"doom");
 
-    let Ok(mut reply) = wm.call(Message::new(proto::WM_CREATE_SURFACE).with_payload(&payload)) else {
+    let Ok(mut reply) = wm.call(Message::new(proto::WM_CREATE_SURFACE).with_payload(&payload))
+    else {
         println!("doom: the compositor did not answer; exiting");
         return 1;
     };
     if reply.flags.contains(MessageFlags::ERROR) || reply.handles.is_empty() {
-        println!("doom: no window granted ({:?}); exiting", proto::decode_error(&reply.payload));
+        println!(
+            "doom: no window granted ({:?}); exiting",
+            proto::decode_error(&reply.payload)
+        );
         return 1;
     }
     let Some(surface) = proto::decode::<proto::WmSurfaceInfo>(&reply.payload) else {
@@ -103,32 +133,38 @@ fn run(mut env: Env) -> i32 {
     let Ok(surface_mapping) = surface_vmo.map(
         0,
         surface.size,
-        MapFlags::READ.or(MapFlags::WRITE).or(MapFlags::SHARED).or(MapFlags::POPULATE),
+        MapFlags::READ
+            .or(MapFlags::WRITE)
+            .or(MapFlags::SHARED)
+            .or(MapFlags::POPULATE),
         MapWindow::Shared,
     ) else {
         println!("doom: failed to map the window surface; exiting");
         return 1;
     };
-    println!("doom: {}x{} window from the compositor", surface.width, surface.height);
-
-    // --- the IWAD --------------------------------------------------------
-    // Read the whole file into a memory object and map it read-only. The mini-
-    // libc's `fopen` resolves `doom.wad` to this range, so the game reads the
-    // WAD in place and never copies it onto its heap.
-    let Some((wad, wad_size)) = load_iwad(&files) else {
-        println!("doom: could not read {IWAD_PATH:?} from the filesystem; exiting");
-        return 1;
-    };
-    let Ok(wad_mapping) = wad.map(0, wad_size, MapFlags::READ, MapWindow::MappedFile) else {
-        println!("doom: failed to map the IWAD; exiting");
-        return 1;
-    };
-    println!("doom: IWAD mapped, {} KiB", wad_size / 1024);
+    println!(
+        "doom: {}x{} window from the compositor",
+        surface.width, surface.height
+    );
 
     let audio = env.take_extra(0).map(Channel::from_handle);
-    println!("doom: sound is {}", if audio.is_some() { "on" } else { "off (no audio service)" });
+    println!(
+        "doom: sound is {}",
+        if audio.is_some() {
+            "on"
+        } else {
+            "off (no audio service)"
+        }
+    );
 
-    platform::install(wm, surface, surface_vmo, surface_mapping, wad_mapping, audio);
+    platform::install(
+        wm,
+        surface,
+        surface_vmo,
+        surface_mapping,
+        wad_mapping,
+        audio,
+    );
 
     // Doom parses its own command line. `-iwad` names the file the mini-libc
     // resolves to the mapping installed above; the name is what tells Doom
@@ -200,7 +236,11 @@ fn load_iwad(files: &Channel) -> Option<(Vmo, u64)> {
     }
 
     let close = proto::Encoded::new(proto::FsCloseRequest { node: open.node });
-    let _ = files.call_with(Message::new(proto::FS_CLOSE).with_payload(close.bytes()), 64, 0);
+    let _ = files.call_with(
+        Message::new(proto::FS_CLOSE).with_payload(close.bytes()),
+        64,
+        0,
+    );
 
     (offset == size).then_some((vmo, size))
 }

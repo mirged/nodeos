@@ -59,7 +59,7 @@ the whole tree builds from `core` and `alloc`.
 
 ```sh
 make            # kernel + userspace + tools + ISO + disk (the whole build)
-make run        # boot the window system in QEMU
+make run        # boot the full-screen shell in QEMU
 make kernel     # just the kernel ELF
 make user       # just the userspace programs
 make modules    # pack userspace programs into NXF images

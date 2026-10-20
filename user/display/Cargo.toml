@@ -1,10 +1,10 @@
 [package]
-name = "compositor"
+name = "display"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "compositor"
+name = "display"
 path = "src/main.rs"
 test = false
 bench = false

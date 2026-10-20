@@ -5,7 +5,7 @@
 #   make        Build the kernel, the userspace programs, the bootable ISO and
 #               the FAT disk image. The disk carries /bin/*.nxf and, when one is
 #               present, /DOOM.WAD.
-#   make run    Boot the window system in QEMU -- compositor, console and shell,
+#   make run    Boot the full-screen shell in QEMU -- display, console and shell,
 #               with the disk attached. Type `run /bin/doom.nxf` at the shell.
 #
 # Everything below is for debugging and CI. `make help` lists it all.
@@ -55,7 +55,7 @@ QEMU_FLAGS   := -machine q35 -cpu $(QEMU_CPU) -smp $(QEMU_SMP) -m $(QEMU_MEM) \
                 -drive file=$(DISK),if=virtio,format=raw
 
 .PHONY: all build kernel tools user modules iso disk run debug \
-        test test-fs test-apps test-cc test-edit test-audio test-mouse test-doom-libc \
+        test test-fs test-apps test-cc test-edit test-audio test-shell test-shell-parser test-fat-read test-terminal test-doom-libc \
         fmt clippy clean help
 
 # --- What you actually run --------------------------------------------------
@@ -83,10 +83,11 @@ user:
 # policy -- the shell hands them capabilities at runtime.
 modules: tools user
 	@mkdir -p $(MODULE_DIR)
+	rm -f $(MODULE_DIR)/desktop.nxf $(MODULE_DIR)/compositor.nxf $(ISODIR)/boot/desktop.nxf $(ISODIR)/boot/compositor.nxf
 	$(NXFPACK) $(USER_DIR)/init -o $(MODULE_DIR)/init.nxf --name init --service --strict \
 		--cap PROCESS --cap CHANNEL --cap MEMORY --cap CLOCK --cap LOAD --cap DEBUG \
 		--stack 256K --heap 4M --max-memory 64M
-	$(NXFPACK) $(USER_DIR)/compositor -o $(MODULE_DIR)/compositor.nxf --name compositor --service --strict \
+	$(NXFPACK) $(USER_DIR)/display -o $(MODULE_DIR)/display.nxf --name display --service --strict \
 		--cap DISPLAY --cap INPUT --cap CHANNEL --cap MEMORY \
 		--stack 256K --heap 4M --max-memory 64M
 	$(NXFPACK) $(USER_DIR)/console -o $(MODULE_DIR)/console.nxf --name console --service --strict \
@@ -122,7 +123,7 @@ modules: tools user
 		--stack 512K --heap 32M --max-memory 64M
 
 # The interactive ISO: every module, and a GRUB menu whose default entry boots
-# the window system.
+# the full-screen shell.
 iso: $(ISO)
 $(ISO): kernel modules grub/grub.cfg
 	@test -f /usr/lib/grub/x86_64-efi/modinfo.sh || { \
@@ -203,9 +204,24 @@ test-edit: $(ISO) $(DISK)
 test-audio: $(ISO) $(DISK)
 	@scripts/run-audio-test.sh
 
-# The pointer and window management, driven through QEMU's monitor.
-test-mouse: $(ISO) $(DISK)
-	@python3 scripts/mouse-test.py
+# Shell workflows and fullscreen foreground applications, driven through QEMU.
+test-shell: $(ISO) $(DISK)
+	@python3 scripts/shell-test.py
+
+test-shell-parser:
+	@mkdir -p $(BUILD)
+	rustc --edition=2021 --test user/shell/src/syntax.rs -o $(BUILD)/shell-parser-test
+	@$(BUILD)/shell-parser-test
+
+test-fat-read:
+	@mkdir -p $(BUILD)
+	rustc --edition=2021 --test user/fs/tests/read.rs -o $(BUILD)/fat-read-test
+	@$(BUILD)/fat-read-test
+
+test-terminal:
+	@mkdir -p $(BUILD)
+	rustc --edition=2021 --test user/libdraw/src/lib.rs -o $(BUILD)/terminal-test
+	@$(BUILD)/terminal-test
 
 # Doom's mini-libc, built for the host so it can be checked directly.
 test-doom-libc:
@@ -234,7 +250,7 @@ help:
 	  'NodeOS' \
 	  '' \
 	  '  make          Build the kernel, userspace, ISO and disk' \
-	  '  make run      Boot the window system in QEMU' \
+	  '  make run      Boot the full-screen shell in QEMU' \
 	  '' \
 	  'Debug and CI' \
 	  '  make debug         Boot and wait for GDB on :1234' \
@@ -244,7 +260,10 @@ help:
 	  '  make test-cc       Compile and run a C program with cc' \
 	  '  make test-edit     Edit and save a file with the editor' \
 	  '  make test-audio    Check sound using QEMU'"'"'s wav backend' \
-	  '  make test-mouse    Drive the mouse and check the pixels' \
+	  '  make test-shell    Check shell workflows and fullscreen apps' \
+	  '  make test-shell-parser  Check quotes, escapes and scripts' \
+	  '  make test-fat-read Check batched and fragmented disk reads' \
+	  '  make test-terminal Check cursor and bounded scrollback state' \
 	  '  make test-doom-libc  Run the Doom mini-libc host test' \
 	  '  make fmt           Format the kernel' \
 	  '  make clippy        Lint the kernel' \

@@ -1,10 +1,8 @@
 //! # libdraw -- pixels, glyphs and a scrolling text grid
 //!
-//! Two processes now draw in NodeOS: `compositor`, which owns the physical
-//! framebuffer, and every client, which owns a shared memory object the
-//! compositor blits from. Both are 32-bit `0x00RRGGBB` linear buffers that
-//! differ only in where the bytes live, so the drawing code belongs to
-//! neither of them.
+//! The full-screen display broker owns the physical framebuffer; console
+//! and explicitly launched applications draw shared-memory surfaces. The
+//! console's text grid keeps visible cells, a cursor and bounded scrollback.
 //!
 //! There is exactly one pixel format handled here: 32 bits per pixel,
 //! `0x00RRGGBB` little-endian in memory (byte order B, G, R, X) -- what every
@@ -17,9 +15,12 @@
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+extern crate alloc;
+
 pub mod canvas;
 pub mod font;
 pub mod text;
+pub mod terminal_font;
 
 pub use canvas::{Canvas, Rgb};
 pub use font::GLYPH_SIZE;

@@ -4,3 +4,5 @@
 /doom_reference
 prebuilt/*.iso
 DOOM.WAD
+
+__pycache__/

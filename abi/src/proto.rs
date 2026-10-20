@@ -302,6 +302,9 @@ pub const CONSOLE_READ_KEY: u32 = 0x5008;
 /// A client that redraws a line needs to know where the console last put the
 /// cursor, which only the console tracks.
 pub const CONSOLE_GET_CURSOR: u32 = 0x5009;
+/// Set terminal text size. Payload: little-endian u32 (0 small, 1 normal,
+/// 2 large). Earlier output is rewrapped; reply payload is [`ConsoleInfo`].
+pub const CONSOLE_SET_FONT: u32 = 0x500A;
 
 /// Reply to [`CONSOLE_GET_INFO`].
 #[repr(C)]
@@ -311,9 +314,9 @@ pub struct ConsoleInfo {
     pub width_px: u32,
     /// Framebuffer height, in pixels.
     pub height_px: u32,
-    /// Text columns (width_px / glyph width).
+    /// Text columns in the padded terminal viewport.
     pub cols: u32,
-    /// Text rows (height_px / glyph height).
+    /// Text rows in the padded terminal viewport.
     pub rows: u32,
 }
 

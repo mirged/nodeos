@@ -321,3 +321,18 @@ impl Canvas {
         }
     }
 }
+
+impl Canvas {
+    /// Scroll a clipped rectangular text viewport without moving its margins.
+    pub fn scroll_rect_up(&mut self, x:u32,y:u32,w:u32,h:u32,pixels:u32,bg:Rgb) {
+        let w=w.min(self.width.saturating_sub(x));let h=h.min(self.height.saturating_sub(y));
+        let shift=pixels.min(h);if shift==0||w==0{return}
+        for row in 0..h-shift {
+            let dst=(y+row)as usize*self.pitch as usize+x as usize*4;
+            let src=(y+row+shift)as usize*self.pitch as usize+x as usize*4;
+            // SAFETY: clipping bounds both rows; copy permits overlap.
+            unsafe { core::ptr::copy(self.base.add(src),self.base.add(dst),w as usize*4); }
+        }
+        self.fill_rect(x,y+h-shift,w,shift,bg);
+    }
+}

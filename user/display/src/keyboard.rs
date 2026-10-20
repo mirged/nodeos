@@ -1,7 +1,7 @@
 //! PS/2 Set 1 scancode decoding.
 //!
 //! This used to live in `console`, back when `console` held the keyboard
-//! device. It belongs to the compositor now for the same reason the
+//! device. It belongs to the display broker now for the same reason the
 //! framebuffer does: there is one keyboard, and something has to decide which
 //! window the next keystroke is for.
 //!
@@ -30,8 +30,8 @@ pub struct KeyEvent {
 
 /// Make code of the left Meta ("Windows") key, which arrives `0xE0`-prefixed.
 ///
-/// The compositor's own hotkey has to be one that no client will ever want,
-/// because the compositor swallows it. Meta is the only key on the keyboard
+/// The display broker's own hotkey has to be one that no client will ever want,
+/// because the display broker swallows it. Meta is the only key on the keyboard
 /// that neither the shell's line editor nor Doom's thirty-year-old key table
 /// has any use for -- every function key, every modifier and every letter is
 /// spoken for somewhere.
@@ -201,7 +201,7 @@ impl Decoder {
 
 impl KeyEvent {
     /// Whether this key *is* the Meta modifier: the extended Windows key or its
-    /// Scroll Lock alias. Both are swallowed by the compositor and both take
+    /// Scroll Lock alias. Both are swallowed by the display broker and both take
     /// part in the tap-to-cycle-shortcut logic in `main`.
     pub fn is_meta_key(&self) -> bool {
         (self.extended && self.scancode == META_MAKE) || (!self.extended && self.scancode == SCROLL_LOCK_MAKE)

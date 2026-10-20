@@ -27,7 +27,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "compositor"
+name = "console"
 version = "0.1.0"
 dependencies = [
  "libdraw",
@@ -36,7 +36,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "console"
+name = "display"
 version = "0.1.0"
 dependencies = [
  "libdraw",

@@ -37,6 +37,7 @@ pub mod env;
 pub mod io;
 pub mod mem;
 pub mod process;
+pub mod session;
 pub mod rt;
 pub mod start;
 pub mod sync;

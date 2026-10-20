@@ -37,17 +37,12 @@ use crate::task::Process;
 /// thing more plainly.
 pub struct BootDevices {
     /// The boot framebuffer, if the loader reported one. Granted to
-    /// `"compositor"` at index 0 of its bootstrap message's capabilities.
+    /// `"display"` at index 0 of its bootstrap message's capabilities.
     pub framebuffer: Option<Arc<Device>>,
-    /// The PS/2 keyboard. Granted to `"compositor"` at index 1.
+    /// The PS/2 keyboard. Granted to `"display"` at index 1.
     pub keyboard: Arc<Device>,
-    /// The PS/2 controller's auxiliary port -- the mouse, if the machine has
-    /// one. Granted to `"compositor"` at index 2.
-    ///
-    /// The object exists whether or not a mouse answered the bring-up probe,
-    /// and the capability says which: the display server is the one process
-    /// that has to decide where a pointer is, so it is the one process that
-    /// has to be able to find out there isn't one.
+    /// Kernel mouse device, reserved for driver tests. The shell boot does
+    /// not grant this capability to any userspace service.
     pub pointer: Arc<Device>,
     /// The AC'97 audio controller, if the machine has one. Granted to
     /// `"audio"`, which is the only process that ever touches it.
@@ -68,14 +63,12 @@ fn policy(name: &str) -> CapSet {
         // load further images. It gets no device or filesystem authority: it
         // hands those to the services that need them, having never held them.
         "init" => base.with(CapClass::Process).with(CapClass::Load).with(CapClass::Clock).with(CapClass::Debug),
-        // The compositor is the only thing in the system that holds the
+        // The display broker is the only thing in the system that holds the
         // screen and the keyboard. Everything that wants to draw or to be
         // typed at is one of its clients, and holds a channel instead.
-        "compositor" => base.with(CapClass::Display).with(CapClass::Input),
-        // The console service used to hold those two devices, and with them
-        // the whole screen. It is now a compositor client with a window, so
-        // the floor is all it needs -- which is why it and `doom` can be on
-        // screen at the same time.
+        "display" => base.with(CapClass::Display).with(CapClass::Input),
+        // The text console gets a full-screen surface from the display
+        // broker, keeping all device capabilities out of the shell session.
         "console" => base,
         // The filesystem service may create and serve files. It also holds
         // the disk, because the only thing in this system that speaks blocks
@@ -112,14 +105,14 @@ fn policy(name: &str) -> CapSet {
             .with(CapClass::FileWrite)
             .with(CapClass::FileCreate)
             .with(CapClass::Audio),
-        // Doom is a compositor client too. It does not go through `console`
-        // -- it repaints its whole window 35 times a second and wants raw
+        // Doom is a display broker client too. It does not go through `console`
+        // -- it repaints its whole surface 35 times a second and wants raw
         // make/break scancodes, neither of which the console protocol offers
-        // -- but the window system serves both without either holding a
+        // -- but the display broker serves both without either holding a
         // device. Doom needs the clock for its frame timing, and `Audio` for
         // the channel to the mixer -- which is still not a device: the sound
         // card belongs to `audio`, exactly as the screen belongs to the
-        // compositor.
+        // display broker.
         "doom" => base.with(CapClass::Clock).with(CapClass::Audio),
         // Anything else gets the floor: memory and channels.
         _ => base,
@@ -181,7 +174,7 @@ unsafe fn data_module_vmo(name: &str, start: u64, len: u64) -> Option<Arc<crate:
 /// equal and keeps the loader's order.
 fn launch_rank(name: &str) -> u32 {
     match name {
-        "compositor" => 0,
+        "display" => 0,
         // Both are services with clients below them, and neither is a client
         // of anything, so they can come up in parallel with the console.
         "audio" | "fs" => 1,
@@ -261,23 +254,22 @@ pub unsafe fn launch_boot_modules(boot_info: &BootInfo, devices: &BootDevices) -
         // depend on another module already being launched -- which only the
         // caller can know.
         let extra_handles = match name {
-            // The compositor is the one holder of the screen and the keyboard.
+            // The display broker is the one holder of the screen and the keyboard.
             // Every other program that draws gets a channel to it instead,
             // below.
-            "compositor" => match &devices.framebuffer {
+            "display" => match &devices.framebuffer {
                 Some(framebuffer) => alloc::vec![
                     Handle::root(framebuffer.clone(), framebuffer.default_rights()),
                     Handle::root(devices.keyboard.clone(), devices.keyboard.default_rights()),
-                    Handle::root(devices.pointer.clone(), devices.pointer.default_rights()),
                 ],
                 None => {
-                    crate::warn!("compositor launched with no framebuffer to drive");
+                    crate::warn!("display broker launched with no framebuffer to drive");
                     Vec::new()
                 }
             },
-            "console" => connect_to(&launched, "compositor", name).into_iter().collect(),
+            "console" => connect_to(&launched, "display", name).into_iter().collect(),
             // The audio service is handed the sound card the same way the
-            // compositor is handed the screen: one device capability, held by
+            // display broker is handed the screen: one device capability, held by
             // one process, for the lifetime of the boot.
             "audio" => devices
                 .audio
@@ -302,14 +294,14 @@ pub unsafe fn launch_boot_modules(boot_info: &BootInfo, devices: &BootDevices) -
             // start.
             // The shell reads its capabilities positionally: console first,
             // filesystem second, then the two it only forwards to the programs
-            // it launches -- the compositor (so a graphical program like Doom
-            // can open a window) and the mixer (so Doom can make a noise). A
+            // it launches -- the display broker (so a graphical program like Doom
+            // can take the full screen) and the mixer (so Doom can make a noise). A
             // boot with no `audio` module simply omits the last one.
             "shell" => {
                 let mut handles: Vec<Handle> = connect_to(&launched, "console", name).into_iter().collect();
                 if !handles.is_empty() {
                     handles.extend(connect_to(&launched, "fs", name));
-                    handles.extend(connect_to(&launched, "compositor", name));
+                    handles.extend(connect_to(&launched, "display", name));
                     handles.extend(connect_to(&launched, "audio", name));
                 }
                 handles
@@ -317,12 +309,12 @@ pub unsafe fn launch_boot_modules(boot_info: &BootInfo, devices: &BootDevices) -
             // Doom's whole authority is two handles: a window, and the IWAD as
             // a read-only memory object. It cannot create a process, touch a
             // filesystem, or reach any device -- including the screen it is
-            // drawing on, which it now reaches only through the compositor.
+            // drawing on, which it now reaches only through the display broker.
             //
             // The connection has to come first or not at all: `doom` reads its
             // capabilities positionally, and handing it a WAD where it expects
             // a channel would be worse than handing it nothing.
-            "doom" => match connect_to(&launched, "compositor", name) {
+            "doom" => match connect_to(&launched, "display", name) {
                 Some(connection) => {
                     let mut handles = alloc::vec![connection];
                     match data.iter().find(|entry| entry.name.ends_with("wad")) {

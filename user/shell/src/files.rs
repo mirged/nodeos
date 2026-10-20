@@ -16,50 +16,26 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libnode::abi::message::{BootstrapMessage, KIND_BOOTSTRAP};
 use libnode::abi::message::MessageFlags;
 use libnode::abi::proto::{self, fs_kind};
-use libnode::abi::{CapClass, Rights};
-use libnode::mem::Vmo;
-use libnode::process::Process;
 use libnode::{println, Channel, Error, Message};
 
 use crate::write_text;
 
-/// Run one file command.
-///
-/// `compositor` and `audio` are only used by `run`: they are the session
-/// channels every child gets, so a program that needs a window or a mixer finds
-/// them without having to ask.
-pub fn run(
-    console: &Channel,
-    files: &Channel,
-    compositor: Option<&Channel>,
-    audio: Option<&Channel>,
-    cwd: &str,
-    command: &str,
-    rest: &str,
-) {
-    let rest = rest.trim();
-    match command {
-        "ls" => list(console, files, &resolve(cwd, if rest.is_empty() { "." } else { rest })),
-        "cat" => cat(console, files, &resolve(cwd, rest)),
-        "write" => put(console, files, cwd, rest, false),
-        "append" => put(console, files, cwd, rest, true),
-        "mkdir" => simple(console, files, proto::FS_MKDIR, &resolve(cwd, rest), "created"),
-        "rm" => simple(console, files, proto::FS_UNLINK, &resolve(cwd, rest), "removed"),
-        "stat" => stat(console, files, &resolve(cwd, rest)),
-        "df" => df(console, files),
-        "fstest" => self_test(console, files),
-        "touch" => touch(console, files, cwd, rest),
-        "run" => run_program(console, files, compositor, audio, cwd, rest),
-        _ => {}
-    }
-}
-
+/// Change directory only after the filesystem confirms it is a directory.
 pub fn change_dir(console: &Channel, files: &Channel, cwd: &mut String, rest: &str) {
-    let path = resolve(cwd, if rest.trim().is_empty() { "/" } else { rest.trim() });
-    match call(files, Message::new(proto::FS_STAT).with_payload(path.as_bytes())) {
+    let path = resolve(
+        cwd,
+        if rest.trim().is_empty() {
+            "/"
+        } else {
+            rest.trim()
+        },
+    );
+    match call(
+        files,
+        Message::new(proto::FS_STAT).with_payload(path.as_bytes()),
+    ) {
         Ok(reply) => match proto::decode::<proto::FsStat>(&reply.payload) {
             Some(stat) if stat.kind == fs_kind::DIRECTORY => *cwd = path,
             Some(_) => write_text(console, "cd: not a directory\n"),
@@ -72,16 +48,23 @@ pub fn change_dir(console: &Channel, files: &Channel, cwd: &mut String, rest: &s
 pub fn resolve(cwd: &str, input: &str) -> String {
     let mut components: Vec<String> = Vec::new();
     let source = if input.starts_with('/') { input } else { cwd };
-    for component in source.split('/').chain(if input.starts_with('/') { "" } else { input }.split('/')) {
+    for component in source
+        .split('/')
+        .chain(if input.starts_with('/') { "" } else { input }.split('/'))
+    {
         match component {
             "" | "." => {}
-            ".." => { components.pop(); }
+            ".." => {
+                components.pop();
+            }
             name => components.push(name.into()),
         }
     }
     let mut path = String::from("/");
     for (index, component) in components.iter().enumerate() {
-        if index != 0 { path.push('/'); }
+        if index != 0 {
+            path.push('/');
+        }
         path.push_str(component);
     }
     path
@@ -92,31 +75,71 @@ pub fn resolve(cwd: &str, input: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn list(console: &Channel, files: &Channel, path: &str) {
-    let reply = match call(files, Message::new(proto::FS_LIST).with_payload(path.as_bytes())) {
+    let reply = match call(
+        files,
+        Message::new(proto::FS_LIST).with_payload(path.as_bytes()),
+    ) {
         Ok(reply) => reply,
         Err(error) => return report(console, path, error),
     };
-    let mut count = 0;
-    for record in reply.payload.split(|byte| *byte == 0) {
-        if record.is_empty() {
-            continue;
-        }
-        let Ok(text) = core::str::from_utf8(record) else { continue };
-        let mut columns = text.split('\t');
-        let name = columns.next().unwrap_or("");
-        let kind = columns.next().unwrap_or("f");
-        let size = columns.next().unwrap_or("0");
-        let mut line = String::new();
-        let _ = core::fmt::write(
-            &mut line,
-            format_args!("{:<20} {:>10} {}\n", name, if kind == "d" { "<dir>" } else { size }, kind),
+    write_text(
+        console,
+        &alloc::format!(
+            "\x1b[1m{}\x1b[0m\n\n\x1b[2m{:<32} {:>12}\x1b[0m\n",
+            path,
+            "Name",
+            "Size"
+        ),
+    );
+    let mut entries: Vec<(&str, bool, u64)> = reply
+        .payload
+        .split(|b| *b == 0)
+        .filter_map(|record| {
+            let text = core::str::from_utf8(record).ok()?;
+            let mut fields = text.split('\t');
+            let name = fields.next()?;
+            if name.is_empty() {
+                return None;
+            }
+            Some((
+                name,
+                fields.next() == Some("d"),
+                fields.next().unwrap_or("0").parse().unwrap_or(0),
+            ))
+        })
+        .collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    for (name, dir, size) in &entries {
+        let label = alloc::format!("{}{}", name, if *dir { "/" } else { "" });
+        let size = if *dir {
+            String::from("folder")
+        } else if *size >= 1024 * 1024 {
+            alloc::format!(
+                "{}.{:01} MiB",
+                size / (1024 * 1024),
+                (size % (1024 * 1024)) * 10 / (1024 * 1024)
+            )
+        } else if *size >= 1024 {
+            alloc::format!("{}.{:01} KiB", size / 1024, (size % 1024) * 10 / 1024)
+        } else {
+            alloc::format!("{} B", size)
+        };
+        let color = if *dir {
+            "\x1b[36m"
+        } else if name.to_ascii_lowercase().ends_with(".nxf") {
+            "\x1b[32m"
+        } else {
+            "\x1b[0m"
+        };
+        write_text(
+            console,
+            &alloc::format!("{}{:<32}\x1b[0m {:>12}\n", color, label, size),
         );
-        write_text(console, &line);
-        count += 1;
     }
-    let mut summary = String::new();
-    let _ = core::fmt::write(&mut summary, format_args!("{count} entries in {path}\n"));
-    write_text(console, &summary);
+    write_text(
+        console,
+        &alloc::format!("\n\x1b[2m{} entries\x1b[0m\n", entries.len()),
+    );
 }
 
 fn cat(console: &Channel, files: &Channel, path: &str) {
@@ -131,7 +154,10 @@ fn cat(console: &Channel, files: &Channel, path: &str) {
             length: 4096,
             _reserved: 0,
         });
-        let Ok(reply) = call(files, Message::new(proto::FS_READ).with_payload(request.bytes())) else {
+        let Ok(reply) = call(
+            files,
+            Message::new(proto::FS_READ).with_payload(request.bytes()),
+        ) else {
             break;
         };
         if reply.payload.is_empty() {
@@ -141,200 +167,22 @@ fn cat(console: &Channel, files: &Channel, path: &str) {
         // Written a chunk at a time rather than assembled: a large file would
         // otherwise be held twice, once here and once in the console's own
         // buffer, for no benefit.
-        write_text(console, core::str::from_utf8(&reply.payload).unwrap_or("<binary>"));
+        write_text(
+            console,
+            core::str::from_utf8(&reply.payload).unwrap_or("<binary>"),
+        );
     }
     close(files, node.node);
     write_text(console, "\n");
 }
 
 /// `write <path> <text>` and `append <path> <text>`.
-fn put(console: &Channel, files: &Channel, cwd: &str, rest: &str, append: bool) {
-    let mut parts = rest.splitn(2, ' ');
-    let path = parts.next().unwrap_or("").trim();
-    let text = parts.next().unwrap_or("");
-    if path.is_empty() {
-        return write_text(console, "usage: write <path> <text>\n");
-    }
-    let path = resolve(cwd, path);
-
-    let node = if append {
-        match open(files, &path) {
-            Ok(node) => node,
-            // Appending to a file that is not there creates it, which is what
-            // every shell's `>>` does.
-            Err(_) => match create(files, &path) {
-                Ok(node) => node,
-                Err(error) => return report(console, &path, error),
-            },
-        }
-    } else {
-        match create(files, &path) {
-            Ok(node) => node,
-            Err(error) => return report(console, &path, error),
-        }
-    };
-
-    let mut payload = Vec::new();
-    let header = proto::Encoded::new(proto::FsWriteHeader {
-        node: node.node,
-        offset: if append { node.size } else { 0 },
-        length: (text.len() + 1) as u32,
-        _reserved: 0,
-    });
-    payload.extend_from_slice(header.bytes());
-    payload.extend_from_slice(text.as_bytes());
-    payload.push(b'\n');
-
-    match call(files, Message::new(proto::FS_WRITE).with_payload(&payload)) {
-        Ok(reply) => {
-            let written = proto::decode::<proto::FsWriteHeader>(&reply.payload).map(|h| h.length).unwrap_or(0);
-            let mut line = String::new();
-            let _ = core::fmt::write(&mut line, format_args!("wrote {written} bytes to {path}\n"));
-            write_text(console, &line);
-        }
-        Err(error) => report(console, &path, error),
-    }
-    close(files, node.node);
-}
-
-fn touch(console: &Channel, files: &Channel, cwd: &str, rest: &str) {
-    let input = rest.trim();
-    if input.is_empty() {
-        return write_text(console, "usage: touch <path>\n");
-    }
-    let path = resolve(cwd, input);
-    match create(files, &path) {
-        Ok(node) => {
-            close(files, node.node);
-            let mut line = String::new();
-            let _ = core::fmt::write(&mut line, format_args!("created {path}\n"));
-            write_text(console, &line);
-        }
-        Err(_) => match open(files, &path) {
-            Ok(node) => {
-                close(files, node.node);
-                write_text(console, "touched\n");
-            }
-            Err(error) => report(console, &path, error),
-        },
-    }
-}
-
-fn run_program(
-    console: &Channel,
-    files: &Channel,
-    compositor: Option<&Channel>,
-    audio: Option<&Channel>,
-    cwd: &str,
-    rest: &str,
-) {
-    // `run <program> [args...]`: the first word names the program, the rest are
-    // its command line. Splitting on whitespace is the whole of this shell's
-    // quoting; a path with a space in it is not something it can express.
-    let mut words = rest.split_whitespace();
-    let Some(program) = words.next() else {
-        return write_text(console, "usage: run <program> [args...]\n");
-    };
-    let args: Vec<&str> = words.collect();
-    let path = resolve(cwd, program);
-    let Ok(node) = open(files, &path) else {
-        return report(console, &path, Error::NotFound);
-    };
-    if node.kind != fs_kind::FILE {
-        close(files, node.node);
-        return write_text(console, "run: not a regular file\n");
-    }
-
-    let image = read_all(files, node.node);
-    close(files, node.node);
-    let Some(image) = image else {
-        return write_text(console, "run: could not read executable\n");
-    };
-    if image.len() < 4 || image[..4] != *b"NXF\0" {
-        return write_text(console, "run: file is not an NXF executable\n");
-    }
-
-    let Ok(vmo) = Vmo::create(image.len() as u64, false) else {
-        return write_text(console, "run: could not allocate image memory\n");
-    };
-    if vmo.write(0, &image).is_err() {
-        return write_text(console, "run: could not stage executable\n");
-    }
-
-    let Ok(process) = Process::create(&path, u32::MAX) else {
-        return write_text(console, "run: process creation denied\n");
-    };
-    let Ok(loaded) = process.load(&vmo, image.len() as u64) else {
-        return write_text(console, "run: executable load failed\n");
-    };
-    let Ok((parent_bootstrap, child_bootstrap)) = Channel::create() else {
-        return write_text(console, "run: could not create bootstrap channel\n");
-    };
-    if process.start(loaded.entry, loaded.stack, child_bootstrap.into_handle()).is_err() {
-        return write_text(console, "run: could not start process\n");
-    }
-
-    let granted_caps = [
-        CapClass::Process,
-        CapClass::Load,
-        CapClass::Channel,
-        CapClass::Memory,
-        CapClass::Clock,
-        CapClass::FileRead,
-        CapClass::FileWrite,
-        CapClass::FileCreate,
-        CapClass::Audio,
-    ]
-    .into_iter()
-    .fold(0u32, |mask, class| mask | (1 << class as u32));
-
-    // Every child gets the shell's session capabilities, in a fixed order the
-    // programs know: console (0), filesystem (1), compositor (2), audio (3). A
-    // program reads the ones it needs and ignores the rest -- the console apps
-    // take 0 and 1, Doom takes 1 (for its IWAD), 2 and 3.
-    let sources = [Some(console), Some(files), compositor, audio];
-    let extra_count = sources.iter().flatten().count() as u32;
-
-    let info = proto::Encoded::new(BootstrapMessage {
-        version: 1,
-        granted_caps,
-        process: nodeos_abi::HandleValue::INVALID,
-        space: nodeos_abi::HandleValue::INVALID,
-        thread: nodeos_abi::HandleValue::INVALID,
-        namespace: nodeos_abi::HandleValue::INVALID,
-        image_base: 0,
-        // Generous: the compiler maps an 8 MiB address space for the programs
-        // it runs on top of its own allocations, and the editor maps a window.
-        // The object is demand-paged, so wanting the room costs nothing until
-        // a program uses it.
-        heap_size: 16 * 1024 * 1024,
-        extra_count,
-        _reserved: 0,
-    });
-
-    // The command line rides after the bootstrap struct, one NUL-terminated
-    // argument after another, with the resolved program path as `argv[0]`.
-    let mut payload = Vec::from(info.bytes());
-    for arg in core::iter::once(path.as_str()).chain(args.iter().copied()) {
-        payload.extend_from_slice(arg.as_bytes());
-        payload.push(0);
-    }
-
-    let mut message = Message::new(KIND_BOOTSTRAP).with_payload(&payload);
-    for source in sources.into_iter().flatten() {
-        let Ok(handle) = source.handle().duplicate(Rights::DEFAULT) else {
-            return write_text(console, "run: could not duplicate a capability\n");
-        };
-        message = message.with_handle(handle);
-    }
-    if parent_bootstrap.send(message).is_err() {
-        return write_text(console, "run: could not deliver bootstrap\n");
-    }
-    write_text(console, "process started\n");
-}
 
 fn stat(console: &Channel, files: &Channel, path: &str) {
-    match call(files, Message::new(proto::FS_STAT).with_payload(path.as_bytes())) {
+    match call(
+        files,
+        Message::new(proto::FS_STAT).with_payload(path.as_bytes()),
+    ) {
         Ok(reply) => {
             let Some(stat) = proto::decode::<proto::FsStat>(&reply.payload) else {
                 return write_text(console, "malformed reply\n");
@@ -345,7 +193,11 @@ fn stat(console: &Channel, files: &Channel, path: &str) {
                 format_args!(
                     "{path}: {} bytes, {}, first cluster {}, {} entries\n",
                     stat.size,
-                    if stat.kind == fs_kind::DIRECTORY { "directory" } else { "file" },
+                    if stat.kind == fs_kind::DIRECTORY {
+                        "directory"
+                    } else {
+                        "file"
+                    },
                     stat.node,
                     stat.entries
                 ),
@@ -363,7 +215,9 @@ fn df(console: &Channel, files: &Channel) {
                 return write_text(console, "malformed reply\n");
             };
             let tag = stat.kind.to_le_bytes();
-            let name = core::str::from_utf8(&tag).unwrap_or("FAT").trim_end_matches('\0');
+            let name = core::str::from_utf8(&tag)
+                .unwrap_or("FAT")
+                .trim_end_matches('\0');
             let mut line = String::new();
             let _ = core::fmt::write(
                 &mut line,
@@ -378,20 +232,6 @@ fn df(console: &Channel, files: &Channel) {
             write_text(console, &line);
         }
         Err(error) => report(console, "df", error),
-    }
-}
-
-fn simple(console: &Channel, files: &Channel, kind: u32, path: &str, verb: &str) {
-    if path.is_empty() {
-        return write_text(console, "usage: <command> <path>\n");
-    }
-    match call(files, Message::new(kind).with_payload(path.as_bytes())) {
-        Ok(_) => {
-            let mut line = String::new();
-            let _ = core::fmt::write(&mut line, format_args!("{verb} {path}\n"));
-            write_text(console, &line);
-        }
-        Err(error) => report(console, path, error),
     }
 }
 
@@ -434,7 +274,12 @@ fn self_test(console: &Channel, files: &Channel) {
     // representation rather than a cached entry.
     close(files, node.node);
     let reopened = open(files, PATH);
-    step(reopened.as_ref().is_ok_and(|n| n.size == FIRST.len() as u64), "reopen, size matches");
+    step(
+        reopened
+            .as_ref()
+            .is_ok_and(|n| n.size == FIRST.len() as u64),
+        "reopen, size matches",
+    );
     let Ok(reopened) = reopened else {
         return finish(console, failures);
     };
@@ -450,7 +295,10 @@ fn self_test(console: &Channel, files: &Channel) {
         all.extend_from_slice(SECOND.as_bytes());
         all
     };
-    step(read.as_deref() == Some(expected.as_slice()), "appended contents match");
+    step(
+        read.as_deref() == Some(expected.as_slice()),
+        "appended contents match",
+    );
     close(files, reopened.node);
 
     // It should be in the root listing.
@@ -460,11 +308,14 @@ fn self_test(console: &Channel, files: &Channel) {
     step(listed, "appears in the root listing");
 
     // And stat should agree about its length.
-    let sized = call(files, Message::new(proto::FS_STAT).with_payload(PATH.as_bytes()))
-        .ok()
-        .and_then(|reply| proto::decode::<proto::FsStat>(&reply.payload))
-        .map(|stat| stat.size == expected.len() as u64)
-        .unwrap_or(false);
+    let sized = call(
+        files,
+        Message::new(proto::FS_STAT).with_payload(PATH.as_bytes()),
+    )
+    .ok()
+    .and_then(|reply| proto::decode::<proto::FsStat>(&reply.payload))
+    .map(|stat| stat.size == expected.len() as u64)
+    .unwrap_or(false);
     step(sized, "stat reports 27 bytes");
 
     // A directory, and a file inside it, to prove the tree is more than one
@@ -482,14 +333,30 @@ fn self_test(console: &Channel, files: &Channel) {
     // Removing a directory that still has something in it must be refused --
     // this is the one destructive operation here and the check that it is not
     // recursive is worth having.
-    let refused = call(files, Message::new(proto::FS_UNLINK).with_payload(b"/SHDIR")).is_err();
+    let refused = call(
+        files,
+        Message::new(proto::FS_UNLINK).with_payload(b"/SHDIR"),
+    )
+    .is_err();
     step(refused, "rm refuses a non-empty directory");
 
     // Clean up everything except the file the host will check for.
-    let removed = call(files, Message::new(proto::FS_UNLINK).with_payload(b"/SHDIR/INNER.TXT")).is_ok()
-        && call(files, Message::new(proto::FS_UNLINK).with_payload(b"/SHDIR")).is_ok();
+    let removed = call(
+        files,
+        Message::new(proto::FS_UNLINK).with_payload(b"/SHDIR/INNER.TXT"),
+    )
+    .is_ok()
+        && call(
+            files,
+            Message::new(proto::FS_UNLINK).with_payload(b"/SHDIR"),
+        )
+        .is_ok();
     step(removed, "remove the subdirectory");
-    let gone = call(files, Message::new(proto::FS_OPEN).with_payload(b"/SHDIR/INNER.TXT")).is_err();
+    let gone = call(
+        files,
+        Message::new(proto::FS_OPEN).with_payload(b"/SHDIR/INNER.TXT"),
+    )
+    .is_err();
     step(gone, "the removed file is gone");
 
     finish(console, failures);
@@ -501,7 +368,10 @@ fn finish(console: &Channel, failures: u32) {
         println!("fstest: PASS");
     } else {
         let mut line = String::new();
-        let _ = core::fmt::write(&mut line, format_args!("fstest: FAIL ({failures} step(s))\n"));
+        let _ = core::fmt::write(
+            &mut line,
+            format_args!("fstest: FAIL ({failures} step(s))\n"),
+        );
         write_text(console, &line);
         println!("fstest: FAIL ({failures} steps)");
     }
@@ -533,18 +403,27 @@ fn call(files: &Channel, request: Message) -> Result<Message, Error> {
 }
 
 fn open(files: &Channel, path: &str) -> Result<proto::FsOpenReply, Error> {
-    let reply = call(files, Message::new(proto::FS_OPEN).with_payload(path.as_bytes()))?;
+    let reply = call(
+        files,
+        Message::new(proto::FS_OPEN).with_payload(path.as_bytes()),
+    )?;
     proto::decode::<proto::FsOpenReply>(&reply.payload).ok_or(Error::BadState)
 }
 
 fn create(files: &Channel, path: &str) -> Result<proto::FsOpenReply, Error> {
-    let reply = call(files, Message::new(proto::FS_CREATE).with_payload(path.as_bytes()))?;
+    let reply = call(
+        files,
+        Message::new(proto::FS_CREATE).with_payload(path.as_bytes()),
+    )?;
     proto::decode::<proto::FsOpenReply>(&reply.payload).ok_or(Error::BadState)
 }
 
 fn close(files: &Channel, node: u64) {
     let request = proto::Encoded::new(proto::FsCloseRequest { node });
-    let _ = call(files, Message::new(proto::FS_CLOSE).with_payload(request.bytes()));
+    let _ = call(
+        files,
+        Message::new(proto::FS_CLOSE).with_payload(request.bytes()),
+    );
 }
 
 fn write_at(files: &Channel, node: u64, offset: u64, data: &[u8]) -> Result<usize, Error> {
@@ -557,7 +436,9 @@ fn write_at(files: &Channel, node: u64, offset: u64, data: &[u8]) -> Result<usiz
     let mut payload = Vec::from(header.bytes());
     payload.extend_from_slice(data);
     let reply = call(files, Message::new(proto::FS_WRITE).with_payload(&payload))?;
-    Ok(proto::decode::<proto::FsWriteHeader>(&reply.payload).map(|h| h.length as usize).unwrap_or(0))
+    Ok(proto::decode::<proto::FsWriteHeader>(&reply.payload)
+        .map(|h| h.length as usize)
+        .unwrap_or(0))
 }
 
 fn read_all(files: &Channel, node: u64) -> Option<Vec<u8>> {
@@ -569,7 +450,11 @@ fn read_all(files: &Channel, node: u64) -> Option<Vec<u8>> {
             length: 4096,
             _reserved: 0,
         });
-        let reply = call(files, Message::new(proto::FS_READ).with_payload(request.bytes())).ok()?;
+        let reply = call(
+            files,
+            Message::new(proto::FS_READ).with_payload(request.bytes()),
+        )
+        .ok()?;
         if reply.payload.is_empty() {
             return Some(out);
         }
@@ -578,7 +463,298 @@ fn read_all(files: &Channel, node: u64) -> Option<Vec<u8>> {
 }
 
 fn report(console: &Channel, what: &str, error: Error) {
-    let mut line = String::new();
-    let _ = core::fmt::write(&mut line, format_args!("{what}: {error:?}\n"));
-    write_text(console, &line);
+    crate::show_error(console, what, error);
+}
+
+/// Execute file commands with parsed arguments, preserving quoted paths/text.
+pub fn command(
+    console: &Channel,
+    files: &Channel,
+    cwd: &str,
+    name: &str,
+    args: &[String],
+) -> Result<(), Error> {
+    let path = |at: usize| {
+        args.get(at)
+            .map(|s| resolve(cwd, s))
+            .ok_or(Error::InvalidArgument)
+    };
+    match name {
+        "ls" => list(
+            console,
+            files,
+            &resolve(cwd, args.first().map(String::as_str).unwrap_or(".")),
+        ),
+        "cat" => cat(console, files, &path(0)?),
+        "stat" => stat(console, files, &path(0)?),
+        "df" => df(console, files),
+        "fstest" => self_test(console, files),
+        "mkdir" | "rm" => {
+            let p = path(0)?;
+            call(
+                files,
+                Message::new(if name == "mkdir" {
+                    proto::FS_MKDIR
+                } else {
+                    proto::FS_UNLINK
+                })
+                .with_payload(p.as_bytes()),
+            )?;
+        }
+        "touch" => {
+            let p = path(0)?;
+            match open(files, &p) {
+                Ok(node) => close(files, node.node),
+                Err(Error::NotFound) => {
+                    let node = create(files, &p)?;
+                    close(files, node.node)
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        "write" | "append" => {
+            let p = path(0)?;
+            let text = args.get(1..).unwrap_or(&[]).join(" ");
+            let node = if name == "append" {
+                match open(files, &p) {
+                    Ok(node) => node,
+                    Err(Error::NotFound) => create(files, &p)?,
+                    Err(e) => return Err(e),
+                }
+            } else {
+                create(files, &p)?
+            };
+            let result = (|| {
+                let mut offset = if name == "append" { node.size } else { 0 };
+                for chunk in text.as_bytes().chunks(32768) {
+                    let written = write_at(files, node.node, offset, chunk)?;
+                    if written != chunk.len() {
+                        return Err(Error::BadState);
+                    }
+                    offset += written as u64;
+                }
+                Ok(())
+            })();
+            close(files, node.node);
+            result?;
+        }
+        "cp" => {
+            let force = args.first().map(|s| s == "-f").unwrap_or(false);
+            let at = force as usize;
+            copy_file(files, &path(at)?, &path(at + 1)?, force)?;
+        }
+        "grep" => {
+            let pattern = args.first().ok_or(Error::InvalidArgument)?;
+            let p = path(1)?;
+            let mut line = Vec::new();
+            let mut number = 1;
+            let mut matched = 0;
+            scan_file(files, &p, |bytes| {
+                for byte in bytes {
+                    if *byte == b'\n' {
+                        if String::from_utf8_lossy(&line).contains(pattern.as_str()) {
+                            matched += 1;
+                            write_text(
+                                console,
+                                &alloc::format!("{number}:{}\n", String::from_utf8_lossy(&line)),
+                            );
+                        }
+                        line.clear();
+                        number += 1;
+                    } else {
+                        if line.len() >= 32768 {
+                            return Err(Error::LimitExceeded);
+                        }
+                        line.push(*byte);
+                    }
+                }
+                Ok(true)
+            })?;
+            if !line.is_empty() && String::from_utf8_lossy(&line).contains(pattern.as_str()) {
+                matched += 1;
+                write_text(
+                    console,
+                    &alloc::format!("{number}:{}\n", String::from_utf8_lossy(&line)),
+                );
+            }
+            println!("shell: grep matched {matched} line(s)");
+        }
+        "more" => {
+            let p = path(0)?;
+            let reply = console.call_with(Message::new(proto::CONSOLE_GET_INFO), 128, 0)?;
+            let info =
+                proto::decode::<proto::ConsoleInfo>(&reply.payload).ok_or(Error::BadState)?;
+            let rows = info.rows.saturating_sub(2).max(1) as usize;
+            let cols = info.cols.max(1) as usize;
+            let mut used = 0;
+            let mut column = 0;
+            let mut pending = Vec::new();
+            let mut allowance = rows;
+            scan_file(files, &p, |bytes| {
+                for byte in bytes {
+                    if *byte == 0 {
+                        return Err(Error::NotSupported);
+                    }
+                    pending.push(*byte);
+                    if *byte == b'\n' {
+                        used += 1;
+                        column = 0;
+                    } else {
+                        column += 1;
+                        if column >= cols {
+                            used += 1;
+                            column = 0;
+                        }
+                    }
+                    if used >= allowance {
+                        write_text(console, &String::from_utf8_lossy(&pending));
+                        pending.clear();
+                        write_text(console, "-- more --  Space: page  Enter: line  q: quit");
+                        println!("shell: pager waiting");
+                        let key = loop {
+                            let reply =
+                                console.call_with(Message::new(proto::CONSOLE_READ_KEY), 128, 0)?;
+                            let Some(key) = proto::decode::<proto::ConsoleKey>(&reply.payload)
+                            else {
+                                return Err(Error::BadState);
+                            };
+                            if key.pressed != 0
+                                && key.modifiers & proto::wm_mod::CTRL != 0
+                                && key.ascii == b'c'
+                            {
+                                break 3;
+                            }
+                            if key.pressed != 0
+                                && matches!(key.ascii, b' ' | b'\n' | b'q' | b'Q' | 3)
+                            {
+                                break key.ascii;
+                            }
+                        };
+                        write_text(console, "\n");
+                        if matches!(key, b'q' | b'Q' | 3) {
+                            return Ok(false);
+                        }
+                        used = 0;
+                        allowance = if key == b'\n' { 1 } else { rows };
+                    }
+                }
+                Ok(true)
+            })?;
+            if !pending.is_empty() {
+                write_text(console, &String::from_utf8_lossy(&pending));
+            }
+            write_text(console, "\n");
+        }
+        _ => return Err(Error::NotSupported),
+    }
+    Ok(())
+}
+/// Read bounded command-file contents and close the handle on every path.
+pub fn read_file(files: &Channel, path: &str, limit: usize) -> Result<Vec<u8>, Error> {
+    let node = open(files, path)?;
+    let result = (|| {
+        if node.kind != fs_kind::FILE || node.size > limit as u64 {
+            return Err(Error::LimitExceeded);
+        }
+        let mut out = Vec::with_capacity(node.size as usize);
+        let mut offset = 0;
+        while offset < node.size {
+            let bytes = read_chunk(files, node.node, offset)?;
+            if bytes.is_empty() {
+                return Err(Error::BadState);
+            }
+            offset += bytes.len() as u64;
+            out.extend_from_slice(&bytes);
+        }
+        Ok(out)
+    })();
+    close(files, node.node);
+    result
+}
+fn read_chunk(files: &Channel, node: u64, offset: u64) -> Result<Vec<u8>, Error> {
+    let header = proto::Encoded::new(proto::FsReadRequest {
+        node,
+        offset,
+        length: 32768,
+        _reserved: 0,
+    });
+    let reply = files.call_with(
+        Message::new(proto::FS_READ).with_payload(header.bytes()),
+        32768,
+        0,
+    )?;
+    if reply.flags.contains(MessageFlags::ERROR) {
+        return Err(proto::decode_error(&reply.payload).unwrap_or(Error::BadState));
+    }
+    Ok(reply.payload)
+}
+fn scan_file(
+    files: &Channel,
+    path: &str,
+    mut consume: impl FnMut(&[u8]) -> Result<bool, Error>,
+) -> Result<(), Error> {
+    let node = open(files, path)?;
+    let result = (|| {
+        if node.kind != fs_kind::FILE {
+            return Err(Error::InvalidArgument);
+        }
+        let mut offset = 0;
+        while offset < node.size {
+            let bytes = read_chunk(files, node.node, offset)?;
+            if bytes.is_empty() {
+                return Err(Error::BadState);
+            }
+            offset += bytes.len() as u64;
+            if !consume(&bytes)? {
+                break;
+            }
+        }
+        Ok(())
+    })();
+    close(files, node.node);
+    result
+}
+fn copy_file(files: &Channel, source: &str, destination: &str, force: bool) -> Result<(), Error> {
+    if source.eq_ignore_ascii_case(destination) {
+        return Err(Error::InvalidArgument);
+    }
+    // Validate the source before creating/truncating the destination.
+    let source_node = open(files, source)?;
+    let result = (|| {
+        if source_node.kind != fs_kind::FILE {
+            return Err(Error::InvalidArgument);
+        }
+        match open(files, destination) {
+            Ok(existing) => {
+                close(files, existing.node);
+                if existing.kind != fs_kind::FILE {
+                    return Err(Error::InvalidArgument);
+                }
+                if !force {
+                    return Err(Error::AlreadyExists);
+                }
+            }
+            Err(Error::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+        let dest = create(files, destination)?;
+        let copied = (|| {
+            let mut offset = 0;
+            while offset < source_node.size {
+                let bytes = read_chunk(files, source_node.node, offset)?;
+                if bytes.is_empty() {
+                    return Err(Error::BadState);
+                }
+                if write_at(files, dest.node, offset, &bytes)? != bytes.len() {
+                    return Err(Error::BadState);
+                }
+                offset += bytes.len() as u64;
+            }
+            Ok(())
+        })();
+        close(files, dest.node);
+        copied
+    })();
+    close(files, source_node.node);
+    result
 }

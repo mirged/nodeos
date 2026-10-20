@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["libnode", "libdraw", "init", "console", "compositor", "shell", "doom", "audio", "fs", "sysinfo", "tree", "bench", "edit", "cc"]
+members = ["libnode", "libdraw", "init", "console", "display", "shell", "doom", "audio", "fs", "sysinfo", "tree", "bench", "edit", "cc"]
 
 [workspace.dependencies]
 nodeos-abi = { path = "../abi" }
