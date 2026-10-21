@@ -10,80 +10,33 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ISO="${ISO:-${ROOT}/build/nodeos.iso}"
-DISK="${DISK:-${ROOT}/build/disk.img}"
+NAME=run-audio-test
 WAV="${ROOT}/build/audio-test.wav"
 LOG="${ROOT}/build/audio-test.log"
 PORT="${PORT:-45475}"
-BOOTWAIT="${BOOTWAIT:-14}"
+# QEMU's `wav` backend records everything the card played.
+AUDIODEV="wav,id=snd0,path=${WAV}"
 # How long Doom is given to play after it reports sound is on.
 PLAY_SECONDS="${PLAY_SECONDS:-20}"
-
-for required in "${ISO}" "${DISK}"; do
-    [[ -f "${required}" ]] || { echo "run-audio-test: ${required} not found; run 'make'" >&2; exit 1; }
-done
-
-rm -f "${WAV}" "${LOG}"
-echo "run-audio-test: booting ${ISO} with the wav backend"
-qemu-system-x86_64 \
-    -machine q35 -cpu qemu64 -smp 1 -m 512M -boot d -no-reboot \
-    -cdrom "${ISO}" -serial "file:${LOG}" -display none \
-    -audiodev wav,id=snd0,path="${WAV}" -device AC97,audiodev=snd0 \
-    -drive file="${DISK}",if=virtio,format=raw \
-    -monitor tcp:127.0.0.1:${PORT},server,nowait >/dev/null 2>&1 &
-QEMU_PID=$!
-cleanup() { kill "${QEMU_PID}" 2>/dev/null; wait "${QEMU_PID}" 2>/dev/null; }
-trap cleanup EXIT
-
-monitor() {
-    exec 3<>"/dev/tcp/127.0.0.1/${PORT}" || return 1
-    printf '%s\n' "$@" >&3
-    sleep 0.15
-    exec 3<&- 3>&-
-}
-
-type_line() {
-    local text="$1" char
-    for (( i = 0; i < ${#text}; i++ )); do
-        char="${text:i:1}"
-        case "${char}" in
-            " ") monitor "sendkey spc" ;;
-            "/") monitor "sendkey slash" ;;
-            ".") monitor "sendkey dot" ;;
-            *)   monitor "sendkey ${char}" ;;
-        esac
-    done
-    monitor "sendkey ret"
-}
-
-plain_log() { sed -e 's/\x1b\[[0-9;]*m//g' "${LOG}"; }
-
-wait_for_log() {
-    local pattern="$1" seconds="${2:-20}" waited=0
-    while (( waited < seconds * 4 )); do
-        plain_log | grep -q "${pattern}" && return 0
-        sleep 0.25
-        waited=$(( waited + 1 ))
-    done
-    return 1
-}
+source "${ROOT}/scripts/lib/guest.sh"
 
 fail() {
-    echo "run-audio-test: FAIL -- $1" >&2
+    echo "${NAME}: FAIL -- $1" >&2
     [[ -f "${LOG}" ]] && plain_log | grep -iE "audio|doom:|fs:" | tail -15 >&2
     exit 1
 }
 
-sleep "${BOOTWAIT}"
-wait_for_log "fs: FAT16 mounted\|fs: FAT32 mounted" 20 || fail "the filesystem service did not mount the disk"
+require_files "${ISO}" "${DISK}"
+rm -f "${WAV}"
+boot_guest
+wait_for_mount 20
 
 # Doom is an ordinary disk program now: type its name at the shell.
 type_line "run /bin/doom.nxf"
 wait_for_log "doom: sound is on" 90 || fail "Doom did not get a channel to the mixer"
 
 sleep "${PLAY_SECONDS}"
-cleanup
-trap - EXIT
+shutdown_guest
 
 grep -q "audio: .* Hz stereo" "${LOG}" || fail "the audio service never initialised the card"
 [[ -s "${WAV}" ]] || fail "QEMU recorded nothing at all"

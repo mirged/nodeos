@@ -17,67 +17,20 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ISO="${ISO:-${ROOT}/build/nodeos.iso}"
-DISK="${DISK:-${ROOT}/build/disk.img}"
+NAME=run-maylang-test
 LOG="${ROOT}/build/maylang-test.log"
 PORT="${PORT:-45481}"
-BOOTWAIT="${BOOTWAIT:-14}"
+EXPECT_PREFIX="may: | "
 SELFHOST="${SELFHOST:-0}"
 # Compiling the compiler needs about 400 MiB. KVM, where the host allows it,
 # turns a self-build of minutes into seconds; QEMU falls back to TCG.
 MEMORY="${MEMORY:-1G}"
 ACCEL="${ACCEL:--accel kvm -accel tcg}"
 STAGED="${ROOT}/build/maylang"
+source "${ROOT}/scripts/lib/guest.sh"
 
-for required in "${ISO}" "${DISK}"; do
-    [[ -f "${required}" ]] || { echo "run-maylang-test: ${required} not found; run 'make'" >&2; exit 1; }
-done
-
-rm -f "${LOG}"
-# shellcheck disable=SC2086 # ACCEL is a list of options
-qemu-system-x86_64 ${ACCEL} \
-    -machine q35 -cpu qemu64 -smp 1 -m "${MEMORY}" -boot d -no-reboot \
-    -cdrom "${ISO}" -serial "file:${LOG}" -display none \
-    -audiodev none,id=snd0 -device AC97,audiodev=snd0 \
-    -drive file="${DISK}",if=virtio,format=raw \
-    -monitor tcp:127.0.0.1:${PORT},server,nowait >/dev/null 2>&1 &
-QEMU_PID=$!
-cleanup() { kill "${QEMU_PID}" 2>/dev/null; wait "${QEMU_PID}" 2>/dev/null; }
-trap cleanup EXIT
-
-monitor() {
-    exec 3<>"/dev/tcp/127.0.0.1/${PORT}" || return 1
-    printf '%s\n' "$@" >&3
-    sleep 0.15
-    exec 3<&- 3>&-
-}
-
-type_line() {
-    local text="$1" char
-    for (( i = 0; i < ${#text}; i++ )); do
-        char="${text:i:1}"
-        case "${char}" in
-            " ") monitor "sendkey spc" ;;
-            "/") monitor "sendkey slash" ;;
-            ".") monitor "sendkey dot" ;;
-            "-") monitor "sendkey minus" ;;
-            *)   monitor "sendkey ${char}" ;;
-        esac
-    done
-    monitor "sendkey ret"
-}
-
-plain_log() { sed -e 's/\x1b\[[0-9;]*m//g' -e 's/\r$//' "${LOG}"; }
-
-wait_for_log() {
-    local pattern="$1" seconds="${2:-30}" waited=0
-    while (( waited < seconds * 4 )); do
-        plain_log | grep -q "${pattern}" && return 0
-        sleep 0.25
-        waited=$(( waited + 1 ))
-    done
-    return 1
-}
+require_files "${ISO}" "${DISK}"
+boot_guest
 
 # Wait for the Nth program exit; every Maylang program reports one.
 exits=0
@@ -94,16 +47,6 @@ wait_for_exit() {
     echo "run-maylang-test: FAIL -- ${what} did not finish within ${seconds}s" >&2
     plain_log | grep -E "may:|shell:|panic|fault|exception" | tail -20 >&2
     exit 1
-}
-
-fail=0
-expect() {
-    if plain_log | grep -qF "may: | $1"; then
-        echo "run-maylang-test: OK   $1"
-    else
-        echo "run-maylang-test: FAIL -- missing output line: $1" >&2
-        fail=1
-    fi
 }
 
 # Every line of the smoke test, as a program on NodeOS prints it. A run from
@@ -127,12 +70,7 @@ SMOKE_LINES=(
     "smoke: done"
 )
 
-echo "run-maylang-test: booting ${ISO}"
-sleep "${BOOTWAIT}"
-wait_for_log "fs: FAT16 mounted\|fs: FAT32 mounted" 30 || {
-    echo "run-maylang-test: FAIL -- the filesystem service did not mount the disk" >&2
-    exit 1
-}
+wait_for_mount 30
 wait_for_log "shell: ready" 30
 
 # 1. A program cross-compiled on the host. It runs itself again as a child,
@@ -204,8 +142,7 @@ if plain_log | grep -q "kernel panic\|SELFTEST FAILED\|fatal exception"; then
     fail=1
 fi
 monitor "screendump ${ROOT}/build/maylang-test.ppm"
-cleanup
-trap - EXIT
+shutdown_guest
 
 # What the programs wrote is on the disk, where the host can read it back.
 if [[ "$(mtype -i "${DISK}" ::/SMOKE.TXT 2>/dev/null)" == $'line one\nline two' ]]; then

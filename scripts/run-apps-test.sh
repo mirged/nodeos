@@ -9,73 +9,15 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ISO="${ISO:-${ROOT}/build/nodeos.iso}"
-DISK="${DISK:-${ROOT}/build/disk.img}"
+NAME=run-apps-test
 LOG="${ROOT}/build/apps-test.log"
 PORT="${PORT:-45473}"
-BOOTWAIT="${BOOTWAIT:-14}"
+source "${ROOT}/scripts/lib/guest.sh"
 
-for required in "${ISO}" "${DISK}"; do
-    [[ -f "${required}" ]] || { echo "run-apps-test: ${required} not found; run 'make'" >&2; exit 1; }
-done
+require_files "${ISO}" "${DISK}"
+boot_guest
+wait_for_mount 20
 
-rm -f "${LOG}"
-qemu-system-x86_64 \
-    -machine q35 -cpu qemu64 -smp 1 -m 512M -boot d -no-reboot \
-    -cdrom "${ISO}" -serial "file:${LOG}" -display none \
-    -audiodev none,id=snd0 -device AC97,audiodev=snd0 \
-    -drive file="${DISK}",if=virtio,format=raw \
-    -monitor tcp:127.0.0.1:${PORT},server,nowait >/dev/null 2>&1 &
-QEMU_PID=$!
-cleanup() { kill "${QEMU_PID}" 2>/dev/null; wait "${QEMU_PID}" 2>/dev/null; }
-trap cleanup EXIT
-
-monitor() {
-    exec 3<>"/dev/tcp/127.0.0.1/${PORT}" || return 1
-    printf '%s\n' "$@" >&3
-    sleep 0.15
-    exec 3<&- 3>&-
-}
-
-type_line() {
-    local text="$1" char
-    for (( i = 0; i < ${#text}; i++ )); do
-        char="${text:i:1}"
-        case "${char}" in
-            " ") monitor "sendkey spc" ;;
-            "/") monitor "sendkey slash" ;;
-            ".") monitor "sendkey dot" ;;
-            "-") monitor "sendkey minus" ;;
-            *)   monitor "sendkey ${char}" ;;
-        esac
-    done
-    monitor "sendkey ret"
-}
-
-plain_log() {
-    sed -e 's/\x1b\[[0-9;]*m//g' "${LOG}"
-}
-
-wait_for_log() {
-    local pattern="$1" seconds="${2:-20}" waited=0
-    while (( waited < seconds * 4 )); do
-        plain_log | grep -q "${pattern}" && return 0
-        sleep 0.25
-        waited=$(( waited + 1 ))
-    done
-    return 1
-}
-
-echo "run-apps-test: booting ${ISO}"
-sleep "${BOOTWAIT}"
-
-if ! wait_for_log "fs: FAT16 mounted\|fs: FAT32 mounted"; then
-    echo "run-apps-test: FAIL -- the filesystem service did not mount the disk" >&2
-    tail -20 "${LOG}" >&2
-    exit 1
-fi
-
-fail=0
 run_app() {
     local command="$1" marker="$2" label="$3"
     type_line "${command}"
@@ -101,8 +43,7 @@ if plain_log | grep -q "kernel panic\|SELFTEST FAILED"; then
     fail=1
 fi
 
-cleanup
-trap - EXIT
+shutdown_guest
 
 if (( fail != 0 )); then
     echo "run-apps-test: FAIL" >&2

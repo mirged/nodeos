@@ -6,55 +6,18 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ISO="${ISO:-${ROOT}/build/nodeos.iso}"
+NAME=run-shell-features-test
 SOURCE_DISK="${DISK:-${ROOT}/build/disk.img}"
 DISK="${ROOT}/build/shell-features.img"
 LOG="${ROOT}/build/shell-features.log"
 PORT="${PORT:-45483}"
 ACCEL="${ACCEL:--accel kvm -accel tcg}"
+MONITOR_DELAY=0.05
+source "${ROOT}/scripts/lib/guest.sh"
 
-for required in "${ISO}" "${SOURCE_DISK}"; do
-    [[ -f "${required}" ]] || { echo "run-shell-features-test: ${required} not found; run 'make'" >&2; exit 1; }
-done
+require_files "${ISO}" "${SOURCE_DISK}"
 cp "${SOURCE_DISK}" "${DISK}"
-
-rm -f "${LOG}"
-# shellcheck disable=SC2086 # ACCEL is a list of options
-qemu-system-x86_64 ${ACCEL} \
-    -machine q35 -cpu qemu64 -smp 1 -m 512M -boot d -no-reboot \
-    -cdrom "${ISO}" -serial "file:${LOG}" -display none \
-    -audiodev none,id=snd0 -device AC97,audiodev=snd0 \
-    -drive file="${DISK}",if=virtio,format=raw \
-    -monitor tcp:127.0.0.1:${PORT},server,nowait >/dev/null 2>&1 &
-QEMU_PID=$!
-cleanup() { kill "${QEMU_PID}" 2>/dev/null; wait "${QEMU_PID}" 2>/dev/null; }
-trap cleanup EXIT
-
-monitor() {
-    exec 3<>"/dev/tcp/127.0.0.1/${PORT}" || return 1
-    printf '%s\n' "$@" >&3
-    sleep 0.05
-    exec 3<&- 3>&-
-}
-
-type_line() {
-    local text="$1" char key
-    for (( i = 0; i < ${#text}; i++ )); do
-        char="${text:i:1}"
-        case "${char}" in
-            " ") key=spc ;; "/") key=slash ;; ".") key=dot ;; "-") key=minus ;; "=") key=equal ;;
-            ";") key=semicolon ;; "_") key=shift-minus ;; "\$") key=shift-4 ;; "&") key=shift-7 ;;
-            "|") key=shift-backslash ;; ">") key=shift-dot ;; "<") key=shift-comma ;;
-            "?") key=shift-slash ;; "\"") key=shift-apostrophe ;; "{") key=shift-bracket_left ;;
-            "}") key=shift-bracket_right ;; [A-Z]) key="shift-$(echo "${char}" | tr A-Z a-z)" ;;
-            *) key="${char}" ;;
-        esac
-        monitor "sendkey ${key}"
-    done
-    monitor "sendkey ret"
-}
-
-plain_log() { sed -e 's/\x1b\[[0-9;]*m//g' -e 's/\r$//' "${LOG}"; }
+boot_guest
 
 completed=0
 # Wait for the shell to finish the next command line.
@@ -88,10 +51,8 @@ run 'cd /tests; pwd > /SF8.TXT; mayc hello.may -o /tests/sfhello.nxf && sfhello 
 run 'mayupper < /SF1.TXT > /SF9.TXT'
 
 monitor "screendump ${ROOT}/build/shell-features.ppm"
-cleanup
-trap - EXIT
+shutdown_guest
 
-fail=0
 check() {
     local name="$1" file="$2" expected="$3" actual
     actual="$(mtype -i "${DISK}" "::/${file}" 2>/dev/null)"

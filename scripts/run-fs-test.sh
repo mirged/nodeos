@@ -9,88 +9,19 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ISO="${ISO:-${ROOT}/build/nodeos.iso}"
-DISK="${DISK:-${ROOT}/build/disk.img}"
+NAME=run-fs-test
 LOG="${ROOT}/build/fs-test.log"
 PORT="${PORT:-45471}"
-BOOTWAIT="${BOOTWAIT:-14}"
+source "${ROOT}/scripts/lib/guest.sh"
 
-for required in "${ISO}" "${DISK}"; do
-    [[ -f "${required}" ]] || { echo "run-fs-test: ${required} not found; run 'make'" >&2; exit 1; }
-done
+require_files "${ISO}" "${DISK}"
 
 # A file left behind by an earlier run would make the "the host can read it"
 # check pass without NodeOS having written anything at all.
 mdel -i "${DISK}" ::/SHTEST.TXT >/dev/null 2>&1 || true
 
-rm -f "${LOG}"
-qemu-system-x86_64 \
-    -machine q35 -cpu qemu64 -smp 1 -m 512M -boot d -no-reboot \
-    -cdrom "${ISO}" -serial "file:${LOG}" -display none \
-    -audiodev none,id=snd0 -device AC97,audiodev=snd0 \
-    -drive file="${DISK}",if=virtio,format=raw \
-    -monitor tcp:127.0.0.1:${PORT},server,nowait >/dev/null 2>&1 &
-QEMU_PID=$!
-cleanup() { kill "${QEMU_PID}" 2>/dev/null; wait "${QEMU_PID}" 2>/dev/null; }
-trap cleanup EXIT
-
-monitor() {
-    exec 3<>"/dev/tcp/127.0.0.1/${PORT}" || return 1
-    printf '%s\n' "$@" >&3
-    sleep 0.15
-    exec 3<&- 3>&-
-}
-
-type_line() {
-    local text="$1" char
-    for (( i = 0; i < ${#text}; i++ )); do
-        char="${text:i:1}"
-        case "${char}" in
-            " ") monitor "sendkey spc" ;;
-            "/") monitor "sendkey slash" ;;
-            ".") monitor "sendkey dot" ;;
-            *)   monitor "sendkey ${char}" ;;
-        esac
-    done
-    monitor "sendkey ret"
-}
-
-# A line in the serial log, waited for. Everything this test asks the guest to
-# do happens asynchronously -- it types at a machine running at its own speed --
-# so a check that sleeps for a fixed time and looks once is a race that passes
-# on a fast host and fails on a slow one. It also fails *misleadingly*: the
-# message says the guest did the wrong thing when the truth is that it had not
-# got there yet.
-# The log carries colour escapes, and they sit *inside* the module tags:
-# `ESC[35m[/bin/init.nxf]ESC[0m init: ...`. A pattern that includes a tag -- the
-# only way to tell the shell's own output apart from a child it launched -- has
-# to be matched against the log with the escapes taken out, or it silently never
-# matches and the test blames the guest.
-plain_log() {
-    sed -e 's/\x1b\[[0-9;]*m//g' "${LOG}"
-}
-
-wait_for_log() {
-    local pattern="$1" seconds="${2:-15}" waited=0
-    while (( waited < seconds * 4 )); do
-        plain_log | grep -q "${pattern}" && return 0
-        sleep 0.25
-        waited=$(( waited + 1 ))
-    done
-    return 1
-}
-
-echo "run-fs-test: booting ${ISO}"
-sleep "${BOOTWAIT}"
-
-if ! wait_for_log "fs: FAT16 mounted\|fs: FAT32 mounted"; then
-    echo "run-fs-test: FAIL -- the filesystem service did not mount the disk" >&2
-    if [[ ! -s "${LOG}" ]]; then
-        echo "run-fs-test: the serial log is empty; QEMU produced nothing at all" >&2
-    fi
-    tail -20 "${LOG}" >&2
-    exit 1
-fi
+boot_guest
+wait_for_mount 15
 
 type_line "fstest"
 sleep 6
@@ -135,8 +66,7 @@ else
     exit 1
 fi
 
-cleanup
-trap - EXIT
+shutdown_guest
 sleep 0.5
 
 # --- The other half: read the same disk with somebody else's tools -----------
