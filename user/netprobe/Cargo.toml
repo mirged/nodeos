@@ -1,0 +1,8 @@
+[package]
+name = "netprobe"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libnode = { workspace = true }
+net = { path = "../net" }

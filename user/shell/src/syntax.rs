@@ -1,6 +1,6 @@
 //! Parse shell words and command files before any commands are executed.
 //!
-//! A line is a list of commands joined by `;`, newlines, `&&` or `||`. A
+//! A line is a list of commands joined by `;`, newlines, `&&`, `||` or `|`. A
 //! command is words plus redirections (`> file`, `>> file`, `< file`). Words
 //! keep their variable references (`$NAME`, `${NAME}`, `$?`) unexpanded,
 //! because an earlier command on the same line may set them: expansion happens
@@ -50,6 +50,8 @@ pub enum Connector {
     IfSuccess,
     /// After `||`: only if the previous command failed.
     IfFailure,
+    /// A stage connected to the previous command's standard output.
+    Pipe,
 }
 
 struct Parser {
@@ -237,10 +239,8 @@ pub fn parse(input: &str) -> Result<Vec<(Connector, Command)>, &'static str> {
                 p.end_command(Connector::IfSuccess)?;
             }
             '|' => {
-                if chars.next_if_eq(&'|').is_none() {
-                    return Err("pipes (|) are not supported; use > and < with a file");
-                }
-                p.end_command(Connector::IfFailure)?;
+                let next = if chars.next_if_eq(&'|').is_some() { Connector::IfFailure } else { Connector::Pipe };
+                p.end_command(next)?;
             }
             '>' => {
                 let kind = if chars.next_if_eq(&'>').is_some() { RedirectKind::Append } else { RedirectKind::Out };
@@ -304,7 +304,7 @@ mod tests {
         for text in [
             "echo ok; echo '",
             "echo \\",
-            "echo x | cat",
+            "echo x | | cat",
             "echo x &",
             "echo x >",
             "> file",
@@ -331,6 +331,28 @@ mod tests {
             connectors,
             [Connector::Always, Connector::IfSuccess, Connector::IfFailure, Connector::Always]
         );
+    }
+
+    #[test]
+    fn pipelines() {
+        let commands = parse("echo hello | grep ell | wc; false || echo fallback | cat; true && echo ok").unwrap();
+        let connectors: Vec<Connector> = commands.iter().map(|(connector, _)| *connector).collect();
+        assert_eq!(
+            connectors,
+            [
+                Connector::Always,
+                Connector::Pipe,
+                Connector::Pipe,
+                Connector::Always,
+                Connector::IfFailure,
+                Connector::Pipe,
+                Connector::Always,
+                Connector::IfSuccess,
+            ]
+        );
+        for input in ["| cat", "echo x |", "echo x ||| cat"] {
+            assert!(parse(input).is_err(), "{input}");
+        }
     }
 
     #[test]

@@ -302,6 +302,8 @@ pub mod device_kind {
     pub const VIRTIO_BLK: u32 = 4;
     /// The PS/2 mouse, on the 8042's auxiliary port.
     pub const PS2_MOUSE: u32 = 5;
+    /// An Intel 82540EM-compatible Ethernet controller.
+    pub const E1000: u32 = 6;
 }
 
 /// Information returned by `device_info`. Fields not meaningful for a given

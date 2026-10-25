@@ -34,7 +34,7 @@ class Monitor:
     def hmp(self,text):return self.call('human-monitor-command',**{'command-line':text})
     def key(self,name):self.hmp('sendkey '+name+' 30');time.sleep(.065)
     def type(self,text):
-        names={' ':'spc','/':'slash','.':'dot','-':'minus','_':'shift-minus','"':'shift-apostrophe',"'":'apostrophe',';':'semicolon','\\':'backslash',':':'shift-semicolon','(':'shift-9',')':'shift-0','>':'shift-dot','<':'shift-comma'}
+        names={' ':'spc','/':'slash','.':'dot','-':'minus','_':'shift-minus','"':'shift-apostrophe',"'":'apostrophe',';':'semicolon','\\':'backslash',':':'shift-semicolon','(':'shift-9',')':'shift-0','>':'shift-dot','<':'shift-comma','|':'shift-backslash'}
         for char in text:
             self.key(names.get(char,('shift-'+char.lower())if char.isupper()else char))
     def line(self,text):self.type(text);self.key('ret')
@@ -67,6 +67,10 @@ def main():
                     wait('shell: ready (fullscreen)')
                     mon.hmp(f'screendump {BUILD}/shell-boot.ppm')
                     assert 'desktop' not in log.read_text().lower()
+                    mon.line('echo pipeline works | grep works > /PIPE.TXT')
+                    wait('shell: command complete: pipeline (status 0)')
+                    mon.line('sysinfo | cat > /PIPEAPP.TXT')
+                    wait('shell: command complete: pipeline (status 0)')
                     mon.line('help')
                     time.sleep(.3);mon.hmp(f'screendump {BUILD}/shell-help.ppm')
                     for size in ('large','small','normal'):
@@ -121,11 +125,13 @@ def main():
         assert read('COPY.TXT')=='alpha beta\nsecond line\nend\n'
         assert subprocess.check_output(['mtype','-i',str(disk),'::/BIG.BIN'])==binary.read_bytes()
         assert read('DONE.TXT')=='script complete'
+        assert read('PIPE.TXT')=='1:pipeline works\n'
+        assert 'sysinfo: NodeOS system report' in read('PIPEAPP.TXT')
         assert read('EDIT.TXT')=='right'
         assert read('KEY.TXT')=='az'
         assert read('WORD.TXT')=='bc'
         assert read('AFTER.TXT')=='returned'
         assert subprocess.run(['mdir','-i',str(disk),'::/BAD.TXT'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode!=0
         assert (BUILD/'shell-workflows.ppm').read_bytes()!=(BUILD/'shell-scrollback.ppm').read_bytes()
-        print('shell-test: PASS (quotes, scripts, copy protection, grep, editing, pager, scrollback, foreground apps, Doom return)',flush=True)
+        print('shell-test: PASS (pipelines, quotes, scripts, copy protection, grep, editing, pager, scrollback, foreground apps, Doom return)',flush=True)
 if __name__=='__main__':main()

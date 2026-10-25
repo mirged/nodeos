@@ -97,6 +97,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "net"
+version = "0.1.0"
+dependencies = [
+ "libnode",
+ "nodeos-abi",
+]
+
+[[package]]
+name = "netprobe"
+version = "0.1.0"
+dependencies = [
+ "libnode",
+ "net",
+]
+
+[[package]]
 name = "nodeos-abi"
 version = "0.1.0"
 

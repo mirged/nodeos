@@ -12,11 +12,10 @@
 //! A PCI function is claimed the same way, and the shape of the capability is
 //! the point: the kernel reads configuration space, enables the function's
 //! decoding and its bus mastering, and hands the driver a [`DeviceKind::Pci`]
-//! naming the *port windows the function already decodes* plus the ability to
+//! naming the *windows the function already decodes* plus the ability to
 //! allocate DMA memory. Configuration space itself is never exposed, so a
-//! driver cannot move its own window on top of another device's, and the port
-//! syscalls refuse an offset outside the window. `audio` drives an AC'97 and
-//! `fs` drives a virtio-blk disk with no more authority than that.
+//! driver cannot move its own window on top of another device's. `audio`
+//! drives an AC'97, `fs` drives a virtio-blk disk, and `net` drives an e1000.
 //!
 //! There is deliberately no standalone `Irq` object here even though
 //! [`ObjectType::Irq`] exists: the two interrupts this module deals with --
@@ -68,8 +67,8 @@ pub enum DeviceKind {
         /// Whether a mouse answered the bring-up probe.
         present: bool,
     },
-    /// A claimed PCI function, reduced to what a userspace driver can use:
-    /// the port windows its BARs decode, and its interrupt line.
+    /// A claimed PCI function, reduced to the BARs and interrupt line a
+    /// userspace driver can use.
     Pci {
         /// What the function is, as the abi's `device_kind` names it.
         role: PciRole,
@@ -80,6 +79,8 @@ pub enum DeviceKind {
         /// The port windows the function decodes. An unused window has
         /// `len == 0` and every access to it is refused.
         windows: [PortWindow; MAX_PORT_WINDOWS],
+        /// The first MMIO BAR, when present.
+        mmio: Option<MmioWindow>,
         /// Interrupt line the firmware routed the function to. Reported for
         /// completeness; NodeOS has no bindable interrupt object yet, and both
         /// drivers in this tree poll.
@@ -103,6 +104,15 @@ pub struct PortWindow {
     pub len: u16,
 }
 
+/// A memory-mapped PCI BAR.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MmioWindow {
+    /// Physical base address.
+    pub base: u64,
+    /// Length in bytes.
+    pub len: u64,
+}
+
 /// Which driver a claimed PCI function is for.
 ///
 /// The kernel identifies the function -- it is the only thing that can read
@@ -114,6 +124,8 @@ pub enum PciRole {
     Ac97,
     /// A legacy-interface virtio block device.
     VirtioBlk,
+    /// Intel 82540EM-compatible Ethernet controller.
+    E1000,
 }
 
 /// Errors from device operations.
@@ -233,12 +245,22 @@ impl Device {
     /// drive the hardware and to point its DMA engine at memory.
     pub unsafe fn pci(role: PciRole, function: &crate::arch::x86_64::pci::Function, bars: &[usize]) -> Arc<Self> {
         let mut windows = [PortWindow::default(); MAX_PORT_WINDOWS];
+        let mut mmio = None;
         for (slot, index) in bars.iter().take(MAX_PORT_WINDOWS).enumerate() {
             if let Some(base) = function.io_port(*index) {
                 // SAFETY: forwarded contract -- a live function, claimed here
                 // and nowhere else, before userspace exists.
                 let len = unsafe { function.bar_size(*index) };
                 windows[slot] = PortWindow { base, len: len.min(u16::MAX as u64) as u16 };
+            } else if mmio.is_none() {
+                if let Some(base) = function.mmio_base(*index) {
+                    // SAFETY: forwarded contract -- this function is being
+                    // claimed during single-threaded boot.
+                    let len = unsafe { function.bar_size(*index) };
+                    if len != 0 {
+                        mmio = Some(MmioWindow { base, len });
+                    }
+                }
             }
         }
         // SAFETY: forwarded contract.
@@ -251,6 +273,7 @@ impl Device {
                 vendor: function.vendor,
                 device: function.device,
                 windows,
+                mmio,
                 irq: function.irq,
             },
             vmo: IrqSpinLock::new(None),
@@ -345,18 +368,18 @@ impl Device {
     /// A memory object over this device's MMIO range, building it on first
     /// use. Only valid for MMIO-backed kinds.
     pub fn vmo(&self) -> Result<Arc<Vmo>, DeviceError> {
-        let DeviceKind::FramebufferMmio { phys_base, size, .. } = self.kind else {
-            return Err(DeviceError::WrongKind);
+        let (phys_base, size) = match self.kind {
+            DeviceKind::FramebufferMmio { phys_base, size, .. } => (phys_base, size),
+            DeviceKind::Pci { mmio: Some(window), .. } => (window.base, window.len),
+            _ => return Err(DeviceError::WrongKind),
         };
         let mut slot = self.vmo.lock();
         if let Some(vmo) = slot.as_ref() {
             return Ok(vmo.clone());
         }
-        // SAFETY: this physical range came from the loader's framebuffer tag,
-        // which the frame allocator never hands out (see `mm::init`), and
-        // holding a handle to this `Device` -- checked at the syscall layer
-        // via `Rights::DEVICE_IO` -- is exactly the authority `Vmo::new_physical`
-        // asks for.
+        // SAFETY: this range came either from the loader's framebuffer tag or
+        // from a PCI BAR belonging to this claimed device. Neither range is
+        // managed RAM, and DEVICE_IO is the authority to map it.
         let vmo = unsafe { Vmo::new_physical(phys_base, size) }.map_err(|error| match error {
             VmoError::OutOfMemory => DeviceError::NoMemory,
             _ => DeviceError::NoMemory,

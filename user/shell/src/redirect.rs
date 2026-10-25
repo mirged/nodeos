@@ -22,6 +22,7 @@ use crate::syntax::RedirectKind;
 
 /// Largest console request served, as the console itself accepts.
 const REQUEST_CAPACITY: usize = 64 * 1024;
+const PIPELINE_CAPTURE_LIMIT: usize = 1024 * 1024;
 
 struct Output {
     path: alloc::string::String,
@@ -42,14 +43,62 @@ pub fn run(
     fs: &Channel,
     display: Option<&Channel>,
     audio: Option<&Channel>,
+    network: Option<&Channel>,
     path: &str,
     args: &[&str],
     environment: &[&str],
     redirects: &[(RedirectKind, alloc::string::String)],
 ) -> Result<Process, Error> {
+    run_inner(console, fs, display, audio, network, path, args, environment, redirects, None, false)
+        .map(|(process, _)| process)
+}
+
+/// Run a pipeline stage with optional piped input and capture its output.
+#[allow(clippy::too_many_arguments)]
+pub fn run_pipeline_stage(
+    console: &Channel,
+    fs: &Channel,
+    display: Option<&Channel>,
+    audio: Option<&Channel>,
+    network: Option<&Channel>,
+    path: &str,
+    args: &[&str],
+    environment: &[&str],
+    redirects: &[(RedirectKind, alloc::string::String)],
+    piped_input: Option<&[u8]>,
+) -> Result<(Process, Vec<u8>), Error> {
+    run_inner(
+        console,
+        fs,
+        display,
+        audio,
+        network,
+        path,
+        args,
+        environment,
+        redirects,
+        piped_input,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_inner(
+    console: &Channel,
+    fs: &Channel,
+    display: Option<&Channel>,
+    audio: Option<&Channel>,
+    network: Option<&Channel>,
+    path: &str,
+    args: &[&str],
+    environment: &[&str],
+    redirects: &[(RedirectKind, alloc::string::String)],
+    piped_input: Option<&[u8]>,
+    capture_output: bool,
+) -> Result<(Process, Vec<u8>), Error> {
     // Open everything before the program starts, so a bad path fails the
     // command instead of a program that has already run.
-    let mut input = None;
+    let mut input = piped_input.map(|data| Input { data: Vec::from(data), at: 0 });
     let mut output = None;
     for (kind, target) in redirects {
         match kind {
@@ -65,7 +114,8 @@ pub fn run(
         }
     }
     let (served, handed) = Channel::create()?;
-    let launched = libnode::session::launch(&handed, fs, display, audio, path, args, environment);
+    let launched =
+        libnode::session::launch(&handed, fs, display, audio, network, path, args, environment);
     // The program holds its own duplicate; ours would keep the channel open
     // after it exits.
     drop(handed);
@@ -80,6 +130,8 @@ pub fn run(
     };
     libnode::println!("shell: foreground {path} (redirected)");
 
+    let mut captured = Vec::new();
+    let mut capture_overflow = false;
     loop {
         let mut items = [
             WaitItem { handle: served.handle().raw(), wanted: Signals::READABLE.0, observed: 0, _reserved: 0 },
@@ -97,7 +149,16 @@ pub fn run(
         // last is lost.
         if items[0].observed & Signals::READABLE.0 != 0 {
             if let Ok(request) = served.receive_with(REQUEST_CAPACITY, 0, true) {
-                serve(console, fs, &served, request, output.as_mut(), input.as_mut());
+                serve(
+                    console,
+                    fs,
+                    &served,
+                    request,
+                    output.as_mut(),
+                    input.as_mut(),
+                    capture_output.then_some(&mut captured),
+                    &mut capture_overflow,
+                );
                 continue;
             }
         }
@@ -108,7 +169,11 @@ pub fn run(
     if let Some(output) = output {
         finish(fs, output);
     }
-    Ok(process)
+    if capture_overflow {
+        Err(Error::LimitExceeded)
+    } else {
+        Ok((process, captured))
+    }
 }
 
 fn open_output(fs: &Channel, path: &str, append: bool) -> Result<Output, Error> {
@@ -140,6 +205,8 @@ fn serve(
     request: Message,
     output: Option<&mut Output>,
     input: Option<&mut Input>,
+    captured: Option<&mut Vec<u8>>,
+    capture_overflow: &mut bool,
 ) {
     let reply = match (request.kind, output, input) {
         (proto::CONSOLE_WRITE_TEXT, Some(output), _) => {
@@ -158,6 +225,30 @@ fn serve(
                 Err(error) => error_reply(request.kind, error),
             }
         }
+        (proto::CONSOLE_WRITE_TEXT, None, _) if captured.is_some() => {
+            let captured = captured.unwrap();
+            if captured.len().saturating_add(request.payload.len()) > PIPELINE_CAPTURE_LIMIT {
+                *capture_overflow = true;
+                error_reply(request.kind, Error::LimitExceeded)
+            } else {
+                captured.extend_from_slice(&request.payload);
+                Message::new(proto::reply_kind(request.kind))
+            }
+        }
+        (proto::CONSOLE_WRITE_TEXT, None, _) => match console.call_with(
+            Message::new(request.kind).with_payload(&request.payload),
+            REQUEST_CAPACITY,
+            0,
+        ) {
+            Ok(answer) => {
+                let mut reply = Message::new(answer.kind).with_payload(&answer.payload);
+                if answer.flags.contains(MessageFlags::ERROR) {
+                    reply.flags = MessageFlags::ERROR;
+                }
+                reply
+            }
+            Err(error) => error_reply(request.kind, error),
+        },
         (proto::CONSOLE_READ_LINE, _, Some(input)) => {
             if input.at >= input.data.len() {
                 // End of input: a reader sees the console go away.

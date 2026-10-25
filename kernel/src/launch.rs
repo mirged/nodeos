@@ -49,6 +49,8 @@ pub struct BootDevices {
     pub audio: Option<Arc<Device>>,
     /// The virtio block device, if one was attached. Granted to `"fs"`.
     pub storage: Option<Arc<Device>>,
+    /// The e1000 Ethernet controller, if one was attached. Granted to `"net"`.
+    pub network: Option<Arc<Device>>,
 }
 
 /// The boot policy: which capability classes each named module may hold.
@@ -84,6 +86,7 @@ fn policy(name: &str) -> CapSet {
         // filesystem, no display, no way to learn what it is mixing. It is
         // handed samples over a channel and it puts them on a ring.
         "audio" => base.with(CapClass::Audio).with(CapClass::Device).with(CapClass::Clock),
+        "net" => base.with(CapClass::Network).with(CapClass::Device),
         // The filesystem service may create and serve files; it may not touch
         // devices or the network.
         "ramfs" => base.with(CapClass::FileRead).with(CapClass::FileWrite).with(CapClass::FileCreate),
@@ -104,7 +107,8 @@ fn policy(name: &str) -> CapSet {
             .with(CapClass::FileRead)
             .with(CapClass::FileWrite)
             .with(CapClass::FileCreate)
-            .with(CapClass::Audio),
+            .with(CapClass::Audio)
+            .with(CapClass::Network),
         // Doom is a display broker client too. It does not go through `console`
         // -- it repaints its whole surface 35 times a second and wants raw
         // make/break scancodes, neither of which the console protocol offers
@@ -177,7 +181,7 @@ fn launch_rank(name: &str) -> u32 {
         "display" => 0,
         // Both are services with clients below them, and neither is a client
         // of anything, so they can come up in parallel with the console.
-        "audio" | "fs" => 1,
+        "audio" | "fs" | "net" => 1,
         "console" => 2,
         _ => 3,
     }
@@ -287,22 +291,35 @@ pub unsafe fn launch_boot_modules(boot_info: &BootInfo, devices: &BootDevices) -
                     crate::warn!("fs launched with no disk to serve");
                     Vec::new()
                 }),
+            "net" => devices
+                .network
+                .as_ref()
+                .map(|device| alloc::vec![Handle::root(device.clone(), device.default_rights())])
+                .unwrap_or_else(|| {
+                    crate::warn!("net launched with no Ethernet controller to drive");
+                    Vec::new()
+                }),
             // The shell reads its capabilities positionally: the console
             // first, the filesystem second. A boot with no `fs` module gives
             // it one handle and the shell's file commands report that they
             // have nowhere to look, which is better than a shell that will not
             // start.
-            // The shell reads its capabilities positionally: console first,
-            // filesystem second, then the two it only forwards to the programs
-            // it launches -- the display broker (so a graphical program like Doom
-            // can take the full screen) and the mixer (so Doom can make a noise). A
-            // boot with no `audio` module simply omits the last one.
+            // The shell reads its capabilities positionally: console, filesystem,
+            // display, audio, then raw networking. Keep the final network slot
+            // present even when no service can be reached, so later handles never
+            // shift into the wrong position.
             "shell" => {
                 let mut handles: Vec<Handle> = connect_to(&launched, "console", name).into_iter().collect();
                 if !handles.is_empty() {
                     handles.extend(connect_to(&launched, "fs", name));
                     handles.extend(connect_to(&launched, "display", name));
                     handles.extend(connect_to(&launched, "audio", name));
+                    let network = connect_to(&launched, "net", name).unwrap_or_else(|| {
+                        let (client, server) = Channel::create_pair();
+                        drop(server);
+                        Handle::root(client, Channel::default_rights())
+                    });
+                    handles.push(network);
                 }
                 handles
             }

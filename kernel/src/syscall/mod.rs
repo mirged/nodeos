@@ -616,8 +616,8 @@ fn map_device_error(error: DeviceError) -> Error {
 /// `device_get_vmo(device) -> handle`
 ///
 /// Turns a `Device` capability into a mappable memory object over its MMIO
-/// range. Only meaningful for MMIO-backed devices (today: the framebuffer);
-/// a device with no MMIO range fails with `WrongType`.
+/// range. Only meaningful for MMIO-backed devices; a device with no MMIO
+/// range fails with `WrongType`.
 fn sys_device_get_vmo(args: &Args) -> Result<i64, Error> {
     let process = current()?;
     let handle = process
@@ -659,11 +659,12 @@ fn sys_device_info(args: &Args) -> Result<i64, Error> {
             present: present as u32,
             ..Default::default()
         },
-        DeviceKind::Pci { role, vendor, device, windows, irq } => {
+        DeviceKind::Pci { role, vendor, device, windows, irq, .. } => {
             let mut info = DeviceInfo {
                 kind: match role {
                     crate::obj::device::PciRole::Ac97 => device_kind::AC97,
                     crate::obj::device::PciRole::VirtioBlk => device_kind::VIRTIO_BLK,
+                    crate::obj::device::PciRole::E1000 => device_kind::E1000,
                 },
                 vendor: vendor as u32,
                 device: device as u32,

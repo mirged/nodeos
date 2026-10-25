@@ -18,13 +18,14 @@ fn call(channel: &Channel, request: Message, capacity: usize) -> Result<Message,
 
 /// Start an NXF from `path`, passing arguments, `NAME=value` environment
 /// strings and the caller's session. Each child gets a private display
-/// connection so its input cannot be consumed by another application. Files
-/// and audio retain the session policy.
+/// connection so its input cannot be consumed by another application. Files,
+/// audio and raw networking retain the session policy.
 pub fn launch(
     console: &Channel,
     files: &Channel,
     wm: Option<&Channel>,
     audio: Option<&Channel>,
+    network: Option<&Channel>,
     path: &str,
     args: &[&str],
     environment: &[&str],
@@ -93,8 +94,8 @@ pub fn launch(
     } else {
         None
     };
-    let sources = [Some(console), Some(files), display.as_ref(), audio];
-    let granted_caps = [
+    let sources = [Some(console), Some(files), display.as_ref(), audio, network];
+    let mut granted_caps = [
         CapClass::Process,
         CapClass::Load,
         CapClass::Channel,
@@ -107,6 +108,9 @@ pub fn launch(
     ]
     .into_iter()
     .fold(0u32, |mask, cap| mask | (1 << cap as u32));
+    if network.is_some() {
+        granted_caps |= 1 << CapClass::Network as u32;
+    }
     let info = proto::Encoded::new(BootstrapMessage {
         version: 1,
         granted_caps,

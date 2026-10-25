@@ -187,8 +187,9 @@ pub extern "C" fn kmain(magic: u32, info: u64) -> ! {
     info!("pci: {} function(s) on the bus", functions.len());
     let audio = claim_pci(&functions, obj::device::PciRole::Ac97, "audio");
     let storage = claim_pci(&functions, obj::device::PciRole::VirtioBlk, "storage");
+    let network = claim_pci(&functions, obj::device::PciRole::E1000, "network");
 
-    let devices = launch::BootDevices { framebuffer, keyboard, pointer, audio, storage };
+    let devices = launch::BootDevices { framebuffer, keyboard, pointer, audio, storage, network };
 
     // SAFETY: memory management and the scheduler are up, and `boot_info` has
     // been relocated to the direct physical map.
@@ -234,9 +235,14 @@ fn claim_pci(
         // through PCI capabilities and MMIO, and the driver here speaks the
         // legacy port interface.
         obj::device::PciRole::VirtioBlk => (|f| f.vendor == 0x1AF4 && f.device == 0x1001, &[0]),
+        // QEMU's Intel 82540EM model; the driver only claims the device model
+        // it has been tested against.
+        obj::device::PciRole::E1000 => (|f| f.vendor == 0x8086 && f.device == 0x100E, &[0]),
     };
 
-    let function = functions.iter().find(|f| matches(f) && f.io_port(bars[0]).is_some())?;
+    let function = functions.iter().find(|f| {
+        matches(f) && (f.io_port(bars[0]).is_some() || f.mmio_base(bars[0]).is_some())
+    })?;
     // SAFETY: `function` came from the scan above, nothing else holds a
     // capability over it, and userspace does not exist yet.
     let device = unsafe { obj::Device::pci(role, function, bars) };

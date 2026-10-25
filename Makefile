@@ -73,6 +73,7 @@ QEMU_FLAGS   := -machine q35 -cpu $(QEMU_CPU) -smp $(QEMU_SMP) -m $(QEMU_MEM) \
                 -no-reboot -no-shutdown -boot d \
                 -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
                 -audiodev $(AUDIODEV_ARGS),id=snd0 -device AC97,audiodev=snd0 \
+                -netdev user,id=net0 -device e1000,netdev=net0 \
                 -drive file=$(DISK),if=virtio,format=raw
 
 .PHONY: all build kernel tools user modules iso disk run debug sysroot lx lx-apps maylang \
@@ -117,11 +118,14 @@ modules: tools user
 		--stack 256K --heap 4M --max-memory 32M
 	$(NXFPACK) $(USER_DIR)/shell -o $(MODULE_DIR)/shell.nxf --name shell --service --strict \
 		--cap PROCESS --cap LOAD --cap DEBUG --cap CHANNEL --cap MEMORY --cap CLOCK \
-		--cap FILE_READ --cap FILE_WRITE --cap FILE_CREATE --cap AUDIO \
+		--cap FILE_READ --cap FILE_WRITE --cap FILE_CREATE --cap AUDIO --cap NETWORK \
 		--stack 256K --heap 4M --max-memory 16M
 	$(NXFPACK) $(USER_DIR)/audio -o $(MODULE_DIR)/audio.nxf --name audio --service --strict \
 		--cap AUDIO --cap DEVICE --cap CHANNEL --cap MEMORY --cap CLOCK \
 		--stack 256K --heap 4M --max-memory 32M
+	$(NXFPACK) $(USER_DIR)/net -o $(MODULE_DIR)/net.nxf --name net --service --strict \
+		--cap NETWORK --cap DEVICE --cap CHANNEL --cap MEMORY \
+		--stack 256K --heap 1M --max-memory 8M
 	$(NXFPACK) $(USER_DIR)/fs -o $(MODULE_DIR)/fs.nxf --name fs --service --strict \
 		--cap FILE_READ --cap FILE_WRITE --cap FILE_CREATE --cap DEVICE --cap CHANNEL --cap MEMORY \
 		--stack 256K --heap 8M --max-memory 64M
@@ -143,6 +147,9 @@ modules: tools user
 	$(NXFPACK) $(USER_DIR)/cc -o $(MODULE_DIR)/cc.nxf --name cc \
 		--cap CHANNEL --cap MEMORY --cap FILE_READ \
 		--stack 512K --heap 32M --max-memory 64M
+	$(NXFPACK) $(USER_DIR)/netprobe -o $(MODULE_DIR)/netprobe.nxf --name netprobe \
+		--cap CHANNEL --cap MEMORY --cap NETWORK \
+		--stack 256K --heap 2M --max-memory 8M
 
 # --- Linux programs: musl over liblx -----------------------------------------
 

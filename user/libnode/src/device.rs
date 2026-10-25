@@ -27,13 +27,17 @@ impl Device {
         let mut info = DeviceInfo::default();
         // SAFETY: `&mut info` is a single, correctly sized, writable `DeviceInfo`.
         let raw = unsafe {
-            sys::syscall2(Syscall::DeviceInfo, self.handle.raw().0 as u64, &mut info as *mut _ as u64)
+            sys::syscall2(
+                Syscall::DeviceInfo,
+                self.handle.raw().0 as u64,
+                &mut info as *mut _ as u64,
+            )
         };
         sys::ok(raw).map(|()| info)
     }
 
-    /// A memory object over this device's MMIO range (e.g. the framebuffer),
-    /// and map it in one step.
+    /// A memory object over this device's MMIO range (e.g. the framebuffer or
+    /// a claimed PCI BAR), and map it in one step.
     pub fn map(&self, len: u64, flags: nodeos_abi::types::MapFlags) -> Result<Mapping, Error> {
         // SAFETY: the handle value is a scalar.
         let raw = unsafe { sys::syscall1(Syscall::DeviceGetVmo, self.handle.raw().0 as u64) };
@@ -47,11 +51,15 @@ impl Device {
     pub fn read(&self, out: &mut [u8]) -> Result<usize, Error> {
         // SAFETY: `out` is a valid writable slice of the declared length.
         let raw = unsafe {
-            sys::syscall3(Syscall::DeviceRead, self.handle.raw().0 as u64, out.as_mut_ptr() as u64, out.len() as u64)
+            sys::syscall3(
+                Syscall::DeviceRead,
+                self.handle.raw().0 as u64,
+                out.as_mut_ptr() as u64,
+                out.len() as u64,
+            )
         };
         sys::status(raw).map(|n| n as usize)
     }
-
 
     /// Read one register through port window `window`.
     ///
@@ -125,7 +133,12 @@ impl Device {
         let mut info = DmaInfo::default();
         // SAFETY: `&mut info` is a single, correctly sized, writable `DmaInfo`.
         let raw = unsafe {
-            sys::syscall3(Syscall::DeviceDmaAlloc, self.handle.raw().0 as u64, len, &mut info as *mut _ as u64)
+            sys::syscall3(
+                Syscall::DeviceDmaAlloc,
+                self.handle.raw().0 as u64,
+                len,
+                &mut info as *mut _ as u64,
+            )
         };
         sys::ok(raw)?;
 
@@ -139,7 +152,13 @@ impl Device {
                 .or(nodeos_abi::types::MapFlags::POPULATE),
             nodeos_abi::types::MapWindow::Shared,
         )?;
-        Ok(Dma { _vmo: vmo, phys: info.phys, base: mapping.base(), len: info.len, _mapping: mapping })
+        Ok(Dma {
+            _vmo: vmo,
+            phys: info.phys,
+            base: mapping.base(),
+            len: info.len,
+            _mapping: mapping,
+        })
     }
 }
 
