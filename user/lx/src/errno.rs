@@ -3,6 +3,7 @@
 use nodeos_abi::Error;
 
 pub const ENOENT: i64 = 2;
+pub const EAGAIN: i64 = 11;
 pub const EIO: i64 = 5;
 pub const EBADF: i64 = 9;
 pub const ENOMEM: i64 = 12;
@@ -19,6 +20,17 @@ pub const ESPIPE: i64 = 29;
 pub const EPIPE: i64 = 32;
 pub const ERANGE: i64 = 34;
 pub const ENOSYS: i64 = 38;
+pub const EDESTADDRREQ: i64 = 89;
+pub const EPROTOTYPE: i64 = 91;
+pub const ENOPROTOOPT: i64 = 92;
+pub const EOPNOTSUPP: i64 = 95;
+pub const EAFNOSUPPORT: i64 = 97;
+pub const ENETUNREACH: i64 = 101;
+pub const ECONNRESET: i64 = 104;
+pub const ENOTCONN: i64 = 107;
+pub const ETIMEDOUT: i64 = 110;
+pub const ECONNREFUSED: i64 = 111;
+pub const EINPROGRESS: i64 = 115;
 pub const ENAMETOOLONG: i64 = 36;
 
 /// The `errno` a Linux program expects for a NodeOS failure.

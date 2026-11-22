@@ -64,6 +64,15 @@ fn start(mut env: Env) -> i32 {
         session.push(handle);
     }
     crate::fs::init(session.first().map(|h| h.raw().0), session.get(1).map(|h| h.raw().0), env.var("PWD"));
+    // The launcher puts the network channel last, and only when it granted the
+    // NETWORK capability: a program the shell started with no network service
+    // reachable has no socket to open.
+    let network = if env.has_capability(libnode::abi::CapClass::Network) {
+        session.last().map(|handle| handle.raw().0)
+    } else {
+        None
+    };
+    crate::net::init(network);
     core::mem::forget(session);
 
     // NUL-terminated copies of the arguments and environment, which musl and

@@ -19,6 +19,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use libnode::sync::SpinLock;
+use net::ready;
 use nodeos_abi::message::{MessageDescriptor, MessageFlags};
 use nodeos_abi::{proto, Syscall};
 
@@ -32,6 +33,10 @@ const MAX_PATH: usize = 4096;
 static CONSOLE: AtomicU32 = AtomicU32::new(0);
 static FILES: AtomicU32 = AtomicU32::new(0);
 static CWD: SpinLock<String> = SpinLock::new(String::new());
+
+/// Console input mode, as the last `tcsetattr` set it: non-zero when a program
+/// turned off `ICANON` and `ECHO` and is reading keys itself.
+static CONSOLE_RAW: AtomicU32 = AtomicU32::new(0);
 
 /// Record the session channels. Called once, by startup.
 pub fn init(console: Option<u32>, files: Option<u32>, cwd: Option<&str>) {
@@ -63,7 +68,12 @@ static SCRATCH_LOCK: SpinLock<()> = SpinLock::new(());
 /// Send `kind` with the concatenation of `parts` as its payload, and receive
 /// the reply payload into `reply`. Returns the reply's length, or the errno
 /// the failure means.
-fn call(channel: u32, kind: u32, parts: &[&[u8]], reply: &mut [u8]) -> Result<usize, i64> {
+pub(crate) fn call(
+    channel: u32,
+    kind: u32,
+    parts: &[&[u8]],
+    reply: &mut [u8],
+) -> Result<usize, i64> {
     if channel == 0 {
         return Err(EBADF);
     }
@@ -231,10 +241,19 @@ struct Dir {
     position: usize,
 }
 
+/// A file this process answers itself, such as `/etc/resolv.conf`: the bytes
+/// come from the network service, not from the disk.
+struct MemFile {
+    content: Vec<u8>,
+    offset: usize,
+}
+
 enum Object {
     Tty(Tty),
     File(File),
     Dir(Dir),
+    Socket(crate::net::Socket),
+    Mem(MemFile),
 }
 
 impl Drop for Object {
@@ -242,7 +261,8 @@ impl Drop for Object {
         match self {
             Object::File(file) => fs_close(file.node),
             Object::Dir(dir) => fs_close(dir.node),
-            Object::Tty(_) => {}
+            Object::Socket(socket) => crate::net::close(socket),
+            Object::Tty(_) | Object::Mem(_) => {}
         }
     }
 }
@@ -289,6 +309,11 @@ pub fn close(fd: i32) -> i64 {
     // does, outside the table lock.
     drop(entry);
     0
+}
+
+/// Put a freshly opened socket in the descriptor table, and return its number.
+pub fn install_socket(socket: crate::net::Socket) -> i64 {
+    install_at_least(Arc::new(SpinLock::new(Object::Socket(socket))), 0)
 }
 
 pub fn dup(fd: i32, minimum: usize) -> i64 {
@@ -388,6 +413,8 @@ const O_EXCL: i32 = 0x80;
 const O_TRUNC: i32 = 0x200;
 const O_APPEND: i32 = 0x400;
 const O_DIRECTORY: i32 = 0x10000;
+const O_RDWR: i32 = 2;
+const O_NONBLOCK: i32 = 0o4000;
 
 pub unsafe fn openat(dirfd: i32, path: *const u8, flags: i32) -> i64 {
     // SAFETY: forwarded contract.
@@ -399,6 +426,16 @@ pub unsafe fn openat(dirfd: i32, path: *const u8, flags: i32) -> i64 {
 
 fn open_path(dirfd: i32, path: &str, flags: i32) -> Result<i64, i64> {
     let path = resolve(dirfd, path)?;
+    // Files the network service supplies, for musl's resolver: there is no
+    // `/etc` on the disk, and these two are the only paths a program reads
+    // before it can reach the network at all.
+    if let Some(content) = crate::net::synthetic_file(&path) {
+        if flags & O_ACCMODE != O_RDONLY {
+            return Err(EACCES);
+        }
+        let object = Object::Mem(MemFile { content: content.into_bytes(), offset: 0 });
+        return Ok(install_at_least(Arc::new(SpinLock::new(object)), 0));
+    }
     let node = match fs_open(&path) {
         Ok(node) => {
             if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
@@ -446,6 +483,14 @@ pub unsafe fn read(fd: i32, buf: *mut u8, len: usize) -> i64 {
         Object::Tty(Tty::Input) => read_console(out),
         Object::Tty(_) => -EBADF,
         Object::Dir(_) => -EISDIR,
+        Object::Socket(socket) => crate::net::recv(socket, out, None),
+        Object::Mem(mem) => {
+            let available = mem.content.len().saturating_sub(mem.offset);
+            let got = available.min(out.len());
+            out[..got].copy_from_slice(&mem.content[mem.offset..mem.offset + got]);
+            mem.offset += got;
+            got as i64
+        }
         Object::File(file) => match fs_read(file.node, file.offset, out) {
             Ok(got) => {
                 file.offset += got as u64;
@@ -482,6 +527,8 @@ pub unsafe fn write(fd: i32, buf: *const u8, len: usize) -> i64 {
         Object::Tty(Tty::Input) => -EBADF,
         Object::Tty(kind) => write_console(*kind, data),
         Object::Dir(_) => -EISDIR,
+        Object::Socket(socket) => crate::net::send(socket, data, None),
+        Object::Mem(_) => -EACCES,
         Object::File(file) => {
             if file.flags & O_ACCMODE == O_RDONLY {
                 return -EBADF;
@@ -573,6 +620,20 @@ pub fn lseek(fd: i32, offset: i64, whence: i32) -> i64 {
         Err(errno) => return -errno,
     };
     let mut object = entry.lock();
+    if let Object::Mem(mem) = &mut *object {
+        let base = match whence {
+            0 => 0,
+            1 => mem.offset as i64,
+            2 => mem.content.len() as i64,
+            _ => return -EINVAL,
+        };
+        let target = base + offset;
+        if target < 0 {
+            return -EINVAL;
+        }
+        mem.offset = target as usize;
+        return target;
+    }
     let Object::File(file) = &mut *object else { return -ESPIPE };
     let base = match whence {
         0 => 0,
@@ -639,22 +700,96 @@ static PENDING_INPUT: SpinLock<(Vec<u8>, usize)> = SpinLock::new((Vec::new(), 0)
 fn read_console(out: &mut [u8]) -> i64 {
     let mut pending = PENDING_INPUT.lock();
     if pending.1 >= pending.0.len() {
-        // Canonical mode, as the console provides it: it edits and echoes the
-        // line itself and replies when Enter is pressed.
-        let mut line = alloc::vec![0u8; 1024];
-        let got = match call(CONSOLE.load(Ordering::Relaxed), proto::CONSOLE_READ_LINE, &[], &mut line) {
-            Ok(got) => got,
-            Err(_) => return 0, // a console that went away is end of file
-        };
-        line.truncate(got);
-        line.push(b'\n');
-        *pending = (line, 0);
+        if console_raw() {
+            // Raw mode, as `tcsetattr` asked for: the console hands over one
+            // key press at a time, does no editing and echoes nothing. Control
+            // keys, arrows and the delete/home/end block become the bytes a
+            // Linux program expects, because the program is doing its own
+            // editing and drawing.
+            let mut key = [0u8; 32];
+            let got = match call(
+                CONSOLE.load(Ordering::Relaxed),
+                proto::CONSOLE_READ_KEY,
+                &[],
+                &mut key,
+            ) {
+                Ok(got) => got,
+                Err(_) => return 0, // a console that went away is end of file
+            };
+            let key = match decode::<proto::ConsoleKey>(&key[..got]) {
+                Ok(key) => key,
+                Err(errno) => return errno,
+            };
+            let mut bytes = [0u8; 8];
+            let n = key_bytes(key, &mut bytes);
+            *pending = (bytes[..n].to_vec(), 0);
+        } else {
+            // Canonical mode, as the console provides it: it edits and echoes
+            // the line itself and replies when Enter is pressed.
+            let mut line = alloc::vec![0u8; 1024];
+            let got = match call(
+                CONSOLE.load(Ordering::Relaxed),
+                proto::CONSOLE_READ_LINE,
+                &[],
+                &mut line,
+            ) {
+                Ok(got) => got,
+                Err(_) => return 0, // a console that went away is end of file
+            };
+            line.truncate(got);
+            line.push(b'\n');
+            *pending = (line, 0);
+        }
     }
     let available = &pending.0[pending.1..];
     let n = available.len().min(out.len());
     out[..n].copy_from_slice(&available[..n]);
     pending.1 += n;
     n as i64
+}
+
+/// The bytes one key press means to a Linux program reading a raw terminal.
+///
+/// Printable keys are their character, with control held reducing a letter to
+/// the control code it has always been. Enter is CR because the program is
+/// reading keys, not lines: a canonical read is what turns it into a newline.
+/// The keys with no character of their own become the ANSI sequences a
+/// full-screen program parses (`\x1b[A` and friends).
+fn key_bytes(key: proto::ConsoleKey, out: &mut [u8; 8]) -> usize {
+    let sequence: &[u8] = if key.extended != 0 {
+        match key.scancode {
+            0x48 => b"\x1b[A", // Up
+            0x50 => b"\x1b[B", // Down
+            0x4D => b"\x1b[C", // Right
+            0x4B => b"\x1b[D", // Left
+            0x47 => b"\x1b[H", // Home
+            0x4F => b"\x1b[F", // End
+            0x52 => b"\x1b[2~", // Insert
+            0x53 => b"\x1b[3~", // Delete
+            0x49 => b"\x1b[5~", // Page Up
+            0x51 => b"\x1b[6~", // Page Down
+            _ => b"",
+        }
+    } else {
+        match key.scancode {
+            0x1C => b"\r",  // Enter
+            0x0E => b"\x7f", // Backspace deletes, in a raw Linux terminal
+            0x0F => b"\t",  // Tab
+            0x01 => b"\x1b", // Escape
+            _ if key.ascii != 0 => {
+                let byte = if key.modifiers & proto::wm_mod::CTRL != 0 {
+                    key.ascii & 0x1f
+                } else {
+                    key.ascii
+                };
+                out[0] = byte;
+                return 1;
+            }
+            _ => b"",
+        }
+    };
+    out[..sequence.len()].copy_from_slice(sequence);
+    sequence.len()
 }
 
 /// Everything written to stdout and stderr is also copied, a line at a time,
@@ -698,6 +833,254 @@ pub fn flush_mirrors() {
 }
 
 // ---------------------------------------------------------------------------
+// Sockets
+// ---------------------------------------------------------------------------
+
+const ENOTSOCK: i64 = 88;
+const EDESTADDRREQ: i64 = 89;
+const EOPNOTSUPP: i64 = 95;
+
+/// Run `f` on the socket behind `fd`.
+fn with_socket<T>(fd: i32, f: impl FnOnce(&mut crate::net::Socket) -> T) -> Result<T, i64> {
+    let entry = get(fd)?;
+    let mut object = entry.lock();
+    let Object::Socket(socket) = &mut *object else { return Err(ENOTSOCK) };
+    Ok(f(socket))
+}
+
+pub unsafe fn connect_socket(fd: i32, addr: *const u8, len: u32) -> i64 {
+    // SAFETY: the Linux contract: `addr` has `len` bytes.
+    let address = match unsafe { crate::net::read_address(addr, len) } {
+        Ok(address) => address,
+        Err(errno) => return -errno,
+    };
+    match with_socket(fd, |socket| crate::net::connect(socket, address)) {
+        Ok(result) => result,
+        Err(errno) => -errno,
+    }
+}
+
+pub unsafe fn sendto(
+    fd: i32,
+    buf: *const u8,
+    len: usize,
+    addr: *const u8,
+    addrlen: u32,
+) -> i64 {
+    // SAFETY: the Linux contract: `buf` has `len` readable bytes.
+    let data = unsafe { core::slice::from_raw_parts(buf, len) };
+    let to = if addr.is_null() {
+        None
+    } else {
+        // SAFETY: the Linux contract: `addr` has `addrlen` bytes.
+        match unsafe { crate::net::read_address(addr, addrlen) } {
+            Ok(address) => Some(address),
+            Err(errno) => return -errno,
+        }
+    };
+    match with_socket(fd, |socket| crate::net::send(socket, data, to)) {
+        Ok(result) => result,
+        Err(errno) => -errno,
+    }
+}
+
+pub unsafe fn recvfrom(
+    fd: i32,
+    buf: *mut u8,
+    len: usize,
+    addr: *mut u8,
+    addrlen: *mut u32,
+) -> i64 {
+    // SAFETY: the Linux contract: `buf` has `len` writable bytes.
+    let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    let mut from = crate::net::Address { address: [0; 4], port: 0 };
+    let got = match with_socket(fd, |socket| crate::net::recv(socket, out, Some(&mut from))) {
+        Ok(result) => result,
+        Err(errno) => return -errno,
+    };
+    if got >= 0 && !addr.is_null() && !addrlen.is_null() {
+        if from.address != [0; 4] {
+            // SAFETY: the Linux contract: `addr` has room for a sockaddr_in
+            // and `addrlen` is a writable socklen_t.
+            unsafe { crate::net::write_address(addr, addrlen, from.address, from.port) };
+        }
+    }
+    got
+}
+
+pub unsafe fn sendmsg(fd: i32, message: *const u8) -> i64 {
+    if message.is_null() {
+        return -EFAULT;
+    }
+    // `struct msghdr`: name, namelen, iov, iovlen, control, controllen, flags.
+    // SAFETY: the Linux contract: `message` points at an msghdr.
+    let (name, namelen, iov, iovlen) = unsafe {
+        (
+            (message as *const u64).read_unaligned() as *const u8,
+            (message.add(8) as *const u32).read_unaligned(),
+            (message.add(16) as *const *const IoVec).read_unaligned(),
+            (message.add(24) as *const usize).read_unaligned(),
+        )
+    };
+    let to = if name.is_null() {
+        None
+    } else {
+        // SAFETY: the Linux contract: `name` has `namelen` bytes.
+        match unsafe { crate::net::read_address(name, namelen) } {
+            Ok(address) => Some(address),
+            Err(errno) => return -errno,
+        }
+    };
+    let mut total = 0i64;
+    for index in 0..iovlen {
+        // SAFETY: the Linux contract: `iovlen` iovecs at `iov`.
+        let vec = unsafe { &*iov.add(index) };
+        if vec.len == 0 {
+            continue;
+        }
+        // SAFETY: the contract for each iovec.
+        let data = unsafe { core::slice::from_raw_parts(vec.base, vec.len) };
+        let sent = match with_socket(fd, |socket| crate::net::send(socket, data, to)) {
+            Ok(result) => result,
+            Err(errno) => return if total > 0 { total } else { -errno },
+        };
+        if sent < 0 {
+            return if total > 0 { total } else { sent };
+        }
+        total += sent;
+        if (sent as usize) < vec.len {
+            break;
+        }
+    }
+    total
+}
+
+pub unsafe fn recvmsg(fd: i32, message: *mut u8) -> i64 {
+    if message.is_null() {
+        return -EFAULT;
+    }
+    // `struct msghdr`: name, namelen, iov, iovlen, control, controllen, flags.
+    // SAFETY: the Linux contract: `message` points at an msghdr.
+    let (name, iov, iovlen) = unsafe {
+        (
+            (message as *const u64).read_unaligned() as *mut u8,
+            (message.add(16) as *const *mut IoVec).read_unaligned(),
+            (message.add(24) as *const usize).read_unaligned(),
+        )
+    };
+    if iovlen == 0 {
+        return 0;
+    }
+    // The receive fills the first iovec, which is the whole of what a DNS
+    // reply or an HTTP read ever asks for; extra iovecs would mean receiving
+    // into a scratch buffer first.
+    // SAFETY: the Linux contract: one iovec at `iov`.
+    let vec = unsafe { &mut *iov };
+    let out = unsafe { core::slice::from_raw_parts_mut(vec.base, vec.len) };
+    // A slot the receive fills in with the sender, whether or not the caller
+    // asked for it: `recvmsg` reports it to musl's resolver, which checks it
+    // against the name servers it actually sent to.
+    let mut from = crate::net::Address { address: [0; 4], port: 0 };
+    let got = match with_socket(fd, |socket| crate::net::recv(socket, out, Some(&mut from))) {
+        Ok(result) => result,
+        Err(errno) => return -errno,
+    };
+    if got >= 0 && !name.is_null() && from.address != [0; 4] {
+        // SAFETY: the Linux contract: `name` has room for a sockaddr and the
+        // length field at msghdr+8 is a writable socklen_t.
+        unsafe {
+            crate::net::write_address(name, message.add(8) as *mut u32, from.address, from.port);
+            (message.add(48) as *mut i32).write_unaligned(0);
+        }
+    }
+    got
+}
+
+pub fn shutdown_socket(fd: i32, how: i32) -> i64 {
+    match with_socket(fd, |socket| crate::net::shutdown(socket, how)) {
+        Ok(result) => result,
+        Err(errno) => -errno,
+    }
+}
+
+pub unsafe fn bind_socket(_fd: i32, addr: *const u8, len: u32) -> i64 {
+    // SAFETY: the Linux contract: `addr` has `len` bytes.
+    let address = match unsafe { crate::net::read_address(addr, len) } {
+        Ok(address) => address,
+        Err(errno) => return -errno,
+    };
+    // The service chooses the local port when the socket is opened, so only a
+    // request for "any port" can be honoured.
+    if address.port == 0 {
+        0
+    } else {
+        -EOPNOTSUPP
+    }
+}
+
+pub fn listen_socket(fd: i32) -> i64 {
+    match with_socket(fd, |_| ()) {
+        Ok(()) => -EOPNOTSUPP,
+        Err(errno) => -errno,
+    }
+}
+
+pub unsafe fn getsockname(fd: i32, addr: *mut u8, len: *mut u32) -> i64 {
+    let entry = match get(fd) {
+        Ok(entry) => entry,
+        Err(errno) => return -errno,
+    };
+    let object = entry.lock();
+    let Object::Socket(socket) = &*object else { return -ENOTSOCK };
+    // SAFETY: the Linux contract for getsockname.
+    unsafe { crate::net::local_address(socket, addr, len) }
+}
+
+pub unsafe fn getpeername(fd: i32, addr: *mut u8, len: *mut u32) -> i64 {
+    let entry = match get(fd) {
+        Ok(entry) => entry,
+        Err(errno) => return -errno,
+    };
+    let object = entry.lock();
+    let Object::Socket(socket) = &*object else { return -ENOTSOCK };
+    // SAFETY: the Linux contract for getpeername.
+    unsafe { crate::net::peer_address(socket, addr, len) }
+}
+
+pub fn setsockopt(fd: i32, level: i32, name: i32) -> i64 {
+    match with_socket(fd, |_| crate::net::option(level, name)) {
+        Ok(result) => result,
+        Err(errno) => -errno,
+    }
+}
+
+pub unsafe fn getsockopt(fd: i32, level: i32, name: i32, value: *mut u8, len: *mut u32) -> i64 {
+    const SO_ERROR: i32 = 4;
+    if value.is_null() || len.is_null() {
+        return -EFAULT;
+    }
+    let pending = match with_socket(fd, |socket| {
+        if level == 1 && name == SO_ERROR {
+            crate::net::pending_error(socket)
+        } else {
+            crate::net::option(level, name)
+        }
+    }) {
+        Ok(result) => result,
+        Err(errno) => return -errno,
+    };
+    if pending < 0 {
+        return pending;
+    }
+    // SAFETY: the Linux contract for getsockopt: `value` is an int.
+    unsafe {
+        (value as *mut i32).write_unaligned(0);
+        len.write(4);
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
 // ioctl, fcntl, poll
 // ---------------------------------------------------------------------------
 
@@ -707,13 +1090,48 @@ const TCSETSW: u64 = 0x5403;
 const TCSETSF: u64 = 0x5404;
 const TIOCGWINSZ: u64 = 0x5413;
 const TIOCGPGRP: u64 = 0x540F;
+/// `c_lflag` bits: line editing with echo, or the program reading keys.
+const ICANON: u32 = 0o2;
+const ECHO: u32 = 0o10;
+
+/// Whether the console is in the raw mode a program asked for.
+fn console_raw() -> bool {
+    CONSOLE_RAW.load(Ordering::Relaxed) != 0
+}
+
+/// Put the console back in canonical mode, for a program on its way out.
+///
+/// The console's mode belongs to the terminal, not to the process that set it:
+/// a program that exits mid-raw-mode would otherwise leave the next one reading
+/// keys instead of lines, exactly as a real terminal would.
+pub fn reset_console_mode() {
+    CONSOLE_RAW.store(0, Ordering::Relaxed);
+}
 
 pub unsafe fn ioctl(fd: i32, request: u64, arg: *mut u8) -> i64 {
+    const FIONBIO: u64 = 0x5421;
     let entry = match get(fd) {
         Ok(entry) => entry,
         Err(errno) => return -errno,
     };
-    let is_tty = matches!(&*entry.lock(), Object::Tty(_));
+    let mut object = entry.lock();
+    if let Object::Socket(socket) = &mut *object {
+        if request == FIONBIO {
+            if arg.is_null() {
+                return -EFAULT;
+            }
+            // SAFETY: the Linux contract: `arg` points at an int.
+            let on = unsafe { (arg as *const i32).read() } != 0;
+            if on {
+                socket.flags |= O_NONBLOCK;
+            } else {
+                socket.flags &= !O_NONBLOCK;
+            }
+            return 0;
+        }
+        return -ENOTTY;
+    }
+    let is_tty = matches!(&*object, Object::Tty(_));
     if !is_tty {
         return -ENOTTY;
     }
@@ -738,7 +1156,9 @@ pub unsafe fn ioctl(fd: i32, request: u64, arg: *mut u8) -> i64 {
         }
         TCGETS => {
             // `struct termios`, 60 bytes: canonical mode with echo, which is
-            // what the console's line input actually does.
+            // what the console's line input actually does -- unless a program
+            // asked for raw mode with `tcsetattr`, in which case the flags it
+            // asked for are what it reads back.
             // SAFETY: the Linux contract: `arg` points at a termios.
             unsafe {
                 core::ptr::write_bytes(arg, 0, 60);
@@ -746,11 +1166,31 @@ pub unsafe fn ioctl(fd: i32, request: u64, arg: *mut u8) -> i64 {
                 words.write(0o2400); // c_iflag: ICRNL | IXON
                 words.add(1).write(0o5); // c_oflag: OPOST | ONLCR
                 words.add(2).write(0o277); // c_cflag: B38400 | CS8 | CREAD
-                words.add(3).write(0o105073); // c_lflag: ISIG ICANON ECHO ECHOE ECHOK IEXTEN ECHOCTL ECHOKE
+                words.add(3).write(if console_raw() {
+                    0 // no ICANON, no ECHO: the program reads keys itself
+                } else {
+                    0o105073 // c_lflag: ISIG ICANON ECHO ECHOE ECHOK IEXTEN ECHOCTL ECHOKE
+                });
             }
             0
         }
-        TCSETS | TCSETSW | TCSETSF => 0,
+        TCSETS | TCSETSW | TCSETSF => {
+            // Only one thing about a termios matters here: whether the program
+            // wants the console to edit and echo lines, or wants the keys. The
+            // console has no other modes to set, so the rest is read and kept
+            // only insofar as `TCGETS` reports it back.
+            if arg.is_null() {
+                return -EFAULT;
+            }
+            // SAFETY: the Linux contract: `arg` points at a termios, and
+            // `c_lflag` is its fourth word.
+            let lflag = unsafe { (arg.add(12) as *const u32).read_unaligned() };
+            CONSOLE_RAW.store(
+                u32::from(lflag & (ICANON | ECHO) == 0),
+                Ordering::Relaxed,
+            );
+            0
+        }
         TIOCGPGRP => {
             // SAFETY: the Linux contract: `arg` points at a pid_t.
             unsafe { (arg as *mut i32).write(crate::PID as i32) };
@@ -778,10 +1218,18 @@ pub fn fcntl(fd: i32, command: i32, arg: i64) -> i64 {
         F_GETFD | F_SETFD => 0,
         F_GETFL => match &*entry.lock() {
             Object::File(file) => file.flags as i64,
+            Object::Socket(socket) => (socket.flags | O_RDWR) as i64,
+            Object::Mem(_) => O_RDONLY as i64,
             Object::Tty(Tty::Input) | Object::Dir(_) => 0,
             Object::Tty(_) => 1,
         },
-        F_SETFL => 0,
+        F_SETFL => {
+            let requested = arg as i32;
+            if let Object::Socket(socket) = &mut *entry.lock() {
+                socket.flags = (socket.flags & !O_NONBLOCK) | (requested & O_NONBLOCK);
+            }
+            0
+        }
         _ => -EINVAL,
     }
 }
@@ -794,23 +1242,104 @@ pub struct PollFd {
     revents: i16,
 }
 
-pub unsafe fn poll(fds: *mut PollFd, count: usize) -> i64 {
-    // Files are always ready, and console input is a blocking call rather
-    // than a signal anything can wait on, so report every valid descriptor as
-    // ready for what it asked and let the read itself block.
+pub unsafe fn poll(fds: *mut PollFd, count: usize, timeout_ms: i32) -> i64 {
+    const POLLIN: i16 = 0x1;
+    const POLLOUT: i16 = 0x4;
+    const POLLERR: i16 = 0x8;
+    const POLLHUP: i16 = 0x10;
     const POLLNVAL: i16 = 0x20;
-    let mut ready = 0;
+    const MAX_WATCHED: usize = 32;
+
+    // Files and the console are ready the moment they are asked about: a
+    // console line input blocks inside `read` rather than signalling anything
+    // a program could wait on. Sockets are the descriptors that need waiting
+    // for, so they are collected into one request to the network service.
+    let mut watched: [(u32, u8); MAX_WATCHED] = [(0, 0); MAX_WATCHED];
+    let mut positions: [usize; MAX_WATCHED] = [0; MAX_WATCHED];
+    let mut socket_count = 0;
+    let mut ready = 0i64;
+    let mut immediate = false;
+
     for index in 0..count {
         // SAFETY: the Linux contract: `count` pollfds.
         let item = unsafe { &mut *fds.add(index) };
-        item.revents = if item.fd < 0 {
-            0
-        } else if get(item.fd).is_ok() {
-            item.events & 0x5
-        } else {
-            POLLNVAL
-        };
-        if item.revents != 0 {
+        if item.fd < 0 {
+            item.revents = 0;
+            continue;
+        }
+        match get(item.fd) {
+            Ok(entry) => {
+                let object = entry.lock();
+                if let Object::Socket(socket) = &*object {
+                    item.revents = 0;
+                    if socket_count < MAX_WATCHED {
+                        let mut interest = 0;
+                        if item.events & POLLIN != 0 {
+                            interest |= ready::READ;
+                        }
+                        if item.events & POLLOUT != 0 {
+                            interest |= ready::WRITE;
+                        }
+                        watched[socket_count] = (socket.id, interest);
+                        positions[socket_count] = index;
+                        socket_count += 1;
+                    }
+                } else {
+                    item.revents = item.events & (POLLIN | POLLOUT);
+                    immediate = true;
+                    ready += 1;
+                }
+            }
+            Err(_) => {
+                item.revents = POLLNVAL;
+                immediate = true;
+                ready += 1;
+            }
+        }
+    }
+
+    if socket_count == 0 {
+        // Nothing but files and the console: there is nothing to wait on. A
+        // timeout is still a timeout, so honour it rather than spinning.
+        if !immediate && timeout_ms > 0 {
+            crate::sleep_until(
+                libnode::clock_ns().saturating_add(timeout_ms as u64 * 1_000_000),
+            );
+        }
+        return ready;
+    }
+
+    // A file or the console being ready does not mean nothing else is: a
+    // program that polls its keyboard and its socket together expects both
+    // answers. Ask the network service without waiting when something is
+    // already ready, and with the caller's timeout when nothing is.
+    let timeout = if immediate {
+        0
+    } else if timeout_ms < 0 {
+        u32::MAX
+    } else {
+        timeout_ms as u32
+    };
+    let mut bits = [0u8; MAX_WATCHED];
+    if crate::net::poll(&watched[..socket_count], timeout, &mut bits) < 0 {
+        return -EIO;
+    }
+    for index in 0..socket_count {
+        let ready_bits = bits[index];
+        let mut revents = 0;
+        if ready_bits & ready::READ != 0 {
+            revents |= POLLIN;
+        }
+        if ready_bits & ready::WRITE != 0 {
+            revents |= POLLOUT;
+        }
+        if ready_bits & ready::CLOSED != 0 {
+            revents |= POLLERR | POLLHUP;
+        }
+        // SAFETY: `positions` records indices below `count`.
+        let item = unsafe { &mut *fds.add(positions[index]) };
+        item.revents = revents;
+        if revents != 0 {
             ready += 1;
         }
     }
@@ -824,6 +1353,7 @@ pub unsafe fn poll(fds: *mut PollFd, count: usize) -> i64 {
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
 const S_IFCHR: u32 = 0o020000;
+const S_IFSOCK: u32 = 0o140000;
 const AT_EMPTY_PATH: i32 = 0x1000;
 const AT_REMOVEDIR: i32 = 0x200;
 
@@ -869,6 +1399,17 @@ pub unsafe fn fstat(fd: i32, out: *mut u8) -> i64 {
         Object::Tty(_) => {
             // SAFETY: forwarded contract.
             unsafe { fill_stat(out, 0, S_IFCHR | 0o620, 0, 0) };
+            return 0;
+        }
+        Object::Socket(_) => {
+            // SAFETY: forwarded contract.
+            unsafe { fill_stat(out, 0, S_IFSOCK | 0o777, 0, 0) };
+            return 0;
+        }
+        Object::Mem(mem) => {
+            let size = mem.content.len() as u64;
+            // SAFETY: forwarded contract.
+            unsafe { fill_stat(out, 0, S_IFREG | 0o444, size, 0) };
             return 0;
         }
         Object::File(file) => file.path.clone(),

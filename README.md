@@ -4,14 +4,14 @@ An experimental capability-based, message-oriented microkernel for x86-64,
 written in Rust from scratch. It is deliberately **not** a Unix.
 
 ```
-             Applications (shell, doom)
+             Applications (shell, doom, curl, kirc)
                      |
                 Typed IPC
                      |
               Userspace services
-   +------------+---------+---------+---------+
-   | display    | console |   fs    | audio   |
-   +------------+---------+---------+---------+
+   +------------+---------+---------+---------+---------+
+   | display    | console |   fs    | audio   |   net   |
+   +------------+---------+---------+---------+---------+
                      |
                 Microkernel
                      |
@@ -47,6 +47,8 @@ and the whole thing runs in QEMU today.
 | Text console, cursor, 512-line scrollback and command shell | working |
 | Doom as an explicitly launched full-screen program (`docs/DOOM.md`) | working |
 | Linux programs: musl over an in-process Linux personality (`docs/MUSL.md`) | working: Lua 5.4 |
+| Networking: e1000, ARP/IPv4/TCP/UDP, DHCP, socket service (`docs/NET.md`) | working |
+| Linux sockets and name resolution through liblx | working: curl 8.11, kirc 1.2 |
 | Userspace services (ramfs, devmgr) | in progress |
 
 ## Quick start
@@ -70,6 +72,9 @@ make test-apps    # run the console apps from the shell
 make test-cc      # compile and run a C program
 make test-edit    # edit and save a file
 make test-lua     # build Lua 5.4 against musl and run it
+make test-net     # DHCP, a TCP fetch and a DNS lookup through the stack
+make test-curl    # build curl and fetch from the host and the internet
+make test-kirc    # build kirc and talk to an IRC server on the host
 make test-audio   # check sound using QEMU's wav backend
 make test-shell   # scripts, editing, paging, foreground apps, Doom return
 make test-shell-parser # quotes, escapes and command-file syntax
@@ -195,7 +200,7 @@ The shell is an ordinary console client, but it reads raw keys now, so it has
 history (Up/Down), cursor movement, Tab completion of commands and file names,
 and Ctrl+C to abandon a line. It launches programs with `run /bin/<name>.nxf
 [args...]`, handing each child the same session -- console, filesystem,
-display, audio channels -- and its command line.
+display, audio and network channels -- and its command line.
 
 * `sysinfo` -- a process's view of the system: its capability set, the clock,
   the console's geometry, a memory object it allocates, and filesystem
@@ -214,6 +219,17 @@ display, audio channels -- and its command line.
   a stack machine, and runs it, with a standard library of builtins (`printf`,
   `strlen`, `malloc`, `rand`, and friends). `make test-cc` compiles and runs
   `user/cc/tests/hello.c` and checks the output.
+* `netprobe` -- the network stack's own smoke test, without libc in the way: it
+  fetches over TCP (`netprobe 10.0.2.2 80 /`) or sends one DNS query
+  (`netprobe dns example.com`). `make test-net` runs it.
+* `curl` -- upstream curl, built against musl and liblx by
+  `scripts/build-curl.sh`. `make test-curl` fetches from the host and from the
+  internet. See [Networking](#networking).
+* `kirc` -- upstream kirc 1.2.2, a terminal IRC client, built the same way by
+  `scripts/build-kirc.sh`. `make test-kirc` registers with an IRC server on the
+  host, joins a channel, sends a message and reads the server's replies; see
+  [Linux programs](#linux-programs) for what a full-screen Linux client needs
+  from the console.
 
 ```
 /> run /bin/edit.nxf /notes.txt
@@ -247,6 +263,53 @@ program was given: descriptors 0-2 are the console, `open` is the filesystem
 channel, and `mmap` is memory objects. `scripts/lx-cc` is the compiler driver,
 for use as `$(CC)`. [`docs/MUSL.md`](docs/MUSL.md) has the design, what works,
 and what is still to do: threads, `fork`/`exec` and signals.
+`make curl` builds curl 8.11.1 the same way -- it is the largest Linux program
+that runs here -- and sockets are what it needed (see [Networking](#networking)).
+`make kirc` builds kirc 1.2.2, an IRC client that needs more than sockets: it
+puts the terminal in raw mode, reads keys itself, and redraws its input line
+with ANSI cursor and erase sequences. liblx answers `tcsetattr` by switching the
+console from edited lines to individual keys, and the console honours the
+erase-to-end-of-line and cursor-forward sequences a line editor emits. It has no
+cursor addressing beyond one row, so kirc's screen is a scrolling transcript
+rather than a fixed-layout client, and its socket is read between keystrokes
+rather than while it waits for one. Those are the console's limits, not kirc's:
+the IRC protocol path itself is complete, and `make test-kirc` exercises it.
+
+## Networking
+
+There is a network service and a real TCP/IP stack behind it: e1000, ARP, IPv4,
+TCP, UDP and DHCP, in `user/net`, built on smoltcp. Applications reach it through
+sockets, which liblx translates into messages on one channel:
+
+```text
+   curl  --send()-->  musl  --__lx_syscall-->  liblx  --NET_SOCKET_SEND-->  net
+                                                                            |
+                                                          smoltcp -- e1000 --+
+```
+
+The authority to use the network is a channel, like everything else here: a
+program the shell started without one finds `socket()` returning
+`EAFNOSUPPORT`, and there is no ambient network to escape to. Nothing about the
+stack is in the kernel.
+
+```text
+/> curl -s http://example.com/
+<!doctype html><html lang="en"><head><title>Example Domain</title>...
+/> curl -s -o /NOTES.TXT http://10.0.2.2:8000/notes.txt
+/> netprobe dns example.com
+netprobe: example.com is 104.20.23.154
+```
+
+curl is upstream 8.11.1, unmodified, configured as a cross build with
+`scripts/lx-cc` as the compiler and packed as an NXF (`make curl`). It speaks
+HTTP; HTTPS is not available yet, because no TLS library is linked, which is the
+honest state of the port rather than a hidden one. Name resolution is musl's own
+resolver running over UDP sockets, with `/etc/resolv.conf` synthesized from the
+address the service learned by DHCP.
+
+[`docs/NET.md`](docs/NET.md) has the design: the smoltcp integration, the socket
+protocol, how liblx turns it into Linux system calls, what is missing (listening
+sockets, IPv6, TLS) and what each of those would cost.
 
 ## The C compiler
 
@@ -282,6 +345,8 @@ docs/       design documents
 * [`docs/MUSL.md`](docs/MUSL.md) -- the plan for running ordinary Linux
   programs: musl over an in-process Linux personality, and what the kernel
   needs for it.
+* [`docs/NET.md`](docs/NET.md) -- the network: smoltcp over the e1000 driver, the
+  socket service, liblx's Linux sockets, and what networking cannot do yet.
 
 ## Licence
 

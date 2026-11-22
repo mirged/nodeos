@@ -25,12 +25,17 @@ REPL at the console. `make test-lua` builds it and checks it in QEMU.
 | K3: a parent reads a child's exit code (`HandleInfo::exit_code`) | `kernel/src/syscall/mod.rs` | done; `process_kill` not started |
 | K4-K7: `fork`/`exec`, signals | | not started |
 | K8: wall clock and entropy | | not started: realtime starts at the epoch at boot, `getrandom` is xorshift |
+| Sockets: AF_INET TCP/UDP through the network service (`docs/NET.md`) | `user/lx/src/net.rs`, `user/net/` | done: curl 8.11 over HTTP |
+| Raw-mode terminal input and line-editor escape sequences | `user/lx/src/fs.rs`, `user/libdraw/src/text.rs` | done: kirc 1.2.2 talks IRC over the network |
 
 What liblx answers today: `read`, `write`, `readv`, `writev`, `pread64` and
 `pwrite64`; `open`, `openat`, `close`, `lseek` and `ftruncate`; `stat`, `fstat`,
 `lstat` and `newfstatat`; `access` and `faccessat`; `getdents64`, `getcwd`,
 `chdir`, `mkdir`, `unlink`, `rmdir` and `rename` (done by copying);
-`dup`, `dup2`, `dup3`, `fcntl`, `ioctl` (`TCGETS`, `TIOCGWINSZ`) and `poll`;
+`dup`, `dup2`, `dup3`, `fcntl`, `ioctl` (`TCGETS`, `TCSETS*`, `TIOCGWINSZ`,
+`FIONBIO`) and `poll`/`ppoll` (over files, the console and sockets);
+`socket`, `connect`, `bind`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`,
+`shutdown`, `getsockname`, `getpeername`, `setsockopt` and `getsockopt`;
 `mmap` and `munmap`; `arch_prctl`, `set_tid_address`, the clocks,
 `nanosleep`, `uname`, `getrandom`, `exit` and `exit_group`; and stubs
 that tell the truth for identity, signal masks and `brk`. Anything else
@@ -346,25 +351,33 @@ Gaps in the filesystem protocol that the census hits:
   directory's recorded path, and the working directory is a string in liblx.
   Every protocol call already takes a path, so this costs nothing.
 
-**The terminal is the biggest user-visible gap.** The console speaks
-`CONSOLE_WRITE_TEXT` and `CONSOLE_READ_KEY`. It does not interpret any escape
-sequences (it has no ESC handling at all), and Linux TUI programs (`vi`,
-`less`, `top`, anything that uses curses) assume a VT100/xterm. There are two
-routes:
+**The terminal is still the biggest user-visible gap, but it is no longer
+empty.** The console interprets SGR colours, and the two sequences a line
+editor needs to redraw itself in place: `ESC [ K` (erase to the end of the
+row) and `ESC [ n C` / `ESC [ n D` (cursor forward and back within a row). What
+it does not have is cursor addressing across rows, erase-in-display, or the
+alternate screen, and Linux TUI programs (`vi`, `less`, `top`, anything that
+uses curses) assume a full VT100/xterm. `kirc` is the current example: it runs
+and speaks IRC, but its fixed-layout client draws as a scrolling transcript.
+The route to closing the gap is to finish the terminal emulator in the console,
+not to translate escapes in liblx, where every process would carry its own
+emulation.
 
-1. **Recommended:** move escape-sequence parsing into the console. The
-   console is the terminal emulator, so it should parse CSI cursor movement,
-   SGR colours and erase sequences, which is a few hundred lines. Then a byte
-   stream written to a `Tty` descriptor is passed through without changes, and
-   every program that already speaks VT100 works.
-2. Translate escapes in liblx into `CONSOLE_SET_CURSOR` and similar calls.
-   This puts terminal emulation in every process and is the wrong layer.
+`termios` stays in liblx. `TCGETS` reports canonical mode with echo -- or the
+raw flags a program asked for with `TCSETS`/`TCSETSW`/`TCSETSF` -- and
+`TIOCGWINSZ` comes from `CONSOLE_GET_INFO`; anything else is `ENOTTY`. A
+canonical read is one `CONSOLE_READ_LINE`: the console edits and echoes the
+line and replies on Enter, and liblx appends the newline. A raw read is one
+`CONSOLE_READ_KEY` per byte: Enter is CR, backspace is DEL, control keys
+reduce to their control codes, and the arrows, home/end and the
+insert/delete/page block become the `ESC [ ...` sequences a program parses
+itself. A program that exits in raw mode has the mode reset for it.
 
-`termios` stays in liblx. In canonical mode liblx builds lines from
-`CONSOLE_READ_KEY` events, with echo and erase. In raw mode it passes keys
-through as bytes, with the arrow keys encoded as `ESC [ A` and so on. `ioctl`
-handles `TCGETS`, `TCSETS*` and `TIOCGWINSZ` (from `CONSOLE_GET_INFO`) and
-returns `ENOTTY` for anything else.
+`poll` reports the console as always readable, because a console read blocks
+inside liblx rather than signalling readiness. When a socket is in the same
+call, the network service is asked without waiting so that its readiness is
+reported alongside the console's -- which is what lets a program that polls
+its keyboard and its socket together make progress on both.
 
 ### 4.3 Processes
 
@@ -464,6 +477,32 @@ Synchronous faults (`SIGSEGV`, `SIGBUS`, `SIGFPE`, `SIGILL`) use the same
 path from the exception hook. Programs that catch `SIGSEGV` on purpose
 (garbage collectors, some JITs) need this.
 
+### 4.6 Sockets
+
+Sockets are answered by a service rather than the kernel, so liblx's part is
+translation: each Linux socket call becomes one request on the network channel
+the process was given, and the descriptor table grows a `Socket` object beside
+`File`, `Dir` and the terminal. `read` and `write` on a socket descriptor go to
+`recv` and `send`, because musl does not know which kind of descriptor it holds.
+
+Four details are easy to get wrong, and each one cost a debugging session:
+
+* **`SOCK_NONBLOCK` rides in the `socket(2)` type word.** Dropping it makes
+  musl's poll-driven callers -- its resolver -- block inside a `recv` that was
+  meant to be one iteration of their state machine.
+* **`recvmsg` must report the datagram's source.** musl's resolver discards any
+  answer that did not come from a name server it sent to, so leaving `msg_name`
+  untouched turns every lookup into a timeout.
+* **`poll` is one request for the whole set.** The console is always reported
+  ready, so a poll that includes a terminal returns immediately and the socket's
+  readiness comes back as zero for that turn.
+* **`/etc/resolv.conf` and `/etc/hosts` are synthesized** from what the service
+  reports, because a FAT disk has no `/etc`. musl reads them with ordinary
+  `open`/`read`, so they are read-only memory files in the descriptor table.
+
+[`docs/NET.md`](NET.md) covers the service side: the stack, the protocol, and
+what is still missing.
+
 ---
 
 ## 5. Toolchain
@@ -562,11 +601,17 @@ targets.
 Phases 1 to 3 are the bulk of the value. With them, a NOMMU busybox, every
 C program that does not fork, and most Rust programs run.
 
+The socket layer was added outside this list: it needed no kernel work at all,
+only liblx and the `net` service (`docs/NET.md`). `make test-net` and
+`make test-curl` cover it.
+
 ### Out of scope for now
 
-* **Networking.** Sockets need a network stack service first. `AF_UNIX`
-  could be built on channels earlier, and should carry handles in
-  `SCM_RIGHTS`, which maps directly onto channel capability transfer.
+* **Networking beyond IPv4 client sockets.** What exists is in `docs/NET.md`:
+  AF_INET TCP and UDP through the network service, which is what `curl` needs.
+  Listening sockets, IPv6 and TLS are not there. `AF_UNIX` would be built on
+  channels and should carry handles in `SCM_RIGHTS`, which maps directly onto
+  channel capability transfer.
 * **Users and permissions.** There are none, which is the point of NodeOS.
   `getuid` returns 0 so that programs which insist on root are satisfied,
   `setuid` succeeds as a no-op, and file modes are synthesized. Authority is

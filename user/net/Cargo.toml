@@ -6,3 +6,17 @@ edition = "2024"
 [dependencies]
 libnode = { workspace = true }
 nodeos-abi = { workspace = true }
+# The TCP/IP stack. `default-features = false` drops `std`, the raw-socket and
+# TAP backends, IPv6, and the logging shim; what is left is the IPv4/TCP/UDP
+# core, Ethernet framing, DHCP and ARP, none of which need an operating system.
+smoltcp = { version = "=0.11.0", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-dhcpv4",
+    "socket-tcp",
+    "socket-udp",
+    "socket-dhcpv4",
+    "alloc",
+    "iface-max-addr-count-2",
+] }
+

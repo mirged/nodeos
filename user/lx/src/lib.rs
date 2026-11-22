@@ -29,6 +29,7 @@ extern crate alloc;
 mod errno;
 mod fs;
 mod mm;
+mod net;
 mod start;
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -68,6 +69,21 @@ mod nr {
     pub const DUP2: i64 = 33;
     pub const NANOSLEEP: i64 = 35;
     pub const GETPID: i64 = 39;
+    pub const SOCKET: i64 = 41;
+    pub const CONNECT: i64 = 42;
+    pub const ACCEPT: i64 = 43;
+    pub const SENDTO: i64 = 44;
+    pub const RECVFROM: i64 = 45;
+    pub const SENDMSG: i64 = 46;
+    pub const RECVMSG: i64 = 47;
+    pub const SHUTDOWN: i64 = 48;
+    pub const BIND: i64 = 49;
+    pub const LISTEN: i64 = 50;
+    pub const GETSOCKNAME: i64 = 51;
+    pub const GETPEERNAME: i64 = 52;
+    pub const SOCKETPAIR: i64 = 53;
+    pub const SETSOCKOPT: i64 = 54;
+    pub const GETSOCKOPT: i64 = 55;
     pub const CLONE: i64 = 56;
     pub const FORK: i64 = 57;
     pub const VFORK: i64 = 58;
@@ -117,6 +133,7 @@ mod nr {
     pub const FACCESSAT: i64 = 269;
     pub const PPOLL: i64 = 271;
     pub const SET_ROBUST_LIST: i64 = 273;
+    pub const ACCEPT4: i64 = 288;
     pub const DUP3: i64 = 292;
     pub const PIPE2: i64 = 293;
     pub const PRLIMIT64: i64 = 302;
@@ -180,10 +197,34 @@ unsafe fn dispatch(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i6
             nr::RENAMEAT => fs::renameat(a as i32, b as *const u8, c as i32, d as *const u8),
             // FAT has no symbolic links, so nothing is one.
             nr::READLINK | nr::READLINKAT => -EINVAL,
-            nr::POLL => fs::poll(a as *mut fs::PollFd, b as usize),
-            nr::PPOLL => fs::poll(a as *mut fs::PollFd, b as usize),
+            nr::POLL => fs::poll(a as *mut fs::PollFd, b as usize, c as i32),
+            nr::PPOLL => fs::poll(a as *mut fs::PollFd, b as usize, ppoll_timeout(c as *const i64)),
             nr::UMASK => 0o022,
             nr::PIPE2 => -ENOSYS,
+
+            // Sockets. The work is in `net`, over the network service; these
+            // arms only unpack the Linux argument order.
+            nr::SOCKET => net::open(a as i32, b as i32, c as i32, d as i32),
+            nr::CONNECT => fs::connect_socket(a as i32, b as *const u8, c as u32),
+            nr::SENDTO => {
+                fs::sendto(a as i32, b as *const u8, c as usize, e as *const u8, f as u32)
+            }
+            nr::RECVFROM => {
+                fs::recvfrom(a as i32, b as *mut u8, c as usize, e as *mut u8, f as *mut u32)
+            }
+            nr::SENDMSG => fs::sendmsg(a as i32, b as *const u8),
+            nr::RECVMSG => fs::recvmsg(a as i32, b as *mut u8),
+            nr::SHUTDOWN => fs::shutdown_socket(a as i32, b as i32),
+            nr::BIND => fs::bind_socket(a as i32, b as *const u8, c as u32),
+            nr::LISTEN => fs::listen_socket(a as i32),
+            nr::GETSOCKNAME => fs::getsockname(a as i32, b as *mut u8, c as *mut u32),
+            nr::GETPEERNAME => fs::getpeername(a as i32, b as *mut u8, c as *mut u32),
+            nr::SETSOCKOPT => fs::setsockopt(a as i32, b as i32, c as i32),
+            nr::GETSOCKOPT => fs::getsockopt(a as i32, b as i32, c as i32, d as *mut u8, e as *mut u32),
+            // Nothing listens: there is no way to accept a connection, and no
+            // program in this tree asks to.
+            nr::ACCEPT | nr::ACCEPT4 => -ENOSYS,
+            nr::SOCKETPAIR => -EOPNOTSUPP,
 
             nr::MMAP => mm::mmap(a as u64, b as u64, c as i32, d as i32, e as i32, f as u64),
             nr::MUNMAP => mm::munmap(a as u64, b as u64),
@@ -290,6 +331,9 @@ unsafe fn arch_prctl(code: i32, value: u64) -> i64 {
 }
 
 fn exit(code: i32) -> ! {
+    // The terminal outlives the program: a raw-mode program that exits without
+    // restoring the console would leave the next reader getting keys.
+    fs::reset_console_mode();
     fs::flush_mirrors();
     libnode::println!("lx: exited with {code}");
     libnode::exit(code)
@@ -436,7 +480,22 @@ unsafe fn clock_nanosleep(flags: i32, request: *const i64) -> i64 {
     0
 }
 
-fn sleep_until(deadline: u64) {
+/// `ppoll`'s timeout is a `timespec`; `poll`'s is milliseconds.
+unsafe fn ppoll_timeout(request: *const i64) -> i32 {
+    if request.is_null() {
+        return -1;
+    }
+    // SAFETY: the Linux contract: `request` points at a timespec.
+    let (seconds, nanoseconds) = unsafe { (request.read(), request.add(1).read()) };
+    let milliseconds = seconds.saturating_mul(1000) + nanoseconds / 1_000_000;
+    if milliseconds > i32::MAX as i64 {
+        i32::MAX
+    } else {
+        milliseconds as i32
+    }
+}
+
+pub(crate) fn sleep_until(deadline: u64) {
     // `wait` needs an object; there are no timer objects yet, so yield until
     // the clock passes the deadline. Correct, if not free.
     while libnode::clock_ns() < deadline {

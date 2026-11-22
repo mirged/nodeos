@@ -15,3 +15,5 @@ bench = false
 [dependencies]
 libnode = { workspace = true }
 nodeos-abi = { workspace = true }
+# The service protocol: message kinds, socket kinds, status bytes.
+net = { path = "../net" }

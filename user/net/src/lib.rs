@@ -1,6 +1,30 @@
+//! The network service: an e1000 driver, a TCP/IP stack and the message
+//! protocol clients use to reach it.
+//!
+//! There are two halves and they meet in the middle:
+//!
+//! * [`E1000Driver`] programs the Intel 82540EM: descriptor rings, DMA, one
+//!   Ethernet frame in and one out.
+//! * [`stack::Stack`] is smoltcp over that driver: ARP, IPv4, TCP, UDP and
+//!   DHCP, with no operating system underneath it.
+//!
+//! On top of the stack sits a socket table and a small request/reply protocol.
+//! A client does not get a network "stack" object; it gets a channel to this
+//! service and asks for an IPv4 socket, connects it, sends and receives on it,
+//! and polls it for readiness. liblx turns those messages into the Linux socket
+//! system calls, which is how `curl` reaches the internet (docs/MUSL.md).
+//!
+//! ```text
+//!   C program --send--> musl --__lx_syscall--> liblx --NET_SOCKET_SEND--> net
+//!                                                                        |
+//!                                                      smoltcp -- e1000 --+
+//! ```
+
 #![no_std]
 
 extern crate alloc;
+
+pub mod stack;
 
 use alloc::vec::Vec;
 use core::ptr::{copy_nonoverlapping, read_volatile, write_volatile};
@@ -12,68 +36,284 @@ use libnode::device::{Device, Dma};
 use libnode::mem::Mapping;
 use libnode::{Channel, Error, Message};
 
-/// Request/reply for retrieving the link state and station MAC.
-pub const NET_INFO: u32 = 0x4E45_0001;
-/// Request/reply for transmitting one Ethernet frame.
-pub const NET_TRANSMIT: u32 = 0x4E45_0002;
-/// Non-blocking request/reply for receiving one Ethernet frame.
-pub const NET_RECEIVE: u32 = 0x4E45_0003;
-/// Maximum frame size returned by the network service.
-pub const MAX_RX_PACKET_SIZE: usize = 2048;
+pub use stack::{ClientConfig, Id};
 
-/// Link properties returned by [`NetworkClient::link_info`].
+// ---------------------------------------------------------------------------
+// The service protocol
+// ---------------------------------------------------------------------------
+
+/// Link state, addresses and station MAC for this interface.
+pub const NET_INFO: u32 = 0x4E45_0001;
+/// Open a socket. `kind: u8`, `port: u16`; replies with an id `u32`.
+pub const NET_SOCKET_OPEN: u32 = 0x4E45_0011;
+/// Connect a TCP socket or set a UDP peer. Blocks until established.
+pub const NET_SOCKET_CONNECT: u32 = 0x4E45_0012;
+/// Queue bytes for transmission. Replies with the number accepted (`u32`).
+pub const NET_SOCKET_SEND: u32 = 0x4E45_0013;
+/// Receive bytes. Blocks until data, EOF or the timeout.
+pub const NET_SOCKET_RECV: u32 = 0x4E45_0014;
+/// Wait until any of a set of sockets is ready, or the timeout passes.
+pub const NET_SOCKET_POLL: u32 = 0x4E45_0015;
+/// Close a socket.
+pub const NET_SOCKET_CLOSE: u32 = 0x4E45_0016;
+/// Shut down one direction of a socket. `how: u8` as `SHUT_*`.
+pub const NET_SOCKET_SHUTDOWN: u32 = 0x4E45_0017;
+/// Ask about a socket's state, local port and peer.
+pub const NET_SOCKET_INFO: u32 = 0x4E45_0018;
+
+/// Socket kinds a client may open.
+pub mod socket_kind {
+    /// A reliable byte stream.
+    pub const TCP: u8 = 1;
+    /// A datagram socket.
+    pub const UDP: u8 = 2;
+}
+
+/// Readiness bits, both in [`NET_SOCKET_POLL`] requests and its reply, and in
+/// [`SocketInfo::state`]'s neighbourhood: they mirror `poll(2)`.
+pub mod ready {
+    /// Data is available, or end of file has been reached.
+    pub const READ: u8 = 1;
+    /// Space is available in the send buffer.
+    pub const WRITE: u8 = 2;
+    /// The connection is gone; reads return EOF and writes fail.
+    pub const CLOSED: u8 = 4;
+}
+
+/// What an operation did, as the first byte of most socket replies.
+///
+/// Errors in the protocol itself -- an id that was never opened, a malformed
+/// request -- come back as an `ERROR` message instead; these are outcomes of a
+/// well-formed operation.
+pub mod status {
+    /// The operation did what was asked.
+    pub const OK: u8 = 0;
+    /// Nothing was available before the timeout.
+    pub const AGAIN: u8 = 1;
+    /// The peer will send nothing more, or is gone.
+    pub const EOF: u8 = 2;
+    /// The peer refused the connection.
+    pub const REFUSED: u8 = 3;
+    /// The connection attempt ran out of time.
+    pub const TIMEOUT: u8 = 4;
+    /// There is no route, or the interface has no address yet.
+    pub const UNREACHABLE: u8 = 5;
+    /// The connection was established and then lost.
+    pub const RESET: u8 = 6;
+    /// Nothing is connected on this socket.
+    pub const NOT_CONNECTED: u8 = 7;
+}
+
+/// A socket's connection state, as [`NET_SOCKET_INFO`] reports it.
+pub mod socket_state {
+    /// Nothing is connected.
+    pub const CLOSED: u8 = 0;
+    /// A TCP connection is being established.
+    pub const CONNECTING: u8 = 1;
+    /// Data may flow.
+    pub const ESTABLISHED: u8 = 2;
+    /// One side has started to close.
+    pub const CLOSING: u8 = 3;
+}
+
+/// Link properties returned by [`SocketClient::info`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LinkInfo {
+pub struct NetInfo {
     /// Station MAC address.
     pub mac_address: [u8; 6],
     /// Whether carrier is currently reported.
     pub link_up: bool,
+    /// The interface has an address and a default route.
+    pub configured: bool,
+    /// Addresses clients should use.
+    pub config: ClientConfig,
 }
 
-/// Client for the network service's raw-Ethernet channel protocol.
-///
-/// Transmit calls copy their payload into a driver-owned DMA buffer. Receive
-/// calls return an owned frame, or `None` when no frame is queued.
-pub struct NetworkClient {
+/// What [`SocketClient::state`] reports about one socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SocketInfo {
+    /// One of [`socket_state`].
+    pub state: u8,
+    /// The port this side is bound to.
+    pub local_port: u16,
+    /// The peer, once connected.
+    pub peer: [u8; 4],
+    /// The peer's port.
+    pub peer_port: u16,
+}
+
+/// What [`SocketClient::receive`] returned.
+#[derive(Debug)]
+pub enum Received {
+    /// Bytes from the peer, and the address they came from.
+    Data {
+        /// The bytes themselves.
+        bytes: Vec<u8>,
+        /// The sender, which for a datagram socket is not necessarily the peer
+        /// it was connected to.
+        from: ([u8; 4], u16),
+    },
+    /// The peer shut the connection down.
+    Eof,
+    /// Nothing arrived before the timeout.
+    Again,
+    /// The connection is gone.
+    Closed,
+}
+
+/// Client for the network service's TCP/IP channel protocol.
+pub struct SocketClient {
     channel: Channel,
 }
 
-impl NetworkClient {
+impl SocketClient {
     /// Use a network channel capability received from the launcher.
     pub const fn from_channel(channel: Channel) -> Self {
         Self { channel }
     }
 
-    /// Query the current link state and station MAC address.
-    pub fn link_info(&self) -> Result<LinkInfo, Error> {
-        let reply = self.channel.call_with(Message::new(NET_INFO), 8, 0)?;
-        check_reply(&reply)?;
-        if reply.payload.len() != 7 || reply.payload[6] > 1 {
-            return Err(Error::BadState);
-        }
-        let mut mac_address = [0; 6];
-        mac_address.copy_from_slice(&reply.payload[..6]);
-        Ok(LinkInfo { mac_address, link_up: reply.payload[6] != 0 })
+    /// The underlying channel.
+    pub fn channel(&self) -> &Channel {
+        &self.channel
     }
 
-    /// Send one raw Ethernet frame.
-    pub fn transmit(&self, frame: &[u8]) -> Result<(), Error> {
-        if frame.is_empty() || frame.len() > MAX_TX_PACKET_SIZE {
-            return Err(Error::InvalidArgument);
+    /// Link state, addresses and the station MAC.
+    pub fn info(&self) -> Result<NetInfo, Error> {
+        let reply = self.channel.call_with(Message::new(NET_INFO), 32, 0)?;
+        check_reply(&reply)?;
+        decode_info(&reply.payload)
+    }
+
+    /// Open a socket. `port` of zero asks for an ephemeral one.
+    pub fn open(&self, kind: u8, port: u16) -> Result<u32, Error> {
+        let mut request = Message::new(NET_SOCKET_OPEN);
+        request.payload.push(kind);
+        request.payload.extend_from_slice(&port.to_le_bytes());
+        let reply = self.channel.call_with(request, 8, 0)?;
+        check_reply(&reply)?;
+        decode_u32(&reply.payload)
+    }
+
+    /// Connect a socket to `address:port`, waiting up to `timeout_ms` (`0`
+    /// waits as long as the stack takes). Returns the status byte:
+    /// [`status::OK`], [`status::REFUSED`], [`status::TIMEOUT`] or
+    /// [`status::UNREACHABLE`].
+    pub fn connect(
+        &self,
+        id: u32,
+        address: [u8; 4],
+        port: u16,
+        timeout_ms: u32,
+    ) -> Result<u8, Error> {
+        let mut request = Message::new(NET_SOCKET_CONNECT);
+        request.payload.extend_from_slice(&id.to_le_bytes());
+        request.payload.extend_from_slice(&address);
+        request.payload.extend_from_slice(&port.to_le_bytes());
+        request.payload.extend_from_slice(&timeout_ms.to_le_bytes());
+        let reply = self.channel.call_with(request, 16, 0)?;
+        check_reply(&reply)?;
+        reply.payload.first().copied().ok_or(Error::BadState)
+    }
+
+    /// Queue bytes for transmission on a connected socket. Returns the status
+    /// byte and how many bytes the stack accepted; [`status::AGAIN`] means the
+    /// send buffer is full.
+    pub fn send(&self, id: u32, data: &[u8]) -> Result<(u8, usize), Error> {
+        self.send_to(id, [0; 4], 0, data)
+    }
+
+    /// Queue a datagram for `address:port`, or bytes on a TCP connection
+    /// (where the address is ignored).
+    pub fn send_to(
+        &self,
+        id: u32,
+        address: [u8; 4],
+        port: u16,
+        data: &[u8],
+    ) -> Result<(u8, usize), Error> {
+        let mut request = Message::new(NET_SOCKET_SEND);
+        request.payload.extend_from_slice(&id.to_le_bytes());
+        request.payload.extend_from_slice(&address);
+        request.payload.extend_from_slice(&port.to_le_bytes());
+        request.payload.extend_from_slice(data);
+        let reply = self.channel.call_with(request, 16, 0)?;
+        check_reply(&reply)?;
+        let status = reply.payload.first().copied().ok_or(Error::BadState)?;
+        let written = reply
+            .payload
+            .get(1..5)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_le_bytes)
+            .unwrap_or(0);
+        Ok((status, written as usize))
+    }
+
+    /// Receive up to `max` bytes, waiting up to `timeout_ms`.
+    pub fn receive(&self, id: u32, max: usize, timeout_ms: u32) -> Result<Received, Error> {
+        let mut request = Message::new(NET_SOCKET_RECV);
+        request.payload.extend_from_slice(&id.to_le_bytes());
+        request.payload.extend_from_slice(&(max as u32).to_le_bytes());
+        request.payload.extend_from_slice(&timeout_ms.to_le_bytes());
+        let reply = self.channel.call_with(request, max.max(16) + 8, 0)?;
+        check_reply(&reply)?;
+        let payload = &reply.payload;
+        let status = payload.first().copied().ok_or(Error::BadState)?;
+        if status != status::OK {
+            return match status {
+                status::EOF => Ok(Received::Eof),
+                status::AGAIN => Ok(Received::Again),
+                status::RESET | status::NOT_CONNECTED => Ok(Received::Closed),
+                _ => Err(Error::BadState),
+            };
         }
-        let reply = self.channel.call_with(Message::new(NET_TRANSMIT).with_payload(frame), 8, 0)?;
+        // status, the sender's address, its port, then the bytes.
+        if payload.len() < 7 {
+            return Err(Error::BadState);
+        }
+        let mut address = [0; 4];
+        address.copy_from_slice(&payload[1..5]);
+        let port = u16::from_le_bytes([payload[5], payload[6]]);
+        Ok(Received::Data { bytes: payload[7..].to_vec(), from: (address, port) })
+    }
+
+    /// Wait until any of `entries` (`(socket, ready bits)`) is ready.
+    pub fn poll(&self, entries: &[(u32, u8)], timeout_ms: u32) -> Result<Vec<u8>, Error> {
+        let mut request = Message::new(NET_SOCKET_POLL);
+        request.payload.extend_from_slice(&timeout_ms.to_le_bytes());
+        request.payload.push(entries.len() as u8);
+        for (id, interest) in entries {
+            request.payload.extend_from_slice(&id.to_le_bytes());
+            request.payload.push(*interest);
+        }
+        let reply = self.channel.call_with(request, 64, 0)?;
+        check_reply(&reply)?;
+        Ok(reply.payload)
+    }
+
+    /// Close a socket.
+    pub fn close(&self, id: u32) -> Result<(), Error> {
+        let mut request = Message::new(NET_SOCKET_CLOSE);
+        request.payload.extend_from_slice(&id.to_le_bytes());
+        let reply = self.channel.call_with(request, 16, 0)?;
         check_reply(&reply)
     }
 
-    /// Return the next queued raw Ethernet frame, if one is available.
-    pub fn receive(&self) -> Result<Option<Vec<u8>>, Error> {
-        let reply = self.channel.call_with(Message::new(NET_RECEIVE), MAX_RX_PACKET_SIZE, 0)?;
+    /// Shut down one direction. `how`: 0 read, 1 write, 2 both.
+    pub fn shutdown(&self, id: u32, how: u8) -> Result<(), Error> {
+        let mut request = Message::new(NET_SOCKET_SHUTDOWN);
+        request.payload.extend_from_slice(&id.to_le_bytes());
+        request.payload.push(how);
+        let reply = self.channel.call_with(request, 16, 0)?;
+        check_reply(&reply)
+    }
+
+    /// Connection state, local port and peer for a socket.
+    pub fn state(&self, id: u32) -> Result<SocketInfo, Error> {
+        let mut request = Message::new(NET_SOCKET_INFO);
+        request.payload.extend_from_slice(&id.to_le_bytes());
+        let reply = self.channel.call_with(request, 32, 0)?;
         check_reply(&reply)?;
-        if reply.payload.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(reply.payload))
-        }
+        decode_socket_info(&reply.payload)
     }
 }
 
@@ -89,6 +329,67 @@ fn check_reply(reply: &Message) -> Result<(), Error> {
         .ok_or(Error::BadState)?;
     Err(Error::from_raw(raw).unwrap_or(Error::BadState))
 }
+
+fn decode_u32(bytes: &[u8]) -> Result<u32, Error> {
+    bytes
+        .get(..4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_le_bytes)
+        .ok_or(Error::BadState)
+}
+
+/// Decode the 21-byte [`NET_INFO`] reply.
+pub fn decode_info(payload: &[u8]) -> Result<NetInfo, Error> {
+    if payload.len() != 21 {
+        return Err(Error::BadState);
+    }
+    let mut mac_address = [0; 6];
+    mac_address.copy_from_slice(&payload[..6]);
+    let mut address = [0; 4];
+    address.copy_from_slice(&payload[8..12]);
+    let mut gateway = [0; 4];
+    gateway.copy_from_slice(&payload[13..17]);
+    let mut dns = [0; 4];
+    dns.copy_from_slice(&payload[17..21]);
+    Ok(NetInfo {
+        mac_address,
+        link_up: payload[6] != 0,
+        configured: payload[7] != 0,
+        config: ClientConfig { address, prefix_length: payload[12], gateway, dns },
+    })
+}
+
+/// Encode the 21-byte [`NET_INFO`] reply.
+pub fn encode_info(info: &NetInfo) -> [u8; 21] {
+    let mut out = [0u8; 21];
+    out[..6].copy_from_slice(&info.mac_address);
+    out[6] = info.link_up as u8;
+    out[7] = info.configured as u8;
+    out[8..12].copy_from_slice(&info.config.address);
+    out[12] = info.config.prefix_length;
+    out[13..17].copy_from_slice(&info.config.gateway);
+    out[17..21].copy_from_slice(&info.config.dns);
+    out
+}
+
+/// Decode the 9-byte [`NET_SOCKET_INFO`] reply.
+pub fn decode_socket_info(payload: &[u8]) -> Result<SocketInfo, Error> {
+    if payload.len() != 9 {
+        return Err(Error::BadState);
+    }
+    let mut peer = [0; 4];
+    peer.copy_from_slice(&payload[3..7]);
+    Ok(SocketInfo {
+        state: payload[0],
+        local_port: u16::from_le_bytes([payload[1], payload[2]]),
+        peer,
+        peer_port: u16::from_le_bytes([payload[7], payload[8]]),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The e1000 driver
+// ---------------------------------------------------------------------------
 
 const E1000_CTRL: usize = 0x0000;
 const E1000_STATUS: usize = 0x0008;
@@ -405,7 +706,7 @@ impl E1000Driver {
     }
 
     fn write_reg(&self, offset: usize, value: u32) {
-        unsafe { write_volatile((self.mmio_base + offset) as *mut u32, value) };
+        unsafe { write_volatile((self.mmio_base + offset) as *mut u32, value) }
     }
 
     fn read_reg(&self, offset: usize) -> u32 {

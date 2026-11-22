@@ -68,8 +68,9 @@ QEMU_FLAGS   := -machine q35 -cpu $(QEMU_CPU) -smp $(QEMU_SMP) -m $(QEMU_MEM) \
                 -netdev user,id=net0 -device e1000,netdev=net0 \
                 -drive file=$(DISK),if=virtio,format=raw
 
-.PHONY: all build kernel tools user modules iso disk run debug sysroot lx lx-apps \
+.PHONY: all build kernel tools user modules iso disk run debug sysroot lx lx-apps curl kirc \
         test test-fs test-apps test-cc test-edit test-audio test-shell test-shell-parser test-fat-read test-terminal test-doom-libc test-lua \
+        test-net test-curl test-kirc \
         test-shell-features test-editor \
         fmt clippy clean help
 
@@ -117,7 +118,7 @@ modules: tools user
 		--stack 256K --heap 4M --max-memory 32M
 	$(NXFPACK) $(USER_DIR)/net -o $(MODULE_DIR)/net.nxf --name net --service --strict \
 		--cap NETWORK --cap DEVICE --cap CHANNEL --cap MEMORY \
-		--stack 256K --heap 1M --max-memory 8M
+		--stack 256K --heap 4M --max-memory 32M
 	$(NXFPACK) $(USER_DIR)/fs -o $(MODULE_DIR)/fs.nxf --name fs --service --strict \
 		--cap FILE_READ --cap FILE_WRITE --cap FILE_CREATE --cap DEVICE --cap CHANNEL --cap MEMORY \
 		--stack 256K --heap 8M --max-memory 64M
@@ -160,6 +161,17 @@ lx: user
 # hello and Lua, compiled with scripts/lx-cc and packed as NXF.
 lx-apps: sysroot lx tools
 	scripts/build-lx-apps.sh $(NXFPACK)
+
+# curl, from upstream source, built and packed the same way. Separate from
+# `lx-apps` because it is a larger download and a longer build, and neither
+# `make` nor `make lx-apps` needs it; once built, `make` puts it on the disk.
+curl: sysroot lx tools
+	scripts/build-curl.sh $(NXFPACK)
+
+# kirc, the IRC client, built and packed the same way. Once built, `make` puts
+# it on the disk as /bin/kirc.nxf.
+kirc: sysroot lx tools
+	scripts/build-kirc.sh $(NXFPACK)
 
 # The interactive ISO: every module, and a GRUB menu whose default entry boots
 # the full-screen shell.
@@ -245,6 +257,23 @@ test-lua: lx-apps $(ISO) $(DISK)
 	mcopy -o -i $(DISK) $(LX_DIR)/*.nxf ::/bin/
 	@scripts/run-lua-test.sh
 
+# The network stack, without curl in the way: DHCP, a TCP fetch from a server on
+# the host, and a DNS lookup for a name on the internet, driven by `netprobe`.
+test-net: $(ISO) $(DISK)
+	@scripts/run-net-test.sh
+
+# curl, built from upstream source: fetch a file over TCP, save it to the disk,
+# read it back, then fetch a page from the internet.
+test-curl: curl $(ISO) $(DISK)
+	mcopy -o -i $(DISK) $(LX_DIR)/curl.nxf ::/bin/
+	@scripts/run-curl-test.sh
+
+# kirc, built from upstream source: register with an IRC server on the host,
+# join a channel, send a message, read the server's lines back, and quit.
+test-kirc: kirc $(ISO) $(DISK)
+	mcopy -o -i $(DISK) $(LX_DIR)/kirc.nxf ::/bin/
+	@scripts/run-kirc-test.sh
+
 # The text editor: type, save, and read the file back with mtools.
 test-edit: $(ISO) $(DISK)
 	@scripts/run-edit-test.sh
@@ -321,6 +350,11 @@ help:
 	  '  make test-cc       Compile and run a C program with cc' \
 	  '  make test-lua      Run Lua 5.4 and a C program built against musl' \
 	  '  make lx-apps       Build the Linux programs (musl + liblx) into build/lx' \
+	  '  make curl          Build curl from upstream source into build/lx' \
+	  '  make kirc          Build kirc from upstream source into build/lx' \
+	  '  make test-net      Check the network stack: DHCP, TCP, DNS' \
+	  '  make test-curl     Run curl against the host and the internet' \
+	  '  make test-kirc     Run kirc against an IRC server on the host' \
 	  '  make test-edit     Edit and save a file with the editor' \
 	  '  make test-audio    Check sound using QEMU'"'"'s wav backend' \
 	  '  make test-shell    Check shell workflows and fullscreen apps' \

@@ -30,6 +30,7 @@ boot_guest() {
         -machine q35 -cpu qemu64 -smp 1 -m "${MEMORY}" -boot d -no-reboot \
         -cdrom "${ISO}" -serial "file:${LOG}" -display none \
         -audiodev "${AUDIODEV}" -device AC97,audiodev=snd0 \
+        -netdev user,id=net0 -device e1000,netdev=net0 \
         -drive file="${DISK}",if=virtio,format=raw \
         -monitor tcp:127.0.0.1:${PORT},server,nowait >/dev/null 2>&1 &
     QEMU_PID=$!
@@ -61,7 +62,10 @@ type_line() {
             " ") key=spc ;; "/") key=slash ;; ".") key=dot ;; "-") key=minus ;; "=") key=equal ;;
             ",") key=comma ;; ";") key=semicolon ;; "_") key=shift-minus ;; "\$") key=shift-4 ;;
             "&") key=shift-7 ;; "*") key=shift-8 ;; "(") key=shift-9 ;; ")") key=shift-0 ;;
+            "#") key=shift-3 ;; "!") key=shift-1 ;; "@") key=shift-2 ;; "%") key=shift-5 ;;
+            "+") key=shift-equal ;;
             "|") key=shift-backslash ;; ">") key=shift-dot ;; "<") key=shift-comma ;;
+            ":") key=shift-semicolon ;;
             "?") key=shift-slash ;; "\"") key=shift-apostrophe ;;
             "{") key=shift-bracket_left ;; "}") key=shift-bracket_right ;;
             [A-Z]) key="shift-${char,,}" ;;

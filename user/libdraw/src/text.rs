@@ -154,6 +154,45 @@ impl TextGrid {
             }
         }
     }
+    /// Finish an escape sequence: colours, and the cursor and erase controls a
+    /// program uses to redraw its own input line.
+    ///
+    /// Only what such programs actually emit is honoured; anything else is
+    /// dropped, as unknown sequences always were. Cursor motion is confined to
+    /// the current row: the console's damage tracking works in rows, so a move
+    /// to another row would leave that row unpainted.
+    fn escape_sequence(&mut self, canvas: &mut Canvas, final_byte: u8) {
+        let count = self.params[0].max(1) as u32;
+        match final_byte {
+            b'm' => self.sgr(),
+            b'K' => {
+                // Erase from the cursor to the end of the row: `ESC[0K`, the
+                // `CLEAR_LINE` a client writes before redrawing what it has.
+                let ink = self.ink;
+                let paper = self.paper;
+                for col in self.col..self.cols {
+                    self.cells[(self.row * self.cols + col) as usize] = Cell {
+                        byte: b' ',
+                        fg: ink,
+                        bg: paper,
+                    };
+                    self.font.draw(canvas, col, self.row, b' ', ink, paper);
+                }
+            }
+            b'C' => {
+                self.erase_cursor(canvas);
+                self.col = self
+                    .col
+                    .saturating_add(count)
+                    .min(self.cols.saturating_sub(1));
+            }
+            b'D' => {
+                self.erase_cursor(canvas);
+                self.col = self.col.saturating_sub(count);
+            }
+            _ => {}
+        }
+    }
     /// Text columns.
     pub const fn cols(&self) -> u32 {
         self.cols
@@ -342,9 +381,7 @@ impl TextGrid {
                         self.param_at += 1;
                     }
                 } else {
-                    if byte == b'm' {
-                        self.sgr();
-                    }
+                    self.escape_sequence(canvas, byte);
                     self.escape = 0;
                 }
                 continue;
@@ -471,6 +508,26 @@ mod tests {
         assert_eq!(canvas.pixel(0, 0), Some(0x101216));
         assert_eq!(canvas.pixel(15, 40), Some(0x101216));
         assert_eq!(canvas.pixel(71, 97), Some(0x101216));
+    }
+    #[test]
+    fn erase_line_and_cursor_forward_redraw_in_place() {
+        let mut pixels = vec![0u32; 640 * 480];
+        let mut canvas =
+            unsafe { Canvas::from_raw(pixels.as_mut_ptr() as *mut u8, 640, 480, 2560) };
+        let mut grid = TextGrid::new(&canvas, 0xFFFFFF, 0);
+        grid.write(&mut canvas, "hello world");
+        // Back to the start of the row and erase: what a client redrawing an
+        // input line writes (`\r` then `ESC[0K`).
+        grid.write(&mut canvas, "\r\x1b[0K");
+        assert_eq!(grid.cursor(), (0, 0));
+        assert!(grid.cells.iter().all(|cell| cell.byte == b' '));
+        // Cursor forward leaves the cells it passes alone; the next character
+        // lands where the cursor stopped.
+        grid.write(&mut canvas, "ab\x1b[3Ccd");
+        assert_eq!(grid.cursor(), (7, 0));
+        assert_eq!((grid.cells[0].byte, grid.cells[1].byte), (b'a', b'b'));
+        assert!(grid.cells[2..5].iter().all(|cell| cell.byte == b' '));
+        assert_eq!((grid.cells[5].byte, grid.cells[6].byte), (b'c', b'd'));
     }
     #[test]
     fn tabs_align_columns_without_rendering_placeholder_glyphs() {
