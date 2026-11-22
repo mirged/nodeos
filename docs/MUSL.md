@@ -202,10 +202,9 @@ sleeps properly is a good excuse to make `Timer` a real object.
 
 **K3. Process lifecycle (phase 3).** The kernel records `exit_code` in
 `task/process.rs`. A parent now reads it after `PROCESS_TERMINATED` through
-`capability_query`, whose `HandleInfo` has an `exit_code` field (added for
-Maylang's `wait`, `docs/MAYLANG.md`). Still to add: `process_kill(handle)`, which
-needs `MANAGE_PROCESS` and is what `SIGKILL` becomes. There is currently no way
-to end another process at all.
+`capability_query`, whose `HandleInfo` has an `exit_code` field. Still to add:
+`process_kill(handle)`, which needs `MANAGE_PROCESS` and is what `SIGKILL`
+becomes. There is currently no way to end another process at all.
 
 **K4. A child's address space (phase 3).** Only the boot launcher can install
 an `AddressSpace` handle (`launch.rs:401`). A userspace ELF loader and a

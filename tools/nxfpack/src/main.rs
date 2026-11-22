@@ -80,7 +80,7 @@ fn run() -> Result<(), String> {
 }
 
 /// `nxfpack --verify <image.nxf>`: check an image that something other than
-/// nxfpack wrote (mayc emits NXF directly) with the loader's own parser.
+/// nxfpack wrote with the loader's own parser.
 fn verify_request() -> Option<PathBuf> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {

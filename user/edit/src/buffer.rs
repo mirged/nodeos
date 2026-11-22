@@ -743,7 +743,7 @@ mod tests {
     use super::*;
 
     fn doc(text: &str) -> Buffer {
-        Buffer::new(String::from("/t.may"), text)
+        Buffer::new(String::from("/t.c"), text)
     }
 
     #[test]

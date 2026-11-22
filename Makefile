@@ -21,10 +21,6 @@
 # Linux programs (docs/MUSL.md) are built separately, because building them
 # fetches musl and Lua once: `make lx-apps` puts them in build/lx, and from
 # then on `make` copies them onto the disk as /bin/hello.nxf and /bin/lua.nxf.
-#
-# Maylang (docs/MAYLANG.md) comes from a sibling checkout the same way:
-# `make maylang` builds the compiler for NodeOS into build/maylang, and from
-# then on `make` puts /bin/mayc.nxf, its runtime and /stdlib on the disk.
 
 PROFILE      ?= release
 QEMU         ?= qemu-system-x86_64
@@ -63,10 +59,6 @@ SYSROOT      := $(BUILD)/sysroot
 LX_DIR       := $(BUILD)/lx
 LIBLX        := $(LX_DIR)/liblx.a
 
-# Maylang: a checkout whose compiler targets x86_64-nodeos.
-MAYLANG      ?= ../maylang
-MAYLANG_DIR  := $(BUILD)/maylang
-
 # `-boot d` matters: the FAT image `make disk` builds has a boot signature of
 # its own, and the BIOS would boot it instead of the CD.
 QEMU_FLAGS   := -machine q35 -cpu $(QEMU_CPU) -smp $(QEMU_SMP) -m $(QEMU_MEM) \
@@ -76,9 +68,9 @@ QEMU_FLAGS   := -machine q35 -cpu $(QEMU_CPU) -smp $(QEMU_SMP) -m $(QEMU_MEM) \
                 -netdev user,id=net0 -device e1000,netdev=net0 \
                 -drive file=$(DISK),if=virtio,format=raw
 
-.PHONY: all build kernel tools user modules iso disk run debug sysroot lx lx-apps maylang \
+.PHONY: all build kernel tools user modules iso disk run debug sysroot lx lx-apps \
         test test-fs test-apps test-cc test-edit test-audio test-shell test-shell-parser test-fat-read test-terminal test-doom-libc test-lua \
-        test-maylang test-maylang-selfhost test-shell-features test-editor \
+        test-shell-features test-editor \
         fmt clippy clean help
 
 # --- What you actually run --------------------------------------------------
@@ -169,13 +161,6 @@ lx: user
 lx-apps: sysroot lx tools
 	scripts/build-lx-apps.sh $(NXFPACK)
 
-# --- Maylang ------------------------------------------------------------------
-
-# The Maylang compiler built for NodeOS, its runtime, the standard library, the
-# compiler's own source and test programs, staged in build/maylang.
-maylang: tools
-	scripts/build-maylang.sh build $(NXFPACK) $(MAYLANG)
-
 # The interactive ISO: every module, and a GRUB menu whose default entry boots
 # the full-screen shell.
 iso: $(ISO)
@@ -221,7 +206,6 @@ $(DISK): modules README.md
 	  mcopy -i $(DISK) $(LX_DIR)/*.nxf ::/bin/; \
 	  echo "disk: packaged Linux programs: $$(cd $(LX_DIR) && echo *.nxf)"; \
 	fi
-	@if [ -f $(MAYLANG_DIR)/bin/mayc.nxf ]; then scripts/build-maylang.sh install $(DISK); fi
 	@if [ -f "$(DOOM_WAD)" ]; then \
 	  mcopy -i $(DISK) "$(DOOM_WAD)" ::/DOOM.WAD; \
 	  echo "disk: packaged $(DOOM_WAD) as /DOOM.WAD"; \
@@ -261,18 +245,6 @@ test-lua: lx-apps $(ISO) $(DISK)
 	mcopy -o -i $(DISK) $(LX_DIR)/*.nxf ::/bin/
 	@scripts/run-lua-test.sh
 
-# Maylang: a cross-compiled program, then mayc compiling and running programs
-# on NodeOS. Builds the compiler first, which bootstraps the Maylang checkout.
-test-maylang: maylang $(ISO) $(DISK)
-	scripts/build-maylang.sh install $(DISK)
-	@scripts/run-maylang-test.sh
-
-# The same, then mayc rebuilding itself on NodeOS from /src/mayc. The result
-# must be byte-identical to the compiler cross-built on the host.
-test-maylang-selfhost: maylang $(ISO) $(DISK)
-	scripts/build-maylang.sh install $(DISK)
-	@SELFHOST=1 scripts/run-maylang-test.sh
-
 # The text editor: type, save, and read the file back with mtools.
 test-edit: $(ISO) $(DISK)
 	@scripts/run-edit-test.sh
@@ -287,9 +259,8 @@ test-shell: $(ISO) $(DISK)
 	@python3 scripts/shell-test.py
 
 # The shell's variables, chaining, redirection and file commands, checked by
-# reading the disk back. Uses the Maylang test programs when they are staged.
-test-shell-features: maylang $(ISO) $(DISK)
-	scripts/build-maylang.sh install $(DISK)
+# reading the disk back.
+test-shell-features: $(ISO) $(DISK)
 	@scripts/run-shell-features-test.sh
 
 # The editor's buffer, undo and syntax highlighting, on the host.
@@ -350,9 +321,6 @@ help:
 	  '  make test-cc       Compile and run a C program with cc' \
 	  '  make test-lua      Run Lua 5.4 and a C program built against musl' \
 	  '  make lx-apps       Build the Linux programs (musl + liblx) into build/lx' \
-	  '  make maylang       Build the Maylang compiler for NodeOS into build/maylang' \
-	  '  make test-maylang  Run Maylang programs and the compiler on NodeOS' \
-	  '  make test-maylang-selfhost  Also rebuild the compiler on NodeOS itself' \
 	  '  make test-edit     Edit and save a file with the editor' \
 	  '  make test-audio    Check sound using QEMU'"'"'s wav backend' \
 	  '  make test-shell    Check shell workflows and fullscreen apps' \
@@ -367,4 +335,4 @@ help:
 	  '  make clean         Remove build artifacts' \
 	  '' \
 	  'Overrides: PROFILE=debug QEMU_MEM=1G QEMU_ACCEL="-accel tcg" DOOM_WAD=/path/to/doom.wad' \
-	  '           DISK_SIZE_MB=128 AUDIODEV=none MAYLANG=../maylang'
+	  '           DISK_SIZE_MB=128 AUDIODEV=none'

@@ -46,9 +46,8 @@ run 'nosuchprogram; echo status $? >> /SF1.TXT'
 run 'ls -l /tests > /SF2.TXT; wc /SF1.TXT > /SF3.TXT; head -n 2 /SF1.TXT > /SF4.TXT; tail -n 1 /SF1.TXT >> /SF4.TXT'
 run 'mkdir /SFD; cp /SF1.TXT /SFD/A.TXT; mv /SFD/A.TXT /SFD/B.TXT; find / b.txt > /SF5.TXT'
 run 'mkdir /SFD/SUB; write /SFD/SUB/C.TXT x; rmdir /SFD/SUB; rm -r /SFD; echo removed >> /SF5.TXT'
-run 'export GREETING=hi; env > /SF6.TXT; ONCE=1 maysmoke arg > /SF7.TXT'
-run 'cd /tests; pwd > /SF8.TXT; mayc hello.may -o /tests/sfhello.nxf && sfhello >> /SF8.TXT; cd /'
-run 'mayupper < /SF1.TXT > /SF9.TXT'
+run 'export GREETING=hi; env > /SF6.TXT; tree > /SF7.TXT'
+run 'cd /tests; pwd > /SF8.TXT; cp /bin/tree.nxf /tests/walk.nxf && walk >> /SF8.TXT; rm /tests/walk.nxf; cd /'
 
 monitor "screendump ${ROOT}/build/shell-features.ppm"
 shutdown_guest
@@ -68,16 +67,15 @@ check "variables expand, unsplit" SF1.TXT "hello world worlds"
 check "|| runs after failure" SF1.TXT "or-ran"
 check "&& runs after success" SF1.TXT "and-ran"
 check "exit status of a missing program" SF1.TXT "status 127"
-check "ls -l lists exact sizes" SF2.TXT "HELLO.MAY"
+check "ls -l lists exact sizes" SF2.TXT "HELLO.C"
 check "wc counts lines, words, bytes" SF3.TXT "/SF1.TXT"
 check "head and tail" SF4.TXT "hello world worlds"
 check "mv and find" SF5.TXT "/SFD/B.TXT"
 check "rmdir and rm -r" SF5.TXT "removed"
 check "export passes variables" SF6.TXT "GREETING=hi"
-check "a program's output redirected" SF7.TXT "smoke: exec status 7"
+check "a program's output redirected" SF7.TXT "tree: /"
 check "programs start in the shell's directory" SF8.TXT "/tests"
-check "a program compiled and run by name in the directory" SF8.TXT "Hello, Maylang!"
-check "a program's input redirected" SF9.TXT "HELLO WORLD WORLDS"
+check "a program resolved and run by name in the directory" SF8.TXT "tree: /"
 if [[ "$(mtype -i "${DISK}" ::/SF1.TXT)" == *skipped* ]]; then
     echo "run-shell-features-test: FAIL -- a command after && or || ran when it should not" >&2
     fail=1

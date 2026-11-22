@@ -8,8 +8,8 @@
 //!
 //! The text logic lives in two modules with no NodeOS dependencies, tested on
 //! the host (`make test-editor`): `buffer` (a document, its cursor, selection
-//! and undo history) and `highlight` (per-line syntax classes for Maylang, C,
-//! Lua and shell scripts). This file is the window, the keys and the files.
+//! and undo history) and `highlight` (per-line syntax classes for C, Lua and
+//! shell scripts). This file is the window, the keys and the files.
 
 #![no_std]
 #![no_main]
@@ -820,7 +820,7 @@ const HELP: &[&str] = &[
     "Ctrl+F  find (F3 next, Shift+F3 previous)        Ctrl+H  replace all",
     "Ctrl+G  go to line     Ctrl+= / Ctrl+-  text size",
     "",
-    "Maylang, C, Lua and shell files are coloured by their extension.",
+    "C, Lua and shell files are coloured by their extension.",
     "Brackets and quotes close themselves; Enter keeps the indentation.",
     "",
     "Press any key to return.",
