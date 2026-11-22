@@ -1,3 +1,7 @@
 {
-    "makefile.configureOnOpen": false
+  "rust-analyzer.linkedProjects": [
+    "./Cargo.toml",
+    "./tools/Cargo.toml",
+    "./user/Cargo.toml"
+  ]
 }
