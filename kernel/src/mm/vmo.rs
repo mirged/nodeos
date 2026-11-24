@@ -230,9 +230,12 @@ impl Vmo {
 
     /// Copy bytes into the object, committing pages as needed.
     pub fn write(&self, offset: u64, data: &[u8]) -> Result<(), VmoError> {
-        if offset + data.len() as u64 > self.size() {
-            return Err(VmoError::OutOfRange);
-        }
+        let end = offset
+                .checked_add(data.len() as u64)
+                .ok_or(VmoError::OutOfRange)?;
+            if end > self.size() {
+                return Err(VmoError::OutOfRange);
+            }
         let mut written = 0usize;
         while written < data.len() {
             let position = offset + written as u64;
@@ -251,9 +254,12 @@ impl Vmo {
 
     /// Copy bytes out of the object. Uncommitted pages read as zero.
     pub fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), VmoError> {
-        if offset + out.len() as u64 > self.size() {
-            return Err(VmoError::OutOfRange);
-        }
+        let end = offset
+                .checked_add(out.len() as u64)
+                .ok_or(VmoError::OutOfRange)?;
+            if end > self.size() {
+                return Err(VmoError::OutOfRange);
+            }
         let mut read = 0usize;
         while read < out.len() {
             let position = offset + read as u64;

@@ -380,13 +380,13 @@ static SERVER_CHANNEL: crate::sync::Once<Arc<Channel>> = crate::sync::Once::new(
 fn echo_server(_arg: usize) {
     let channel = SERVER_CHANNEL.get().clone();
     for _ in 0..8 {
-        let Ok(request) = channel.receive_blocking() else { break };
+        let Ok(mut request) = channel.receive_blocking() else { break };
         let mut reply = Message::empty(request.kind | 0x8000);
         reply.txid = request.txid;
         reply.flags = MessageFlags::REPLY;
         reply.payload = request.payload.iter().rev().copied().collect();
         // Bounce the capability back, proving round-trip transfer works.
-        reply.handles = request.handles;
+        reply.handles = core::mem::take(&mut request.handles);
         if channel.send(reply).is_err() {
             break;
         }

@@ -20,6 +20,7 @@
 /// # Safety
 /// Standard C contract: both regions must be valid for `n` bytes and must not
 /// overlap.
+#[allow(suspicious_runtime_symbol_definitions)]
 #[no_mangle]
 pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     // Copy 8 bytes at a time, then the tail. `rep movsb` would be faster on
@@ -43,6 +44,7 @@ pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut
 ///
 /// # Safety
 /// Standard C contract; the regions may overlap.
+#[allow(suspicious_runtime_symbol_definitions)]
 #[no_mangle]
 pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     // SAFETY: caller guarantees both regions are valid for `n` bytes.
@@ -64,6 +66,7 @@ pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mu
 ///
 /// # Safety
 /// `dest` must be valid for writes of `n` bytes.
+#[allow(suspicious_runtime_symbol_definitions)]
 #[no_mangle]
 pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
     let byte = c as u8;
@@ -87,6 +90,7 @@ pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
 ///
 /// # Safety
 /// Both pointers must be valid for reads of `n` bytes.
+#[allow(suspicious_runtime_symbol_definitions)]
 #[no_mangle]
 pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
     let mut i = 0usize;
@@ -107,6 +111,7 @@ pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
 ///
 /// # Safety
 /// See [`memcmp`].
+#[allow(suspicious_runtime_symbol_definitions)]
 #[no_mangle]
 pub unsafe extern "C" fn bcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
     // SAFETY: forwarded contract.
@@ -117,6 +122,7 @@ pub unsafe extern "C" fn bcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
 ///
 /// # Safety
 /// `s` must point to a NUL-terminated string.
+#[allow(suspicious_runtime_symbol_definitions)]
 #[no_mangle]
 pub unsafe extern "C" fn strlen(s: *const u8) -> usize {
     let mut n = 0usize;

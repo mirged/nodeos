@@ -1,0 +1,18 @@
+[package]
+name = "stress"
+version = "0.1.0"
+edition = "2021"
+# Built as part of the userspace workspace (it needs user/.cargo/config.toml's
+# ring-3 link setup), but kept under tests/ so it never lands on the regular
+# disk image. See tests/stress/README.md.
+workspace = "../../../user"
+
+[[bin]]
+name = "stress"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+libnode = { workspace = true }
+nodeos-abi = { workspace = true }

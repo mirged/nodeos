@@ -236,22 +236,26 @@ impl AddressSpace {
         window: Window,
         hint: Option<u64>,
     ) -> Result<u64, SpaceError> {
-        let len = align_up(len);
+        let len = align_up(len).ok_or(SpaceError::BadAddress)?; // or InvalidArgument
         if len == 0 {
             return Err(SpaceError::BadAddress);
         }
         let mut regions = self.regions.lock();
 
-        let base = match hint {
+        let base: u64 = match hint {
             Some(addr) => {
                 if addr % PAGE_SIZE as u64 != 0 {
                     return Err(SpaceError::BadAddress);
                 }
                 let (start, end) = window_bounds(window).ok_or(SpaceError::BadAddress)?;
-                if addr < start || addr + len > end {
+
+                // Safely calculate end address; reject immediately if it wraps around
+                let map_end = addr.checked_add(len).ok_or(SpaceError::BadAddress)?;
+
+                if addr < start || map_end > end {
                     return Err(SpaceError::BadAddress);
                 }
-                if regions.values().any(|r| addr < r.end() && r.base < addr + len) {
+                if regions.values().any(|r| addr < r.end() && r.base < map_end) {
                     return Err(SpaceError::Overlap);
                 }
                 addr
@@ -386,8 +390,15 @@ impl AddressSpace {
         }
 
         let page_addr = addr & !(PAGE_SIZE as u64 - 1);
-        let offset = page_addr - region.base + region.vmo_offset;
-        let index = (offset / PAGE_SIZE as u64) as usize;
+        let rel_addr = match page_addr.checked_sub(region.base) {
+            Some(diff) => diff,
+            None => return false,
+        };
+        let offset: u64 = match rel_addr.checked_add(region.vmo_offset) {
+            Some(off) => off,
+            None => return false,
+        };
+        let index: usize = (offset / PAGE_SIZE as u64) as usize;
         let mapper = self.mapper();
 
         // Copy-on-write: the page is present and read-only, and the write must
@@ -538,6 +549,7 @@ pub fn window_bounds(window: Window) -> Option<(u64, u64)> {
     })
 }
 
-fn align_up(size: u64) -> u64 {
-    (size + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1)
+fn align_up(size: u64) -> Option<u64> {
+    let mask = PAGE_SIZE as u64 - 1;
+    size.checked_add(mask).map(|s| s & !mask)
 }

@@ -71,7 +71,7 @@ QEMU_FLAGS   := -machine q35 -cpu $(QEMU_CPU) -smp $(QEMU_SMP) -m $(QEMU_MEM) \
 .PHONY: all build kernel tools user modules iso disk run debug sysroot lx lx-apps curl kirc \
         test test-fs test-apps test-cc test-edit test-audio test-shell test-shell-parser test-fat-read test-terminal test-doom-libc test-lua \
         test-net test-curl test-kirc \
-        test-shell-features test-editor \
+        test-shell-features test-editor stress test-stress \
         fmt clippy clean help
 
 # --- What you actually run --------------------------------------------------
@@ -324,6 +324,25 @@ test-doom-libc:
 	    user/doom/tests/libc_test.c user/doom/tests/mem_shim.c user/doom/libc/*.c
 	@$(BUILD)/doom-libc-test
 
+# Hostile-userspace stress cases (tests/stress/README.md). The binary is
+# packaged on its own, outside $(MODULE_DIR), so it never reaches the normal
+# disk; the harness copies it onto a scratch copy of the disk for each boot.
+# Its capability list is deliberately minimal: `caps-undeclared` checks that
+# the kernel honours it. STRESS_CAPS overrides it, e.g. to give it CLOCK.
+STRESS_DIR  := $(BUILD)/stress
+STRESS_NXF  := $(STRESS_DIR)/stress.nxf
+STRESS_CAPS ?= --cap CHANNEL --cap MEMORY
+
+stress: tools user
+	@mkdir -p $(STRESS_DIR)
+	$(NXFPACK) $(USER_DIR)/stress -o $(STRESS_NXF) --name stress $(STRESS_CAPS) \
+		--stack 256K --heap 2M --max-memory 16M
+
+# One fresh QEMU boot per case. `make test-stress CASES="overflow-transfer
+# chan-nest-drop"` runs a subset; `tests/stress/run.sh --list` names them all.
+test-stress: stress $(ISO) $(DISK)
+	@tests/stress/run.sh $(CASES)
+
 # --- Maintenance ------------------------------------------------------------
 
 fmt:
@@ -364,6 +383,7 @@ help:
 	  '  make test-fat-read Check batched and fragmented disk reads' \
 	  '  make test-terminal Check cursor and bounded scrollback state' \
 	  '  make test-doom-libc  Run the Doom mini-libc host test' \
+	  '  make test-stress    Boot once per hostile-userspace case (tests/stress)' \
 	  '  make fmt           Format the kernel' \
 	  '  make clippy        Lint the kernel' \
 	  '  make clean         Remove build artifacts' \

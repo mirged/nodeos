@@ -317,18 +317,19 @@ impl Channel {
             inbox.bytes = 0;
             inbox.queue.drain(..).collect()
         };
-        // Undelivered capabilities are released here, which may in turn close
-        // further channels -- that cascade is exactly how a dying subsystem
-        // tears its subtree down.
-        drop(dropped);
 
-        self.header.signals().update(Signals::PEER_CLOSED, Signals::READABLE.or(Signals::WRITABLE));
+        self.header.signals().update(
+            Signals::PEER_CLOSED,
+            Signals::READABLE.or(Signals::WRITABLE),
+        );
         self.space_available.wake_all();
 
         if let Some(peer) = self.peer() {
             peer.header.signals().update(Signals::PEER_CLOSED, Signals::WRITABLE);
             peer.space_available.wake_all();
         }
+
+        drop(dropped); // <-- Message::drop now intercepts this and flattens the universe!
     }
 
     /// Rights a freshly created endpoint handle should carry.

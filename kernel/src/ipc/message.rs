@@ -25,6 +25,8 @@
 //! shared memory is "send a VMO handle".
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::IrqSpinLock;
 
 use crate::obj::Handle;
 
@@ -164,6 +166,52 @@ impl Message {
             payload_len: self.payload.len() as u32,
             handle_count: self.handles.len() as u32,
         }
+    }
+}
+
+static DEFERRED_HANDLES: IrqSpinLock<Vec<Handle>> = IrqSpinLock::new(Vec::new());
+static IS_DROPPING_HANDLES: AtomicBool = AtomicBool::new(false);
+
+impl Drop for Message {
+    fn drop(&mut self) {
+        if self.handles.is_empty() {
+            return;
+        }
+
+        // Steal the handles so the default destructor won't recurse
+        let mut handles = core::mem::take(&mut self.handles);
+
+        // Put them on the deferred heap queue
+        DEFERRED_HANDLES.lock().append(&mut handles);
+
+        // RE-ENTRANCY CHECK:
+        // If an outer frame is already running the cleanup loop,
+        // bail out IMMEDIATELY! Do not touch the stack.
+        if IS_DROPPING_HANDLES.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        // We are the top-level frame: process all handles iteratively on the heap
+        loop {
+            // Pop ONE handle with the lock released
+            let next_handle = {
+                let mut guard = DEFERRED_HANDLES.lock();
+                guard.pop()
+            };
+
+            match next_handle {
+                Some(handle) => {
+                    // Dropping this handle might destroy a Channel, which destroys
+                    // an Inbox, which drops nested Messages!
+                    // BUT those nested Messages will hit `IS_DROPPING_HANDLES == true`,
+                    // dump their handles into DEFERRED_HANDLES, and return instantly.
+                    drop(handle);
+                }
+                None => break,
+            }
+        }
+
+        IS_DROPPING_HANDLES.store(false, Ordering::Release);
     }
 }
 

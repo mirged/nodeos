@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["kernel", "abi"]
-exclude = ["tools", "user"]
+exclude = ["tools", "user", "tests"]
 
 [profile.dev]
 panic = "abort"

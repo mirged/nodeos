@@ -854,7 +854,7 @@ fn take_message(process: &Arc<Process>, descriptor: &MessageDescriptor) -> Resul
 fn deliver_message(
     process: &Arc<Process>,
     channel: &Arc<Channel>,
-    message: Message,
+    mut message: Message,
     descriptor_addr: u64,
     mut descriptor: MessageDescriptor,
 ) -> Result<i64, Error> {
@@ -873,7 +873,7 @@ fn deliver_message(
     }
 
     let mut installed = Vec::new();
-    for handle in message.handles {
+    for handle in core::mem::take(&mut message.handles) {
         match process.install(handle) {
             Ok(value) => installed.push(value.0),
             Err(error) => {
