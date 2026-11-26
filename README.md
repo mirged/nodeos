@@ -350,4 +350,6 @@ docs/       design documents
 
 ## Licence
 
-Unlicensed research code. Take what is useful.
+NodeOS is released under the [MIT License](LICENSE). The Doom port in
+`user/doom/csrc/` is GPL-2.0-or-later, and other third-party files keep their
+own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
