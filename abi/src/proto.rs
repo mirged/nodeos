@@ -606,6 +606,18 @@ pub const AUDIO_SET_VOLUME: u32 = 0x7004;
 /// Ask whether a voice is still sounding. Payload: [`AudioVoice`].
 /// Reply payload: [`AudioVoiceState`].
 pub const AUDIO_QUERY_VOICE: u32 = 0x7005;
+/// Append samples to a streaming voice. Payload: [`AudioPlay`] followed by
+/// the samples, exactly as for [`AUDIO_PLAY`].
+///
+/// Where [`AUDIO_PLAY`] replaces a voice, this extends it: if the voice is
+/// still sounding at the same rate and format, the samples are played straight
+/// after the ones already queued, with no gap and no restart. If it is silent
+/// -- never started, stopped, or run dry -- this starts it, so a client that
+/// falls behind recovers by simply carrying on. A long sound (a video's
+/// soundtrack, music) is fed this way in chunks a message can carry, and
+/// [`AUDIO_QUERY_VOICE`]'s `remaining` says how far ahead of the card the
+/// client is, which is also the clock a player synchronises its pictures to.
+pub const AUDIO_QUEUE: u32 = 0x7006;
 
 /// Sample formats [`AUDIO_PLAY`] accepts.
 ///

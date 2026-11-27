@@ -36,6 +36,9 @@ struct Voice {
     position: u64,
     /// How far to advance per output frame, 16.16 fixed point.
     step: u64,
+    /// The rate the samples were given at. A queued chunk only continues a
+    /// voice at the same rate; anything else is a different sound.
+    rate: u32,
     /// Left and right gains, 0..=256 where 256 is unity.
     left: u32,
     right: u32,
@@ -52,6 +55,7 @@ impl Voice {
             samples: Vec::new(),
             position: 0,
             step: ONE,
+            rate: 0,
             left: 0,
             right: 0,
             repeating: false,
@@ -103,17 +107,8 @@ impl Mixer {
             return Err(());
         }
 
-        let converted: Vec<i16> = match format {
-            // DMX sound lumps are unsigned 8-bit centred on 128. Shifting into
-            // the top eight bits is the whole conversion; there is nothing to
-            // dither, because no information is being discarded.
-            audio_format::U8 => samples.iter().map(|byte| ((*byte as i16) - 128) << 8).collect(),
-            audio_format::S16 => samples
-                .chunks_exact(2)
-                .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
-                .collect(),
-            _ => return Err(()),
-        };
+        let mut converted = Vec::new();
+        convert(samples, format, &mut converted)?;
         if converted.is_empty() {
             return Err(());
         }
@@ -125,12 +120,57 @@ impl Mixer {
         // frame: a 11 025 Hz effect played at 48 000 Hz moves 0.2297 samples
         // per frame, so most output frames repeat the sample before them.
         slot.step = (rate as u64 * ONE) / self.output_rate as u64;
+        slot.rate = rate;
         slot.repeating = flags & audio_flags::LOOP != 0;
         slot.active = true;
         let (left, right) = gains(volume, separation);
         slot.left = left;
         slot.right = right;
         Ok(count)
+    }
+
+    /// Append `samples` to `voice`, or start it if it is not sounding.
+    ///
+    /// This is the streaming half of the mixer: a soundtrack arrives a chunk
+    /// at a time and has to play as one continuous sound. Continuing means
+    /// keeping the fractional position, so the seam between two chunks is
+    /// exactly where the resampler would have been anyway. A voice that is
+    /// looping, or running at a different rate, is a different sound, and is
+    /// replaced rather than extended.
+    pub fn queue(
+        &mut self,
+        voice: usize,
+        samples: &[u8],
+        format: u32,
+        rate: u32,
+        volume: u32,
+        separation: u32,
+    ) -> Result<usize, ()> {
+        let continues = self
+            .voices
+            .get(voice)
+            .is_some_and(|slot| slot.active && !slot.repeating && slot.rate == rate);
+        if !continues {
+            return self.play(voice, samples, format, rate, volume, separation, 0);
+        }
+        let slot = &mut self.voices[voice];
+
+        // Drop what has already been played before growing the buffer, so a
+        // stream that runs for minutes holds a fraction of a second of audio
+        // rather than all of it. Only once the played part is large: shifting
+        // the queue down on every chunk would copy the whole backlog each time.
+        let played = (slot.position >> FRACTION_BITS) as usize;
+        if played >= COMPACT_AFTER {
+            slot.samples.drain(..played);
+            slot.position -= (played as u64) << FRACTION_BITS;
+        }
+
+        let before = slot.samples.len();
+        convert(samples, format, &mut slot.samples)?;
+        let (left, right) = gains(volume, separation);
+        slot.left = left;
+        slot.right = right;
+        Ok(slot.samples.len() - before)
     }
 
     /// Silence one voice.
@@ -219,6 +259,31 @@ impl Mixer {
         }
         self.frames += frames as u64;
     }
+}
+
+/// Played samples a streaming voice keeps before [`Mixer::queue`] discards
+/// them: about a second at 48 kHz.
+const COMPACT_AFTER: usize = 48 * 1024;
+
+/// Convert a client's samples to the mixer's signed 16-bit, appending to `out`.
+///
+/// The conversion happens once, when a sound arrives, rather than per output
+/// frame: a sound is played tens of thousands of times more often than it is
+/// started.
+fn convert(samples: &[u8], format: u32, out: &mut Vec<i16>) -> Result<(), ()> {
+    match format {
+        // DMX sound lumps are unsigned 8-bit centred on 128. Shifting into
+        // the top eight bits is the whole conversion; there is nothing to
+        // dither, because no information is being discarded.
+        audio_format::U8 => out.extend(samples.iter().map(|byte| ((*byte as i16) - 128) << 8)),
+        audio_format::S16 => out.extend(
+            samples
+                .chunks_exact(2)
+                .map(|pair| i16::from_le_bytes([pair[0], pair[1]])),
+        ),
+        _ => return Err(()),
+    }
+    Ok(())
 }
 
 /// Split a volume and a stereo position into per-channel gains.
