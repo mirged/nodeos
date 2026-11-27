@@ -13,9 +13,9 @@
 //! as a client holding the framebuffer used to own the whole screen.
 //!
 //! ```text
-//!   doom ──AUDIO_PLAY(voice, samples)──┐
-//!                                      ├─► audio ──► mixer ──► AC'97 ring
-//!   anything else ───────────────────  ┘             16 voices   16 buffers
+//!   doom ──────AUDIO_PLAY(voice, samples)───┐
+//!                                           ├─► audio ──► mixer ──► AC'97 ring
+//!   video ─────AUDIO_QUEUE(voice, chunk)────┘             16 voices   16 buffers
 //! ```
 //!
 //! # The loop, and why it is shaped like this
@@ -249,7 +249,7 @@ fn handle_request(service: &mut Service, client: usize, message: Message) {
             });
             reply(service, client, &message, Message::new(proto::reply_kind(message.kind)).with_payload(info.bytes()));
         }
-        proto::AUDIO_PLAY => play(service, client, message),
+        proto::AUDIO_PLAY | proto::AUDIO_QUEUE => play(service, client, message),
         proto::AUDIO_STOP => {
             if let Some(target) = proto::decode::<proto::AudioVoice>(&message.payload) {
                 service.mixer.stop(target.voice as usize);
@@ -298,22 +298,33 @@ fn play(service: &mut Service, client: usize, message: Message) {
         return;
     }
 
-    let started = service.mixer.play(
-        request.voice as usize,
-        samples,
-        request.format,
-        request.rate,
-        request.volume,
-        request.separation,
-        request.flags,
-    );
+    let started = if message.kind == proto::AUDIO_QUEUE {
+        service.mixer.queue(
+            request.voice as usize,
+            samples,
+            request.format,
+            request.rate,
+            request.volume,
+            request.separation,
+        )
+    } else {
+        service.mixer.play(
+            request.voice as usize,
+            samples,
+            request.format,
+            request.rate,
+            request.volume,
+            request.separation,
+            request.flags,
+        )
+    };
     match started {
         Ok(_) => {
             // Mix immediately rather than waiting for the next pass: the reply
             // is what unblocks the client, and by the time it runs again the
             // first buffer of this sound is already on the ring.
             service.pump();
-            reply(service, client, &message, Message::new(proto::reply_kind(proto::AUDIO_PLAY)));
+            reply(service, client, &message, Message::new(proto::reply_kind(message.kind)));
         }
         Err(()) => reply_error(service, client, &message, Error::InvalidArgument),
     }

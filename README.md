@@ -61,7 +61,11 @@ make      # build everything: kernel, userspace, ISO and disk
 make run  # boot the full-screen shell in QEMU
 ```
 
-At the shell, `doom` plays Doom; `/bin` also holds `sysinfo`,
+At the shell, `doom` plays Doom and `video` opens the video player: a list of
+the `.BAP` videos in `/VIDEOS`, full-screen playback with sound, seeking,
+volume, repeat and colour themes (`H` while playing lists the keys). The disk
+ships with a homebrew demo generated at build time; add your own with
+`user/video/tools/encode.sh` (see `videos/README.md`). `/bin` also holds `sysinfo`,
 `tree` and `bench`. Every other target is a debug or CI check; `make help`
 lists them all.
 
@@ -76,6 +80,7 @@ make test-net     # DHCP, a TCP fetch and a DNS lookup through the stack
 make test-curl    # build curl and fetch from the host and the internet
 make test-kirc    # build kirc and talk to an IRC server on the host
 make test-audio   # check sound using QEMU's wav backend
+make test-video   # play the demo video and check the picture and the sound
 make test-shell   # scripts, editing, paging, foreground apps, Doom return
 make test-shell-parser # quotes, escapes and command-file syntax
 make test-fat-read # fragmented files and batched disk reads
