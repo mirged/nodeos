@@ -43,6 +43,15 @@ impl TerminalFont {
         let (w, h) = self.metrics();
         let (x, y) = (MARGIN + col * w, MARGIN + row * h);
         c.fill_rect(x, y, w, h, bg);
+        self.draw_at(c, x, y, byte, fg, Some(bg));
+    }
+    /// Draw one glyph with its cell's top-left corner at a pixel position.
+    /// With `bg` the coverage blends against that colour, as a terminal cell
+    /// does; with `None` it blends against whatever is already on the canvas,
+    /// which is what text over a picture wants. Nothing outside the glyph's
+    /// own coverage is touched.
+    pub fn draw_at(self, c: &mut Canvas, x: u32, y: u32, byte: u8, fg: Rgb, bg: Option<Rgb>) {
+        let (w, h) = self.metrics();
         let atlas: &[u8] = match self {
             Self::Small => include_bytes!("terminal-font/small.alpha"),
             Self::Normal => include_bytes!("terminal-font/normal.alpha"),
@@ -60,8 +69,15 @@ impl TerminalFont {
                 if a == 0 {
                     continue;
                 }
+                let under = match bg {
+                    Some(bg) => bg,
+                    None => match c.pixel(x + dx, y + dy) {
+                        Some(pixel) => pixel,
+                        None => continue,
+                    },
+                };
                 let blend = |s: u32| -> u32 {
-                    (((fg >> s) & 255) * a + ((bg >> s) & 255) * (255 - a) + 127) / 255
+                    (((fg >> s) & 255) * a + ((under >> s) & 255) * (255 - a) + 127) / 255
                 };
                 c.put_pixel(
                     x + dx,
@@ -70,5 +86,19 @@ impl TerminalFont {
                 );
             }
         }
+    }
+    /// Draw a string from a pixel position, without wrapping; see
+    /// [`TerminalFont::draw_at`]. Returns the x just past the last glyph.
+    pub fn draw_text_at(self, c: &mut Canvas, x: u32, y: u32, text: &str, fg: Rgb, bg: Option<Rgb>) -> u32 {
+        let (w, _) = self.metrics();
+        let mut px = x;
+        for byte in text.bytes() {
+            if px + w > c.width() {
+                break;
+            }
+            self.draw_at(c, px, y, byte, fg, bg);
+            px += w;
+        }
+        px
     }
 }
